@@ -1,0 +1,22 @@
+/target/
+/dist/
+/.hooversion/
+/.release-version
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+.DS_Store
+
+# Environment files
+.env
+.env.*
+!.env.example
