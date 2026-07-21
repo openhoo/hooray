@@ -11,6 +11,9 @@ export default {
       dependencies: [],
     },
   ],
+  hooks: {
+    afterVersion: ["cargo generate-lockfile"],
+  },
   github: {
     releases: true,
   },
