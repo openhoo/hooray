@@ -1167,7 +1167,21 @@ fn open_regular_nofollow(path: &Path) -> Result<File, InputError> {
 }
 fn read_limited(path: &Path, maximum: u64) -> Result<Vec<u8>, InputError> {
     let mut file = open_regular_nofollow(path)?;
-    let mut bytes = Vec::with_capacity(maximum.min(usize::MAX as u64) as usize);
+    let file_size = file
+        .metadata()
+        .map_err(|source| InputError::Io {
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if file_size > maximum {
+        return Err(InputError::InputTooLarge {
+            actual: maximum.saturating_add(1).min(file_size),
+            maximum,
+        });
+    }
+    let capacity = usize::try_from(file_size).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
     file.by_ref()
         .take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)

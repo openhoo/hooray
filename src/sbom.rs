@@ -62,7 +62,8 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
         return Err(SbomError::NoComponents);
     }
 
-    let asset_id = stable_asset_id(&sbom, input)?;
+    let digest = hex_digest(input);
+    let asset_id = stable_asset_id(&sbom, &digest)?;
     let asset = Asset {
         id: asset_id.clone(),
         name: asset_name(&sbom),
@@ -83,8 +84,8 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| format!("sha256:{}", hex_digest(input))),
-        digest: Some(format!("sha256:{}", hex_digest(input))),
+            .unwrap_or_else(|| format!("sha256:{digest}")),
+        digest: Some(format!("sha256:{digest}")),
     };
     let mut state = ParseState {
         asset_id: &asset_id,
@@ -339,13 +340,13 @@ fn parse_scope(scope: Option<&str>) -> Scope {
     }
 }
 
-fn stable_asset_id(sbom: &CycloneDxSbom, input: &[u8]) -> Result<AssetId, SbomError> {
+fn stable_asset_id(sbom: &CycloneDxSbom, digest: &str) -> Result<AssetId, SbomError> {
     let key = sbom
         .serial_number
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("sha256:{}", hex_digest(input)));
+        .unwrap_or_else(|| format!("sha256:{digest}"));
     AssetId::new(format!("sbom:{key}")).map_err(|_| SbomError::InvalidFormat)
 }
 

@@ -626,18 +626,24 @@ fn scan_iac(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
     }
 }
 
-fn scan_terraform(text: &str, builder: &mut FindingBuilder<'_>) {
-    let public_cidr = Regex::new(
+static TERRAFORM_PUBLIC_CIDR_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
         r#"(?m)^\s*(cidr_blocks|ipv6_cidr_blocks)\s*=\s*\[[^\]]*["'](?:0\.0\.0\.0/0|::/0)["']"#,
     )
-    .expect("constant terraform regex");
-    for matched in public_cidr.find_iter(text) {
+    .expect("constant Terraform public CIDR regex")
+});
+
+static TERRAFORM_UNENCRYPTED_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(encrypted|storage_encrypted)\s*=\s*false\b")
+        .expect("constant Terraform encryption regex")
+});
+
+fn scan_terraform(text: &str, builder: &mut FindingBuilder<'_>) {
+    for matched in TERRAFORM_PUBLIC_CIDR_REGEX.find_iter(text) {
         let (line, column) = line_column(text, matched.start());
         builder.add(FindingSpec { kind: FindingKind::Iac, rule: "iac.terraform.public-ingress", line, column, summary: "Unrestricted Terraform network CIDR", details: "A Terraform network rule explicitly permits the entire IPv4 or IPv6 Internet.", severity: Severity::High, confidence: Confidence::High, description: "Concrete cidr_blocks assignment contains 0.0.0.0/0 or ::/0.".to_owned(), references: &["https://developer.hashicorp.com/terraform/language"], properties: BTreeMap::new(), redacted: false, remediation: "Restrict ingress to the smallest required CIDR ranges and ports.", cwe: Some("CWE-284") });
     }
-    let unencrypted = Regex::new(r"(?m)^\s*(encrypted|storage_encrypted)\s*=\s*false\b")
-        .expect("constant terraform regex");
-    for matched in unencrypted.find_iter(text) {
+    for matched in TERRAFORM_UNENCRYPTED_REGEX.find_iter(text) {
         let (line, column) = line_column(text, matched.start());
         builder.add(FindingSpec {
             kind: FindingKind::Iac,
@@ -976,147 +982,200 @@ fn find_structured_scalar(text: &str, value: &str) -> Option<usize> {
         })
 }
 
+struct SastRule {
+    rule: &'static str,
+    regex: Regex,
+    summary: &'static str,
+    cwe: &'static str,
+    severity: Severity,
+    remediation: &'static str,
+}
+
+static SAST_RULES: LazyLock<BTreeMap<&'static str, Vec<SastRule>>> = LazyLock::new(|| {
+    let mut by_extension = BTreeMap::new();
+    for (extensions, rules) in [
+        (
+            &["rs"][..],
+            &[
+                (
+                    "sast.rust.command-shell",
+                    r#"\bCommand\s*::\s*new\s*\(\s*["'](?:sh|bash|cmd|powershell)["']\s*\)\s*\.\s*arg\s*\(\s*["'](?:-c|/C|Command)["']\s*\)\s*\.\s*arg\s*\([^"']"#,
+                    "Dynamic shell command execution",
+                    "CWE-78",
+                    Severity::High,
+                    "Pass fixed arguments directly to the target executable and strictly map permitted operations.",
+                ),
+                (
+                    "sast.rust.sql-format",
+                    r#"(?s)\b(?:query|execute)\s*\(\s*&?format!\s*\(\s*["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)\b"#,
+                    "Formatted SQL passed to a database API",
+                    "CWE-89",
+                    Severity::High,
+                    "Use parameterized queries and bind every untrusted value.",
+                ),
+            ][..],
+        ),
+        (
+            &["js", "jsx", "ts", "tsx"][..],
+            &[
+                (
+                    "sast.javascript.eval-dynamic",
+                    r"\b(?:eval|Function)\s*\(\s*",
+                    "Dynamic JavaScript evaluation",
+                    "CWE-95",
+                    Severity::High,
+                    "Replace dynamic evaluation with explicit parsing and a fixed dispatch table.",
+                ),
+                (
+                    "sast.javascript.exec-dynamic",
+                    r#"\b(?:exec|execSync)\s*\(\s*(?:`[^`]*\$\{|[^"'`])"#,
+                    "Dynamic command execution",
+                    "CWE-78",
+                    Severity::High,
+                    "Use spawn/execFile with a fixed executable and validated argument array.",
+                ),
+                (
+                    "sast.javascript.sql-template",
+                    r"\b(?:query|execute)\s*\(\s*`[^`]*(?:SELECT|INSERT|UPDATE|DELETE)[^`]*\$\{",
+                    "Interpolated SQL query",
+                    "CWE-89",
+                    Severity::High,
+                    "Use driver placeholders and parameter binding.",
+                ),
+            ][..],
+        ),
+        (
+            &["py"][..],
+            &[
+                (
+                    "sast.python.eval-dynamic",
+                    r"\b(?:eval|exec)\s*\(\s*",
+                    "Dynamic Python evaluation",
+                    "CWE-95",
+                    Severity::High,
+                    "Parse expected data formats and use explicit operations rather than eval or exec.",
+                ),
+                (
+                    "sast.python.shell-true",
+                    r"\bsubprocess\.(?:run|call|Popen|check_output)\s*\([^\)]*\bshell\s*=\s*True",
+                    "Python subprocess enables a command shell",
+                    "CWE-78",
+                    Severity::High,
+                    "Set shell=False and pass a fixed executable plus a validated argument list.",
+                ),
+                (
+                    "sast.python.sql-format",
+                    r#"(?i)\.execute\s*\(\s*(?:f["']|["'][^"']*(?:select|insert|update|delete)[^"']*["']\s*(?:%|\.format\s*\())"#,
+                    "Formatted SQL execution",
+                    "CWE-89",
+                    Severity::High,
+                    "Use DB-API placeholders and a separate parameter sequence.",
+                ),
+            ][..],
+        ),
+        (
+            &["go"][..],
+            &[
+                (
+                    "sast.go.command-shell",
+                    r#"\bexec\.Command\s*\(\s*["'](?:sh|bash)["']\s*,\s*["']-c["']\s*,\s*[^"']"#,
+                    "Dynamic shell command execution",
+                    "CWE-78",
+                    Severity::High,
+                    "Invoke the intended executable directly with a validated argument slice.",
+                ),
+                (
+                    "sast.go.sql-format",
+                    r#"\b(?:Query|Exec|QueryRow)\s*\(\s*fmt\.Sprintf\s*\(\s*["'](?:SELECT|INSERT|UPDATE|DELETE)\b"#,
+                    "Formatted SQL passed to database/sql",
+                    "CWE-89",
+                    Severity::High,
+                    "Use database/sql placeholders and pass values as query arguments.",
+                ),
+            ][..],
+        ),
+        (
+            &["java"][..],
+            &[
+                (
+                    "sast.java.runtime-exec",
+                    r"\bRuntime\.getRuntime\(\)\.exec\s*\(\s*",
+                    "Dynamic Runtime.exec command",
+                    "CWE-78",
+                    Severity::High,
+                    "Use ProcessBuilder with a fixed executable and validated arguments.",
+                ),
+                (
+                    "sast.java.sql-concat",
+                    r#"\b(?:executeQuery|executeUpdate|execute)\s*\(\s*["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)[^"']*["']\s*\+"#,
+                    "Concatenated SQL execution",
+                    "CWE-89",
+                    Severity::High,
+                    "Use PreparedStatement placeholders and typed setters.",
+                ),
+            ][..],
+        ),
+        (
+            &["cs"][..],
+            &[
+                (
+                    "sast.csharp.process-shell",
+                    r#"\bProcess\.Start\s*\(\s*["'](?:cmd\.exe|powershell(?:\.exe)?)["']\s*,\s*[^"']"#,
+                    "Dynamic shell process execution",
+                    "CWE-78",
+                    Severity::High,
+                    "Use ProcessStartInfo.ArgumentList with a fixed executable and validated arguments.",
+                ),
+                (
+                    "sast.csharp.sql-concat",
+                    r#"\b(?:SqlCommand|ExecuteSqlRaw)\s*\(\s*(?:\$["']|["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)[^"']*["']\s*\+)"#,
+                    "Interpolated or concatenated SQL",
+                    "CWE-89",
+                    Severity::High,
+                    "Use SQL parameters or ExecuteSqlInterpolated with trusted query structure.",
+                ),
+            ][..],
+        ),
+    ] {
+        for extension in extensions {
+            by_extension.insert(
+                *extension,
+                rules
+                    .iter()
+                    .map(
+                        |(rule, expression, summary, cwe, severity, remediation)| SastRule {
+                            rule,
+                            regex: Regex::new(expression).expect("constant SAST regex"),
+                            summary,
+                            cwe,
+                            severity: *severity,
+                            remediation,
+                        },
+                    )
+                    .collect(),
+            );
+        }
+    }
+    by_extension
+});
+
 fn scan_sast(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
     let extension = Path::new(path)
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let rules: &[(&str, &str, &str, &str, Severity, &str)] = match extension.as_str() {
-        "rs" => &[
-            (
-                "sast.rust.command-shell",
-                r#"\bCommand\s*::\s*new\s*\(\s*["'](?:sh|bash|cmd|powershell)["']\s*\)\s*\.\s*arg\s*\(\s*["'](?:-c|/C|Command)["']\s*\)\s*\.\s*arg\s*\([^"']"#,
-                "Dynamic shell command execution",
-                "CWE-78",
-                Severity::High,
-                "Pass fixed arguments directly to the target executable and strictly map permitted operations.",
-            ),
-            (
-                "sast.rust.sql-format",
-                r#"(?s)\b(?:query|execute)\s*\(\s*&?format!\s*\(\s*["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)\b"#,
-                "Formatted SQL passed to a database API",
-                "CWE-89",
-                Severity::High,
-                "Use parameterized queries and bind every untrusted value.",
-            ),
-        ],
-        "js" | "jsx" | "ts" | "tsx" => &[
-            (
-                "sast.javascript.eval-dynamic",
-                r"\b(?:eval|Function)\s*\(\s*",
-                "Dynamic JavaScript evaluation",
-                "CWE-95",
-                Severity::High,
-                "Replace dynamic evaluation with explicit parsing and a fixed dispatch table.",
-            ),
-            (
-                "sast.javascript.exec-dynamic",
-                r#"\b(?:exec|execSync)\s*\(\s*(?:`[^`]*\$\{|[^"'`])"#,
-                "Dynamic command execution",
-                "CWE-78",
-                Severity::High,
-                "Use spawn/execFile with a fixed executable and validated argument array.",
-            ),
-            (
-                "sast.javascript.sql-template",
-                r"\b(?:query|execute)\s*\(\s*`[^`]*(?:SELECT|INSERT|UPDATE|DELETE)[^`]*\$\{",
-                "Interpolated SQL query",
-                "CWE-89",
-                Severity::High,
-                "Use driver placeholders and parameter binding.",
-            ),
-        ],
-        "py" => &[
-            (
-                "sast.python.eval-dynamic",
-                r"\b(?:eval|exec)\s*\(\s*",
-                "Dynamic Python evaluation",
-                "CWE-95",
-                Severity::High,
-                "Parse expected data formats and use explicit operations rather than eval or exec.",
-            ),
-            (
-                "sast.python.shell-true",
-                r"\bsubprocess\.(?:run|call|Popen|check_output)\s*\([^\)]*\bshell\s*=\s*True",
-                "Python subprocess enables a command shell",
-                "CWE-78",
-                Severity::High,
-                "Set shell=False and pass a fixed executable plus a validated argument list.",
-            ),
-            (
-                "sast.python.sql-format",
-                r#"(?i)\.execute\s*\(\s*(?:f["']|["'][^"']*(?:select|insert|update|delete)[^"']*["']\s*(?:%|\.format\s*\())"#,
-                "Formatted SQL execution",
-                "CWE-89",
-                Severity::High,
-                "Use DB-API placeholders and a separate parameter sequence.",
-            ),
-        ],
-        "go" => &[
-            (
-                "sast.go.command-shell",
-                r#"\bexec\.Command\s*\(\s*["'](?:sh|bash)["']\s*,\s*["']-c["']\s*,\s*[^"']"#,
-                "Dynamic shell command execution",
-                "CWE-78",
-                Severity::High,
-                "Invoke the intended executable directly with a validated argument slice.",
-            ),
-            (
-                "sast.go.sql-format",
-                r#"\b(?:Query|Exec|QueryRow)\s*\(\s*fmt\.Sprintf\s*\(\s*["'](?:SELECT|INSERT|UPDATE|DELETE)\b"#,
-                "Formatted SQL passed to database/sql",
-                "CWE-89",
-                Severity::High,
-                "Use database/sql placeholders and pass values as query arguments.",
-            ),
-        ],
-        "java" => &[
-            (
-                "sast.java.runtime-exec",
-                r"\bRuntime\.getRuntime\(\)\.exec\s*\(\s*",
-                "Dynamic Runtime.exec command",
-                "CWE-78",
-                Severity::High,
-                "Use ProcessBuilder with a fixed executable and validated arguments.",
-            ),
-            (
-                "sast.java.sql-concat",
-                r#"\b(?:executeQuery|executeUpdate|execute)\s*\(\s*["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)[^"']*["']\s*\+"#,
-                "Concatenated SQL execution",
-                "CWE-89",
-                Severity::High,
-                "Use PreparedStatement placeholders and typed setters.",
-            ),
-        ],
-        "cs" => &[
-            (
-                "sast.csharp.process-shell",
-                r#"\bProcess\.Start\s*\(\s*["'](?:cmd\.exe|powershell(?:\.exe)?)["']\s*,\s*[^"']"#,
-                "Dynamic shell process execution",
-                "CWE-78",
-                Severity::High,
-                "Use ProcessStartInfo.ArgumentList with a fixed executable and validated arguments.",
-            ),
-            (
-                "sast.csharp.sql-concat",
-                r#"\b(?:SqlCommand|ExecuteSqlRaw)\s*\(\s*(?:\$["']|["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)[^"']*["']\s*\+)"#,
-                "Interpolated or concatenated SQL",
-                "CWE-89",
-                Severity::High,
-                "Use SQL parameters or ExecuteSqlInterpolated with trusted query structure.",
-            ),
-        ],
-        _ => &[],
+    let Some(rules) = SAST_RULES.get(extension.as_str()) else {
+        return;
     };
-    for (rule, expression, summary, cwe, severity, remediation) in rules {
-        let regex = Regex::new(expression).expect("constant SAST regex");
-        for matched in regex.find_iter(text) {
+    let line_starts = line_starts(text);
+    for rule in rules {
+        for matched in rule.regex.find_iter(text) {
             if offset_in_comment_or_string_prefix(text, matched.start(), &extension) {
                 continue;
             }
             if matches!(
-                *rule,
+                rule.rule,
                 "sast.javascript.eval-dynamic"
                     | "sast.python.eval-dynamic"
                     | "sast.java.runtime-exec"
@@ -1124,8 +1183,8 @@ fn scan_sast(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
             {
                 continue;
             }
-            let (line, column) = line_column(text, matched.start());
-            builder.add(FindingSpec { kind: FindingKind::Sast, rule, line, column, summary, details: "A language-specific call expression uses a dangerous sink with dynamic or explicitly unsafe syntax.", severity: *severity, confidence: Confidence::High, description: "Dangerous sink invocation detected; source expression omitted.".to_owned(), references: &["https://owasp.org/www-project-code-review-guide/"], properties: BTreeMap::new(), redacted: true, remediation, cwe: Some(cwe) });
+            let (line, column) = indexed_line_column(&line_starts, matched.start());
+            builder.add(FindingSpec { kind: FindingKind::Sast, rule: rule.rule, line, column, summary: rule.summary, details: "A language-specific call expression uses a dangerous sink with dynamic or explicitly unsafe syntax.", severity: rule.severity, confidence: Confidence::High, description: "Dangerous sink invocation detected; source expression omitted.".to_owned(), references: &["https://owasp.org/www-project-code-review-guide/"], properties: BTreeMap::new(), redacted: true, remediation: rule.remediation, cwe: Some(rule.cwe) });
         }
     }
 }
@@ -1288,6 +1347,27 @@ fn scan_zip_bomb(bytes: &[u8], config: &ScannerConfig, builder: &mut FindingBuil
         properties.insert("compressed_bytes".to_owned(), total_compressed.to_string());
         builder.add(FindingSpec { kind: FindingKind::Malware, rule: "malware.archive-bomb-indicator", line: 1, column: 1, summary: "Archive bomb indicator", details: "ZIP central-directory metadata exceeds configured expansion, entry-count, entry-size, or compression-ratio bounds. No entry content was extracted.", severity: Severity::High, confidence: Confidence::Medium, description: "Metadata-only archive expansion heuristic; the archive was not decompressed.".to_owned(), references: &["https://owasp.org/www-community/attacks/Zip_bomb"], properties, redacted: false, remediation: "Reject or quarantine the archive and inspect it in an isolated bounded analysis environment.", cwe: None });
     }
+}
+
+fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(text.len() / 40 + 1);
+    starts.push(0);
+    starts.extend(
+        text.bytes()
+            .enumerate()
+            .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+    );
+    starts
+}
+
+fn indexed_line_column(starts: &[usize], offset: usize) -> (u32, u32) {
+    let line_index = starts
+        .partition_point(|start| *start <= offset)
+        .saturating_sub(1);
+    (
+        u32::try_from(line_index + 1).unwrap_or(u32::MAX),
+        u32::try_from(offset.saturating_sub(starts[line_index]) + 1).unwrap_or(u32::MAX),
+    )
 }
 
 fn line_column(text: &str, offset: usize) -> (u32, u32) {

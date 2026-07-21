@@ -96,8 +96,8 @@ pub fn nearest_fixed_version<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
     let current_key = VersionKey::parse(ecosystem, current)?;
-    let mut safe_same_major = Vec::new();
-    let mut safe = Vec::new();
+    let mut nearest_same_major: Option<(VersionKey, &str)> = None;
+    let mut nearest_any: Option<(VersionKey, &str)> = None;
     for candidate in candidates {
         let Some(key) = VersionKey::parse(ecosystem, candidate) else {
             continue;
@@ -105,21 +105,21 @@ pub fn nearest_fixed_version<'a>(
         if key <= current_key {
             continue;
         }
-        let same_major = key.major() == current_key.major();
-        let item = (key, candidate.to_owned());
-        if same_major {
-            safe_same_major.push(item);
+        let choice = if key.major() == current_key.major() {
+            &mut nearest_same_major
         } else {
-            safe.push(item);
+            &mut nearest_any
+        };
+        let replace = choice.as_ref().is_none_or(|(selected_key, selected)| {
+            key < *selected_key || (key == *selected_key && candidate < *selected)
+        });
+        if replace {
+            *choice = Some((key, candidate));
         }
     }
-    let choices = if safe_same_major.is_empty() {
-        &mut safe
-    } else {
-        &mut safe_same_major
-    };
-    choices.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    choices.first().map(|(_, version)| version.clone())
+    nearest_same_major
+        .or(nearest_any)
+        .map(|(_, version)| version.to_owned())
 }
 
 fn parse_purl(purl: &str) -> Result<(PackageEcosystem, String), RemediationError> {

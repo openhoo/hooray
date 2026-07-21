@@ -11,6 +11,8 @@ pub struct DependencyGraph {
     nodes: BTreeSet<ComponentId>,
     outgoing: BTreeMap<ComponentId, BTreeSet<ComponentId>>,
     incoming: BTreeMap<ComponentId, BTreeSet<ComponentId>>,
+    connected_roots: BTreeSet<ComponentId>,
+    depth_from_root: BTreeMap<ComponentId, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -23,6 +25,14 @@ pub enum GraphError {
     Cycle(Vec<ComponentId>),
     #[error("path limit must be greater than zero")]
     ZeroPathLimit,
+}
+
+struct PathCollection<'a> {
+    target: &'a ComponentId,
+    max_depth: usize,
+    max_paths: usize,
+    paths: Vec<DependencyPath>,
+    truncated: bool,
 }
 
 impl DependencyGraph {
@@ -63,10 +73,19 @@ impl DependencyGraph {
                 .unwrap()
                 .insert(edge.from.clone());
         }
+        let connected_roots: BTreeSet<_> = nodes
+            .iter()
+            .filter(|node| incoming[*node].is_empty())
+            .filter(|node| !outgoing[*node].is_empty() || nodes.len() == 1)
+            .cloned()
+            .collect();
+        let depth_from_root = shortest_depths(&connected_roots, &outgoing);
         let graph = Self {
             nodes,
             outgoing,
             incoming,
+            connected_roots,
+            depth_from_root,
         };
         if let Some(cycle) = graph.find_cycle() {
             return Err(GraphError::Cycle(cycle));
@@ -82,27 +101,15 @@ impl DependencyGraph {
             .collect()
     }
 
-    fn connected_roots(&self) -> BTreeSet<ComponentId> {
-        self.roots()
-            .into_iter()
-            .filter(|node| !self.outgoing[node].is_empty() || self.nodes.len() == 1)
-            .collect()
+    fn connected_roots(&self) -> &BTreeSet<ComponentId> {
+        &self.connected_roots
     }
     pub fn classify(&self, component: &ComponentId) -> Result<DependencyKind, GraphError> {
         self.require_node(component)?;
-        let roots = self.connected_roots();
-        if self.incoming[component]
-            .iter()
-            .any(|parent| roots.contains(parent))
-        {
-            Ok(DependencyKind::Direct)
-        } else if self
-            .shortest_path(component)?
-            .is_some_and(|path| path.edge_count() > 1)
-        {
-            Ok(DependencyKind::Transitive)
-        } else {
-            Ok(DependencyKind::Disconnected)
+        match self.depth_from_root.get(component) {
+            Some(1) => Ok(DependencyKind::Direct),
+            Some(depth) if *depth > 1 => Ok(DependencyKind::Transitive),
+            _ => Ok(DependencyKind::Disconnected),
         }
     }
 
@@ -147,65 +154,65 @@ impl DependencyGraph {
         if max_paths == 0 {
             return Err(GraphError::ZeroPathLimit);
         }
-        let mut paths = Vec::new();
-        let mut truncated = false;
-        let mut roots = self.connected_roots().into_iter();
+        let mut collection = PathCollection {
+            target,
+            max_depth,
+            max_paths,
+            paths: Vec::new(),
+            truncated: false,
+        };
+        let mut roots = self.connected_roots().iter().cloned();
         while let Some(root) = roots.next() {
+            if !self.can_reach(&root, target) {
+                continue;
+            }
             let mut current = vec![root];
-            if self.collect_paths(
-                target,
-                max_depth,
-                max_paths,
-                &mut current,
-                &mut paths,
-                &mut truncated,
-            ) {
+            if self.collect_paths(&mut collection, &mut current) {
                 break;
             }
-            if paths.len() == max_paths {
-                truncated = roots.any(|remaining| self.can_reach(&remaining, target));
+            if collection.paths.len() == max_paths {
+                collection.truncated = roots.any(|remaining| self.can_reach(&remaining, target));
                 break;
             }
         }
-        paths.sort();
-        Ok(DependencyPaths { paths, truncated })
+        collection.paths.sort();
+        Ok(DependencyPaths {
+            paths: collection.paths,
+            truncated: collection.truncated,
+        })
     }
 
     fn collect_paths(
         &self,
-        target: &ComponentId,
-        max_depth: usize,
-        max_paths: usize,
+        collection: &mut PathCollection<'_>,
         current: &mut Vec<ComponentId>,
-        paths: &mut Vec<DependencyPath>,
-        truncated: &mut bool,
     ) -> bool {
         let node = current.last().unwrap();
-        if node == target {
-            if paths.len() < max_paths {
-                paths.push(DependencyPath {
+        if node == collection.target {
+            if collection.paths.len() < collection.max_paths {
+                collection.paths.push(DependencyPath {
                     components: current.clone(),
                 });
             }
-            return *truncated && paths.len() == max_paths;
+            return collection.truncated && collection.paths.len() == collection.max_paths;
         }
-        if current.len() > max_depth {
-            if self.can_reach(node, target) {
-                *truncated = true;
+        if current.len() > collection.max_depth {
+            if self.can_reach(node, collection.target) {
+                collection.truncated = true;
             }
-            return *truncated && paths.len() == max_paths;
+            return collection.truncated && collection.paths.len() == collection.max_paths;
         }
         let mut outgoing = self.outgoing[node].iter();
         while let Some(next) = outgoing.next() {
             current.push(next.clone());
-            let stop = self.collect_paths(target, max_depth, max_paths, current, paths, truncated);
+            let stop = self.collect_paths(collection, current);
             current.pop();
             if stop {
                 return true;
             }
-            if paths.len() == max_paths {
-                if outgoing.any(|remaining| self.can_reach(remaining, target)) {
-                    *truncated = true;
+            if collection.paths.len() == collection.max_paths {
+                if outgoing.any(|remaining| self.can_reach(remaining, collection.target)) {
+                    collection.truncated = true;
                     return true;
                 }
                 return false;
@@ -278,6 +285,26 @@ impl DependencyGraph {
         }
         None
     }
+}
+
+fn shortest_depths(
+    roots: &BTreeSet<ComponentId>,
+    outgoing: &BTreeMap<ComponentId, BTreeSet<ComponentId>>,
+) -> BTreeMap<ComponentId, usize> {
+    let mut depths: BTreeMap<ComponentId, usize> =
+        roots.iter().cloned().map(|root| (root, 0)).collect();
+    let mut queue: VecDeque<ComponentId> = roots.iter().cloned().collect();
+    while let Some(node) = queue.pop_front() {
+        let depth = depths[&node];
+        for next in &outgoing[&node] {
+            if depths.contains_key(next) {
+                continue;
+            }
+            depths.insert(next.clone(), depth + 1);
+            queue.push_back(next.clone());
+        }
+    }
+    depths
 }
 
 #[cfg(test)]

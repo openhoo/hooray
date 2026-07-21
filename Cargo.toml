@@ -13,6 +13,10 @@ categories = ["command-line-utilities", "development-tools"]
 name = "hooray"
 path = "src/main.rs"
 
+
+[[bench]]
+name = "performance"
+harness = false
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
