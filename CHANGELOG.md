@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 (2026-07-21)
+
+### Bug Fixes
+
+- **release:** synchronize Cargo lockfile (1dee3c3)
+
 ## 0.2.0 (2026-07-21)
 
 ### Features
