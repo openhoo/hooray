@@ -8,6 +8,10 @@ multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
 
+# Dependencies must use one of the exact MIT-compatible permissive SPDX
+# licenses below. Because cargo-deny rejects every license not explicitly
+# allowed, unknown, copyleft, and source-available licenses fail this policy.
+# Zlib and bzip2-1.0.6 remain allowed for required transitive dependencies.
 [licenses]
 version = 2
 confidence-threshold = 0.8
@@ -20,6 +24,8 @@ allow = [
     "MIT",
     "Unicode-3.0",
     "Unlicense",
+    "Zlib",
+    "bzip2-1.0.6",
 ]
 
 [sources]

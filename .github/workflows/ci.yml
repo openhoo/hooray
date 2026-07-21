@@ -15,6 +15,7 @@ concurrency:
 
 env:
   CARGO_DENY_VERSION: "0.19.8"
+  CARGO_LLVM_COV_VERSION: "0.8.7"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -37,16 +38,26 @@ jobs:
         with:
           path: |
             ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-llvm-cov
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/advisory-db
             target
-          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-deny-${{ env.CARGO_DENY_VERSION }}
+          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-deny-${{ env.CARGO_DENY_VERSION }}-llvm-cov-${{ env.CARGO_LLVM_COV_VERSION }}
           restore-keys: |
             rust-${{ runner.os }}-
 
       - name: Install cargo-deny when uncached
         run: command -v cargo-deny >/dev/null || cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+
+      - name: Install cargo-llvm-cov 0.8.7 when needed
+        run: |
+          if ! command -v cargo-llvm-cov >/dev/null || [ "$(cargo-llvm-cov --version)" != "cargo-llvm-cov $CARGO_LLVM_COV_VERSION" ]; then
+            cargo install cargo-llvm-cov --locked --force --version "$CARGO_LLVM_COV_VERSION"
+          fi
+
+      - name: Install LLVM coverage tools
+        run: rustup component add llvm-tools-preview
 
       - name: Check formatting
         run: cargo fmt --check
@@ -56,6 +67,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
+
+      - name: Enforce line coverage
+        run: cargo llvm-cov --locked --all-targets --all-features --fail-under-lines 90
 
       - name: Check dependency policy
         run: cargo deny check advisories bans licenses sources

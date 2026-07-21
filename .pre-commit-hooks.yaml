@@ -1,0 +1,7 @@
+- id: hooray
+  name: Hooray security policy
+  description: Scan the repository with Hooray and enforce its security policy.
+  entry: hooray scan project . --format json
+  language: rust
+  pass_filenames: false
+  stages: [pre-commit, pre-push]
