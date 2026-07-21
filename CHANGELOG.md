@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 (2026-07-21)
+
+### Other Changes
+
+- switch to MIT license (6145bcb)
+
+### Features
+
+- harden enterprise security scanner (826aa07)
+
 ## Unreleased
 
 ### Major Features
