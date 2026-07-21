@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4 (2026-07-21)
+
+### Performance
+
+- parallelize file analysis (60a2961)
+
 ## 0.3.3 (2026-07-21)
 
 ### Performance
