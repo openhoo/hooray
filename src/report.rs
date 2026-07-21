@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::model::{
-    ApplicabilityStatus, Finding, FindingId, Location, PolicyDecision, PolicyOutcome, ScanReport,
-    Severity,
+    ApplicabilityStatus, ComponentId, Finding, FindingId, Location, LocationId, PolicyDecision,
+    PolicyOutcome, ScanReport, Severity,
 };
 
 pub const CANONICAL_REPORT_VERSION: &str = "1.0.0";
@@ -471,29 +471,110 @@ fn render_table(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportErro
     output.finish()
 }
 
-fn render_sarif(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
-    let mut rule_ids = BTreeSet::new();
-    for finding in report.findings.values() {
-        rule_ids.insert(finding.rule_id.as_str());
+struct ReportIndex<'a> {
+    roots: BTreeSet<&'a ComponentId>,
+    adjacency: BTreeMap<&'a ComponentId, Vec<&'a ComponentId>>,
+    locations: BTreeMap<&'a LocationId, &'a Location>,
+    policies: BTreeMap<&'a FindingId, Vec<&'a PolicyDecision>>,
+}
+
+impl<'a> ReportIndex<'a> {
+    fn new(report: &'a ScanReport) -> Self {
+        let mut roots: BTreeSet<_> = report.inventory.components.keys().collect();
+        let mut adjacency: BTreeMap<_, Vec<_>> = report
+            .inventory
+            .components
+            .keys()
+            .map(|id| (id, Vec::new()))
+            .collect();
+        for edge in &report.inventory.dependencies {
+            roots.remove(&edge.to);
+            adjacency.entry(&edge.from).or_default().push(&edge.to);
+        }
+        if roots.is_empty() {
+            roots.extend(report.inventory.components.keys());
+        }
+        let locations = report
+            .inventory
+            .components
+            .values()
+            .flat_map(|component| component.locations.iter())
+            .map(|location| (&location.id, location))
+            .collect();
+        let mut policies: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for decision in &report.policy_decisions {
+            if let Some(finding_id) = &decision.finding_id {
+                policies.entry(finding_id).or_default().push(decision);
+            }
+        }
+        Self {
+            roots,
+            adjacency,
+            locations,
+            policies,
+        }
     }
-    let rules: Vec<Value> = rule_ids
+
+    fn paths(&self, finding: &'a Finding) -> Vec<Vec<&'a str>> {
+        let Some(target) = finding.component_id.as_ref() else {
+            return Vec::new();
+        };
+        let mut paths = Vec::new();
+        for root in &self.roots {
+            let mut stack = vec![(*root, vec![*root], BTreeSet::from([*root]))];
+            while let Some((node, path, visited)) = stack.pop() {
+                if node == target {
+                    paths.push(path.into_iter().map(ComponentId::as_str).collect());
+                    if paths.len() >= 100 {
+                        return paths;
+                    }
+                    continue;
+                }
+                if let Some(children) = self.adjacency.get(node) {
+                    for child in children.iter().rev() {
+                        if !visited.contains(child) {
+                            let mut next_path = path.clone();
+                            next_path.push(child);
+                            let mut next_visited = visited.clone();
+                            next_visited.insert(child);
+                            stack.push((child, next_path, next_visited));
+                        }
+                    }
+                }
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    fn policies(&self, finding_id: &FindingId) -> &[&'a PolicyDecision] {
+        self.policies.get(finding_id).map_or(&[], Vec::as_slice)
+    }
+}
+
+fn render_sarif(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
+    let index = ReportIndex::new(report);
+    let mut representatives = BTreeMap::new();
+    for finding in report.findings.values() {
+        representatives
+            .entry(finding.rule_id.as_str())
+            .or_insert(finding);
+    }
+    let rules: Vec<Value> = representatives
         .into_iter()
-        .map(|rule_id| {
-            let representative = report.findings.values().find(|finding| finding.rule_id.as_str() == rule_id);
-            json!({
-                "id": rule_id,
-                "name": rule_id,
-                "shortDescription": {"text": representative.and_then(|finding| finding.summary.as_deref()).unwrap_or(rule_id)},
-                "fullDescription": {"text": representative.and_then(|finding| finding.details.as_deref()).unwrap_or_else(|| representative.and_then(|finding| finding.summary.as_deref()).unwrap_or(rule_id))},
-                "defaultConfiguration": {"level": representative.map(|finding| sarif_level(finding.severity)).unwrap_or("note")},
-                "properties": {"tags": representative.map(|finding| vec![finding.kind.as_str()]).unwrap_or_default()}
-            })
-        })
+        .map(|(rule_id, representative)| json!({
+            "id": rule_id,
+            "name": rule_id,
+            "shortDescription": {"text": representative.summary.as_deref().unwrap_or(rule_id)},
+            "fullDescription": {"text": representative.details.as_deref().or(representative.summary.as_deref()).unwrap_or(rule_id)},
+            "defaultConfiguration": {"level": sarif_level(representative.severity)},
+            "properties": {"tags": [representative.kind.as_str()]}
+        }))
         .collect();
 
     let results: Vec<Value> = report.findings.values().map(|finding| {
-        let locations = sarif_locations(report, finding);
-        let paths = dependency_paths(report, finding);
+        let locations = sarif_locations(&index, finding);
+        let paths = index.paths(finding);
         let evidence: Vec<Value> = finding.evidence.iter().map(|item| json!({
             "description": item.description,
             "locations": item.locations.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
@@ -501,7 +582,7 @@ fn render_sarif(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportErro
             "properties": item.properties,
             "redacted": item.redacted
         })).collect();
-        let policies: Vec<Value> = policies_for(report, &finding.id).into_iter().map(|decision| json!({
+        let policies: Vec<Value> = index.policies(&finding.id).iter().map(|decision| json!({
             "policyId": decision.policy_id.as_str(), "outcome": policy_outcome(decision.outcome),
             "reason": decision.reason, "exceptionId": decision.exception_id
         })).collect();
@@ -882,7 +963,7 @@ fn finding_location<'a>(report: &'a ScanReport, finding: &Finding) -> Option<&'a
         .find(|location| &location.id == location_id)
 }
 
-fn sarif_locations(report: &ScanReport, finding: &Finding) -> Vec<Value> {
+fn sarif_locations(index: &ReportIndex<'_>, finding: &Finding) -> Vec<Value> {
     let mut ids = BTreeSet::new();
     if let Some(id) = &finding.location_id {
         ids.insert(id);
@@ -891,7 +972,7 @@ fn sarif_locations(report: &ScanReport, finding: &Finding) -> Vec<Value> {
         ids.extend(&evidence.locations);
     }
     ids.into_iter().filter_map(|id| {
-        let location = report.inventory.components.values().flat_map(|component| component.locations.iter()).find(|location| &location.id == id)?;
+        let location = index.locations.get(id)?;
         let mut region = serde_json::Map::new();
         if let Some(start) = location.start {
             region.insert("startLine".into(), json!(start.line.max(1)));

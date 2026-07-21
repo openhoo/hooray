@@ -1,14 +1,20 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     hint::black_box,
     time::{Duration, Instant},
 };
 
 use hooray::{
     graph::DependencyGraph,
-    model::{AssetId, ComponentId, DependencyEdge, PackageEcosystem, Scope},
+    model::{
+        Asset, AssetId, AssetKind, Component, ComponentId, Confidence, DependencyEdge, Evidence,
+        Finding, FindingId, FindingKind, FindingStatus, Inventory, PackageEcosystem, PolicySummary,
+        RuleId, RunId, RunMetadata, ScanReport, Scope, Severity,
+    },
     remediation::nearest_fixed_version,
+    report::{ReportFormat, render},
     scanners::{MalwareSignatures, ScannerConfig, analyze_bytes},
+    store::Store,
 };
 
 const SAMPLE_TIME: Duration = Duration::from_millis(750);
@@ -99,6 +105,105 @@ fn remediation_fixture() -> Vec<String> {
         .collect()
 }
 
+fn report_fixture(component_count: usize, findings_per_component: usize) -> ScanReport {
+    let asset_id = AssetId::new("asset:performance").expect("asset id");
+    let root_id = component_id("component:root");
+    let mut components = BTreeMap::new();
+    components.insert(
+        root_id.clone(),
+        Component {
+            identity: root_id.clone(),
+            name: "benchmark-root".into(),
+            version: "1.0.0".into(),
+            purl: "pkg:cargo/benchmark-root@1.0.0".into(),
+            scope: Scope::Runtime,
+            provenance: BTreeSet::new(),
+            licenses: BTreeSet::new(),
+            locations: BTreeSet::new(),
+        },
+    );
+    let mut dependencies = BTreeSet::new();
+    let mut findings = BTreeMap::new();
+    let mut parent = root_id;
+    for index in 0..component_count {
+        let component_id = component_id(format!("component:benchmark-{index:04}"));
+        components.insert(
+            component_id.clone(),
+            Component {
+                identity: component_id.clone(),
+                name: format!("benchmark-{index:04}"),
+                version: "1.2.3".into(),
+                purl: format!("pkg:cargo/benchmark-{index:04}@1.2.3"),
+                scope: Scope::Runtime,
+                provenance: BTreeSet::new(),
+                licenses: BTreeSet::new(),
+                locations: BTreeSet::new(),
+            },
+        );
+        dependencies.insert(edge(&parent, &component_id));
+        parent = component_id.clone();
+        for finding_index in 0..findings_per_component {
+            let id = FindingId::new(format!("finding:benchmark-{index:04}-{finding_index:02}"))
+                .expect("finding id");
+            let finding = Finding {
+                id: id.clone(),
+                kind: FindingKind::Sast,
+                rule_id: RuleId::new("sast.benchmark").expect("rule id"),
+                advisory_id: None,
+                component_id: Some(component_id.clone()),
+                location_id: None,
+                aliases: BTreeSet::new(),
+                summary: Some("Synthetic benchmark finding".into()),
+                details: Some("Representative report and persistence payload".into()),
+                severity: Severity::High,
+                confidence: Confidence::High,
+                evidence: BTreeSet::from([Evidence {
+                    description: "Synthetic redacted benchmark evidence".into(),
+                    locations: BTreeSet::new(),
+                    references: BTreeSet::new(),
+                    properties: BTreeMap::from([(
+                        "benchmark.category".into(),
+                        "performance".into(),
+                    )]),
+                    redacted: true,
+                }]),
+                applicability: None,
+                remediation: None,
+                risk: None,
+                first_seen: None,
+                last_seen: None,
+                modified: None,
+                status: FindingStatus::Open,
+            };
+            findings.insert(id, finding);
+        }
+    }
+    ScanReport {
+        schema_version: "1".into(),
+        run: RunMetadata {
+            id: RunId::new("run:performance").expect("run id"),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: Some("2026-01-01T00:00:01Z".into()),
+            scanner_version: Some("benchmark".into()),
+            metadata: BTreeMap::new(),
+        },
+        inventory: Inventory {
+            asset: Asset {
+                id: asset_id,
+                name: "performance".into(),
+                kind: AssetKind::Repository,
+                version: Some("1.0.0".into()),
+                metadata: BTreeMap::new(),
+            },
+            components,
+            dependencies,
+        },
+        findings,
+        policy_decisions: BTreeSet::new(),
+        policy_summary: PolicySummary::default(),
+    }
+}
+
 fn main() {
     let (graph, components, target) = graph_fixture();
     let (iterations, elapsed) = measure(|| {
@@ -145,4 +250,19 @@ fn main() {
         ));
     });
     report("nearest_fixed_10000", iterations, elapsed);
+
+    let large_report = report_fixture(250, 2);
+    let (iterations, elapsed) = measure(|| {
+        black_box(render(black_box(&large_report), ReportFormat::Sarif).expect("SARIF report"));
+    });
+    report("report_sarif_500", iterations, elapsed);
+
+    let (iterations, elapsed) = measure(|| {
+        let mut store = Store::open_memory().expect("memory store");
+        store
+            .save_report(black_box(&large_report))
+            .expect("save report");
+        black_box(store);
+    });
+    report("store_save_250_500", iterations, elapsed);
 }

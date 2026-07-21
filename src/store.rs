@@ -858,23 +858,82 @@ fn insert_report(
 ) -> Result<(), StoreError> {
     t.execute("INSERT INTO scan_runs(run_id,schema_version,started_at,completed_at,scanner_version,asset_id,finding_count,report_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![r.run.id.as_str(),r.schema_version,r.run.started_at,r.run.completed_at,r.run.scanner_version,r.inventory.asset.id.as_str(),count,json])?;
     t.execute("INSERT INTO scan_assets(run_id,asset_id,name,kind,version,metadata_json,asset_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![r.run.id.as_str(),r.inventory.asset.id.as_str(),r.inventory.asset.name,json_scalar(&r.inventory.asset.kind)?,r.inventory.asset.version,serde_json::to_string(&r.inventory.asset.metadata)?,serde_json::to_string(&r.inventory.asset)?])?;
-    for c in r.inventory.components.values() {
-        t.execute("INSERT INTO scan_components(run_id,component_id,name,version,purl,scope,component_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![r.run.id.as_str(),c.identity.as_str(),c.name,c.version,c.purl,json_scalar(&c.scope)?,serde_json::to_string(c)?])?;
+    {
+        let mut statement = t.prepare_cached("INSERT INTO scan_components(run_id,component_id,name,version,purl,scope,component_json) VALUES (?1,?2,?3,?4,?5,?6,?7)")?;
+        for c in r.inventory.components.values() {
+            statement.execute(params![
+                r.run.id.as_str(),
+                c.identity.as_str(),
+                c.name,
+                c.version,
+                c.purl,
+                json_scalar(&c.scope)?,
+                serde_json::to_string(c)?
+            ])?;
+        }
     }
-    for e in &r.inventory.dependencies {
-        t.execute("INSERT INTO scan_dependency_edges(run_id,from_component_id,to_component_id,scope,optional,edge_json) VALUES (?1,?2,?3,?4,?5,?6)",params![r.run.id.as_str(),e.from.as_str(),e.to.as_str(),json_scalar(&e.scope)?,e.optional,serde_json::to_string(e)?])?;
+    {
+        let mut statement = t.prepare_cached("INSERT INTO scan_dependency_edges(run_id,from_component_id,to_component_id,scope,optional,edge_json) VALUES (?1,?2,?3,?4,?5,?6)")?;
+        for e in &r.inventory.dependencies {
+            statement.execute(params![
+                r.run.id.as_str(),
+                e.from.as_str(),
+                e.to.as_str(),
+                json_scalar(&e.scope)?,
+                e.optional,
+                serde_json::to_string(e)?
+            ])?;
+        }
     }
+    let mut finding_statement = t.prepare_cached("INSERT INTO scan_findings(run_id,finding_id,kind,severity,confidence,status,rule_id,advisory_id,component_id,location_id,first_seen,last_seen,finding_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)")?;
+    let mut evidence_statement = t.prepare_cached("INSERT INTO scan_evidence(run_id,finding_id,ordinal,redacted,evidence_json) VALUES (?1,?2,?3,?4,?5)")?;
+    let mut remediation_statement = t.prepare_cached(
+        "INSERT INTO scan_remediations(run_id,finding_id,remediation_json) VALUES (?1,?2,?3)",
+    )?;
     for f in r.findings.values() {
-        t.execute("INSERT INTO scan_findings(run_id,finding_id,kind,severity,confidence,status,rule_id,advisory_id,component_id,location_id,first_seen,last_seen,finding_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![r.run.id.as_str(),f.id.as_str(),f.kind.as_str(),f.severity.as_str(),json_scalar(&f.confidence)?,json_scalar(&f.status)?,f.rule_id.as_str(),f.advisory_id,f.component_id.as_ref().map(|x|x.as_str()),f.location_id.as_ref().map(|x|x.as_str()),f.first_seen,f.last_seen,serde_json::to_string(f)?])?;
+        finding_statement.execute(params![
+            r.run.id.as_str(),
+            f.id.as_str(),
+            f.kind.as_str(),
+            f.severity.as_str(),
+            json_scalar(&f.confidence)?,
+            json_scalar(&f.status)?,
+            f.rule_id.as_str(),
+            f.advisory_id,
+            f.component_id.as_ref().map(|x| x.as_str()),
+            f.location_id.as_ref().map(|x| x.as_str()),
+            f.first_seen,
+            f.last_seen,
+            serde_json::to_string(f)?
+        ])?;
         for (i, e) in f.evidence.iter().enumerate() {
-            t.execute("INSERT INTO scan_evidence(run_id,finding_id,ordinal,redacted,evidence_json) VALUES (?1,?2,?3,?4,?5)",params![r.run.id.as_str(),f.id.as_str(),i64::try_from(i).unwrap_or(i64::MAX),e.redacted,serde_json::to_string(e)?])?;
+            evidence_statement.execute(params![
+                r.run.id.as_str(),
+                f.id.as_str(),
+                i64::try_from(i).unwrap_or(i64::MAX),
+                e.redacted,
+                serde_json::to_string(e)?
+            ])?;
         }
         if let Some(rem) = &f.remediation {
-            t.execute("INSERT INTO scan_remediations(run_id,finding_id,remediation_json) VALUES (?1,?2,?3)",params![r.run.id.as_str(),f.id.as_str(),serde_json::to_string(rem)?])?;
+            remediation_statement.execute(params![
+                r.run.id.as_str(),
+                f.id.as_str(),
+                serde_json::to_string(rem)?
+            ])?;
         }
     }
+    let mut decision_statement = t.prepare_cached("INSERT INTO scan_policy_decisions(run_id,ordinal,policy_id,finding_id,outcome,exception_id,decision_json) VALUES (?1,?2,?3,?4,?5,?6,?7)")?;
     for (i, d) in r.policy_decisions.iter().enumerate() {
-        t.execute("INSERT INTO scan_policy_decisions(run_id,ordinal,policy_id,finding_id,outcome,exception_id,decision_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![r.run.id.as_str(),i64::try_from(i).unwrap_or(i64::MAX),d.policy_id.as_str(),d.finding_id.as_ref().map(|x|x.as_str()),json_scalar(&d.outcome)?,d.exception_id,serde_json::to_string(d)?])?;
+        decision_statement.execute(params![
+            r.run.id.as_str(),
+            i64::try_from(i).unwrap_or(i64::MAX),
+            d.policy_id.as_str(),
+            d.finding_id.as_ref().map(|x| x.as_str()),
+            json_scalar(&d.outcome)?,
+            d.exception_id,
+            serde_json::to_string(d)?
+        ])?;
     }
     Ok(())
 }
