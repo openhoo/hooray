@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 (2026-07-21)
+
+### Performance
+
+- accelerate reports and persistence (f7147ac)
+
 ## 0.3.1 (2026-07-21)
 
 ### Performance
