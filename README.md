@@ -55,4 +55,4 @@ archive, and checksums.
 
 ## License
 
-Licensed under either Apache License 2.0 or the MIT license, at your option.
+Licensed under the MIT License. See [`LICENSE`](LICENSE).
