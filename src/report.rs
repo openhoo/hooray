@@ -169,14 +169,20 @@ fn render_with_limit(
     match format {
         ReportFormat::Json => render_json(&sanitized, limit),
         ReportFormat::Yaml => render_yaml(&sanitized, limit),
-        ReportFormat::Table => render_table(&sanitized, limit),
-        ReportFormat::Sarif => render_sarif(&sanitized, limit),
-        ReportFormat::Junit => render_junit(&sanitized, limit),
-        ReportFormat::Html => render_html(&sanitized, limit),
-        ReportFormat::CycloneDxVex => render_cyclonedx_vex(&sanitized, limit),
-        ReportFormat::Spdx => render_spdx(&sanitized, limit),
-        ReportFormat::GitLabCodeQuality => render_gitlab(&sanitized, limit),
-        ReportFormat::JsonLines => render_json_lines(&sanitized, limit),
+        ReportFormat::Table => render_table(&sanitized, limit, &ReportIndex::new(&sanitized)),
+        ReportFormat::Sarif => render_sarif(&sanitized, limit, &ReportIndex::new(&sanitized)),
+        ReportFormat::Junit => render_junit(&sanitized, limit, &ReportIndex::new(&sanitized)),
+        ReportFormat::Html => render_html(&sanitized, limit, &ReportIndex::new(&sanitized)),
+        ReportFormat::CycloneDxVex => {
+            render_cyclonedx_vex(&sanitized, limit, &ReportIndex::new(&sanitized))
+        }
+        ReportFormat::Spdx => render_spdx(&sanitized, limit, &ReportIndex::new(&sanitized)),
+        ReportFormat::GitLabCodeQuality => {
+            render_gitlab(&sanitized, limit, &ReportIndex::new(&sanitized))
+        }
+        ReportFormat::JsonLines => {
+            render_json_lines(&sanitized, limit, &ReportIndex::new(&sanitized))
+        }
     }
 }
 
@@ -394,7 +400,11 @@ fn render_yaml(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError
     output.finish()
 }
 
-fn render_table(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
+fn render_table(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
     let mut output = BoundedText::new(limit);
     output.push_str("HOORAY REPORT v");
     output.push_str(CANONICAL_REPORT_VERSION);
@@ -423,7 +433,7 @@ fn render_table(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportErro
             truncate_cell(location, 24),
             clean_cell(finding.summary.as_deref().unwrap_or(""))
         ));
-        let paths = dependency_paths(report, finding);
+        let paths = index.paths(finding);
         for path in paths {
             output.push_str("          path: ");
             output.push_str(&path.join(" -> "));
@@ -459,7 +469,7 @@ fn render_table(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportErro
             }
             output.push('\n');
         }
-        for decision in policies_for(report, &finding.id) {
+        for decision in index.policies(&finding.id) {
             output.push_str(&format!(
                 "          policy: {}={} ({})\n",
                 decision.policy_id,
@@ -552,8 +562,11 @@ impl<'a> ReportIndex<'a> {
     }
 }
 
-fn render_sarif(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
-    let index = ReportIndex::new(report);
+fn render_sarif(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
     let mut representatives = BTreeMap::new();
     for finding in report.findings.values() {
         representatives
@@ -573,7 +586,7 @@ fn render_sarif(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportErro
         .collect();
 
     let results: Vec<Value> = report.findings.values().map(|finding| {
-        let locations = sarif_locations(&index, finding);
+        let locations = sarif_locations(index, finding);
         let paths = index.paths(finding);
         let evidence: Vec<Value> = finding.evidence.iter().map(|item| json!({
             "description": item.description,
@@ -626,7 +639,11 @@ fn render_sarif(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportErro
     )
 }
 
-fn render_junit(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
+fn render_junit(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
     let failures = report
         .findings
         .values()
@@ -644,7 +661,7 @@ fn render_junit(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportErro
             finding.kind.as_str(),
             xml_attr(finding.id.as_str())
         ));
-        let body = finding_detail_text(report, finding);
+        let body = finding_detail_text(index, finding);
         if finding.status != crate::model::FindingStatus::Resolved {
             output.push_str(&format!(
                 "      <failure type=\"{}\" message=\"{}\">{}</failure>\n",
@@ -668,10 +685,14 @@ fn render_junit(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportErro
     output.finish()
 }
 
-fn render_html(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
+fn render_html(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
     let mut rows = BoundedText::new(limit);
     for finding in report.findings.values() {
-        let details = finding_detail_text(report, finding);
+        let details = finding_detail_text(index, finding);
         rows.push_str(&format!(
             "<tr><td><span class=\"severity {}\">{}</span></td><td>{}</td><td><code>{}</code></td><td>{}</td><td><details><summary>{}</summary><pre>{}</pre></details></td></tr>",
             finding.severity.as_str(), html_text(finding.severity.as_str()), html_text(finding.kind.as_str()),
@@ -696,7 +717,11 @@ fn render_html(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError
     );
     output.finish()
 }
-fn render_cyclonedx_vex(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
+fn render_cyclonedx_vex(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
     let components: Vec<Value> = report.inventory.components.values().map(|component| {
         json!({
             "type": "library", "bom-ref": component.identity.as_str(), "name": component.name,
@@ -709,7 +734,7 @@ fn render_cyclonedx_vex(report: &ScanReport, limit: usize) -> Result<Vec<u8>, Re
         let analysis = cdx_analysis(finding);
         let advisories: Vec<Value> = finding.evidence.iter().flat_map(|evidence| evidence.references.iter()).map(|url| json!({"url": url})).collect();
         let ratings = vec![json!({"severity": cdx_severity(finding.severity), "method": "other"})];
-        let properties = common_properties(report, finding);
+        let properties = common_properties(index, finding);
         json!({
             "bom-ref": finding.id.as_str(), "id": finding.advisory_id.as_deref().unwrap_or(finding.rule_id.as_str()),
             "source": {"name": "hooray"}, "ratings": ratings,
@@ -744,7 +769,11 @@ fn render_cyclonedx_vex(report: &ScanReport, limit: usize) -> Result<Vec<u8>, Re
     )
 }
 
-fn render_spdx(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
+fn render_spdx(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
     let ids: BTreeMap<_, _> = report
         .inventory
         .components
@@ -775,9 +804,9 @@ fn render_spdx(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError
         "comment": serde_json::to_string(&json!({
             "type": "hooray-finding", "schemaVersion": CANONICAL_REPORT_VERSION, "findingId": finding.id.as_str(),
             "ruleId": finding.rule_id.as_str(), "kind": finding.kind.as_str(), "severity": finding.severity.as_str(),
-            "componentId": finding.component_id.as_ref().map(|id| id.as_str()), "dependencyPaths": dependency_paths(report, finding),
+            "componentId": finding.component_id.as_ref().map(|id| id.as_str()), "dependencyPaths": index.paths(finding),
             "summary": finding.summary, "details": finding.details, "applicability": finding.applicability,
-            "remediation": finding.remediation, "evidence": finding.evidence, "policyOutcomes": policies_for(report, &finding.id)
+            "remediation": finding.remediation, "evidence": finding.evidence, "policyOutcomes": index.policies(&finding.id)
         })).expect("finding annotation contains only serializable report values")
     })).collect();
     pretty_json(
@@ -793,25 +822,33 @@ fn render_spdx(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError
     )
 }
 
-fn render_gitlab(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
+fn render_gitlab(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
     let findings: Vec<Value> = report.findings.values().map(|finding| {
-        let location = finding_location(report, finding);
+        let location = finding.location_id.as_ref().and_then(|id| index.locations.get(id).copied());
         let path = location.map(|item| item.path.as_str()).unwrap_or(".");
         let line = location.and_then(|item| item.start.map(|position| position.line)).unwrap_or(1).max(1);
         json!({
-            "description": finding_detail_text(report, finding), "check_name": finding.rule_id.as_str(),
+            "description": finding_detail_text(index, finding), "check_name": finding.rule_id.as_str(),
             "fingerprint": finding.id.as_str(), "severity": gitlab_severity(finding.severity),
             "location": {"path": path, "lines": {"begin": line}},
             "categories": [finding.kind.as_str()],
             "hooray": {"format_version": CANONICAL_REPORT_VERSION, "finding_id": finding.id.as_str(),
-                "component_id": finding.component_id.as_ref().map(|id| id.as_str()), "dependency_paths": dependency_paths(report, finding),
-                "remediation": finding.remediation, "policy_outcomes": policies_for(report, &finding.id), "evidence": finding.evidence}
+                "component_id": finding.component_id.as_ref().map(|id| id.as_str()), "dependency_paths": index.paths(finding),
+                "remediation": finding.remediation, "policy_outcomes": index.policies(&finding.id), "evidence": finding.evidence}
         })
     }).collect();
     pretty_json(&findings, limit)
 }
 
-fn render_json_lines(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
+fn render_json_lines(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
     let mut output = BoundedWriter::new(limit);
     for finding in report.findings.values() {
         let envelope = JsonLineEnvelope {
@@ -820,8 +857,8 @@ fn render_json_lines(report: &ScanReport, limit: usize) -> Result<Vec<u8>, Repor
             report_schema_version: &report.schema_version,
             run_id: report.run.id.as_str(),
             finding,
-            dependency_paths: dependency_paths(report, finding),
-            policy_outcomes: policies_for(report, &finding.id),
+            dependency_paths: index.paths(finding),
+            policy_outcomes: index.policies(&finding.id).to_vec(),
         };
         if let Err(error) = serde_json::to_writer(&mut output, &envelope) {
             if output.exceeded {
@@ -953,16 +990,6 @@ fn is_sensitive_key(key: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
-fn finding_location<'a>(report: &'a ScanReport, finding: &Finding) -> Option<&'a Location> {
-    let location_id = finding.location_id.as_ref()?;
-    report
-        .inventory
-        .components
-        .values()
-        .flat_map(|component| component.locations.iter())
-        .find(|location| &location.id == location_id)
-}
-
 fn sarif_locations(index: &ReportIndex<'_>, finding: &Finding) -> Vec<Value> {
     let mut ids = BTreeSet::new();
     if let Some(id) = &finding.location_id {
@@ -990,75 +1017,13 @@ fn sarif_locations(index: &ReportIndex<'_>, finding: &Finding) -> Vec<Value> {
     }).collect()
 }
 
-fn dependency_paths<'a>(report: &'a ScanReport, finding: &'a Finding) -> Vec<Vec<&'a str>> {
-    let Some(target) = finding.component_id.as_ref() else {
-        return Vec::new();
-    };
-    let mut roots: BTreeSet<_> = report.inventory.components.keys().collect();
-    for edge in &report.inventory.dependencies {
-        roots.remove(&edge.to);
-    }
-    if roots.is_empty() {
-        roots.extend(report.inventory.components.keys());
-    }
-    let adjacency: BTreeMap<_, Vec<_>> = report
-        .inventory
-        .components
-        .keys()
-        .map(|id| {
-            let children = report
-                .inventory
-                .dependencies
-                .iter()
-                .filter(|edge| &edge.from == id)
-                .map(|edge| &edge.to)
-                .collect();
-            (id, children)
-        })
-        .collect();
-    let mut paths = Vec::new();
-    for root in roots {
-        let mut stack = vec![(root, vec![root], BTreeSet::from([root]))];
-        while let Some((node, path, visited)) = stack.pop() {
-            if node == target {
-                paths.push(path.into_iter().map(|id| id.as_str()).collect());
-                if paths.len() >= 100 {
-                    return paths;
-                }
-                continue;
-            }
-            if let Some(children) = adjacency.get(node) {
-                for child in children.iter().rev() {
-                    if !visited.contains(child) {
-                        let mut next_path = path.clone();
-                        next_path.push(child);
-                        let mut next_visited = visited.clone();
-                        next_visited.insert(child);
-                        stack.push((child, next_path, next_visited));
-                    }
-                }
-            }
-        }
-    }
-    paths.sort();
-    paths
-}
-
-fn policies_for<'a>(report: &'a ScanReport, finding_id: &FindingId) -> Vec<&'a PolicyDecision> {
-    report
-        .policy_decisions
-        .iter()
-        .filter(|decision| decision.finding_id.as_ref() == Some(finding_id))
-        .collect()
-}
-
-fn common_properties(report: &ScanReport, finding: &Finding) -> Vec<Value> {
+fn common_properties(index: &ReportIndex<'_>, finding: &Finding) -> Vec<Value> {
     let mut properties = vec![
         json!({"name": "hooray:finding-id", "value": finding.id.as_str()}),
         json!({"name": "hooray:kind", "value": finding.kind.as_str()}),
-        json!({"name": "hooray:dependency-paths", "value": serde_json::to_string(&dependency_paths(report, finding)).expect("dependency paths are serializable")}),
+        json!({"name": "hooray:dependency-paths", "value": serde_json::to_string(&index.paths(finding)).expect("dependency paths are serializable")}),
         json!({"name": "hooray:evidence", "value": serde_json::to_string(&finding.evidence).expect("evidence is serializable")}),
-        json!({"name": "hooray:policy-outcomes", "value": serde_json::to_string(&policies_for(report, &finding.id)).expect("policy outcomes are serializable")}),
+        json!({"name": "hooray:policy-outcomes", "value": serde_json::to_string(index.policies(&finding.id)).expect("policy outcomes are serializable")}),
     ];
     if let Some(remediation) = &finding.remediation {
         properties.push(json!({"name": "hooray:remediation", "value": serde_json::to_string(remediation).expect("remediation is serializable")}));
@@ -1082,7 +1047,7 @@ fn cdx_analysis(finding: &Finding) -> Value {
     analysis
 }
 
-fn finding_detail_text(report: &ScanReport, finding: &Finding) -> String {
+fn finding_detail_text(index: &ReportIndex<'_>, finding: &Finding) -> String {
     let mut lines = vec![
         format!("Finding: {}", finding.id),
         format!("Rule: {}", finding.rule_id),
@@ -1098,7 +1063,7 @@ fn finding_detail_text(report: &ScanReport, finding: &Finding) -> String {
     if let Some(component) = &finding.component_id {
         lines.push(format!("Component: {component}"));
     }
-    for path in dependency_paths(report, finding) {
+    for path in index.paths(finding) {
         lines.push(format!("Dependency path: {}", path.join(" -> ")));
     }
     if let Some(remediation) = &finding.remediation {
@@ -1124,7 +1089,7 @@ fn finding_detail_text(report: &ScanReport, finding: &Finding) -> String {
             lines.push(format!("Evidence {key}: {value}"));
         }
     }
-    for decision in policies_for(report, &finding.id) {
+    for decision in index.policies(&finding.id) {
         lines.push(format!(
             "Policy {}: {} — {}",
             decision.policy_id,

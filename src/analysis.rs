@@ -43,6 +43,7 @@ impl ApplicabilityAnalyzer {
         let mut rationale = Vec::new();
         let ecosystem = purl_ecosystem(&input.component.purl);
         let evidence = EvidenceView::new(input.evidence);
+        let version = version_parts(&input.component.version);
         let paths = input
             .inventory
             .map(|inventory| dependency_paths(inventory, &input.component.identity))
@@ -106,7 +107,7 @@ impl ApplicabilityAnalyzer {
 
         let mut outcomes = BTreeSet::new();
         for range in matching_ranges {
-            match evaluate_range(range, &input.component.version) {
+            match evaluate_range(range, &input.component.version, version.as_deref()) {
                 RangeOutcome::Affected(detail) => {
                     outcomes.insert(ApplicabilityStatus::Affected);
                     rationale.push(detail);
@@ -270,7 +271,11 @@ enum RangeOutcome {
     Unknown(String),
 }
 
-fn evaluate_range(range: &OsvAffectedRange, version: &str) -> RangeOutcome {
+fn evaluate_range(
+    range: &OsvAffectedRange,
+    version: &str,
+    version_parts: Option<&[String]>,
+) -> RangeOutcome {
     if range.range_type == OsvRangeType::Git {
         return RangeOutcome::Unknown(
             "git ranges require commit identity; package version was not guessed as a commit"
@@ -295,7 +300,7 @@ fn evaluate_range(range: &OsvAffectedRange, version: &str) -> RangeOutcome {
                 saw_comparable = true;
                 crossed_fixed = None;
                 crossed_last_affected = None;
-            } else if let Some(ordering) = compare_versions(version, introduced) {
+            } else if let Some(ordering) = compare_version_parts(version_parts, introduced) {
                 saw_comparable = true;
                 if ordering != Ordering::Less {
                     active = true;
@@ -305,7 +310,7 @@ fn evaluate_range(range: &OsvAffectedRange, version: &str) -> RangeOutcome {
             }
         }
         if let Some(fixed) = event.fixed.as_deref()
-            && let Some(ordering) = compare_versions(version, fixed)
+            && let Some(ordering) = compare_version_parts(version_parts, fixed)
         {
             saw_comparable = true;
             if ordering != Ordering::Less {
@@ -314,7 +319,7 @@ fn evaluate_range(range: &OsvAffectedRange, version: &str) -> RangeOutcome {
             }
         }
         if let Some(last) = event.last_affected.as_deref()
-            && let Some(ordering) = compare_versions(version, last)
+            && let Some(ordering) = compare_version_parts(version_parts, last)
         {
             saw_comparable = true;
             if ordering == Ordering::Greater {
@@ -327,7 +332,7 @@ fn evaluate_range(range: &OsvAffectedRange, version: &str) -> RangeOutcome {
             }
         }
         if let Some(limit) = event.limit.as_deref()
-            && let Some(ordering) = compare_versions(version, limit)
+            && let Some(ordering) = compare_version_parts(version_parts, limit)
         {
             saw_comparable = true;
             if ordering != Ordering::Less {
@@ -359,9 +364,20 @@ fn evaluate_range(range: &OsvAffectedRange, version: &str) -> RangeOutcome {
     }
 }
 
+fn compare_version_parts(left: Option<&[String]>, right: &str) -> Option<Ordering> {
+    let left = left?;
+    let right = version_parts(right)?;
+    compare_parsed_versions(left, &right)
+}
+
+#[cfg(test)]
 fn compare_versions(left: &str, right: &str) -> Option<Ordering> {
     let left = version_parts(left)?;
     let right = version_parts(right)?;
+    compare_parsed_versions(&left, &right)
+}
+
+fn compare_parsed_versions(left: &[String], right: &[String]) -> Option<Ordering> {
     let length = left.len().max(right.len());
     for index in 0..length {
         let lhs = left.get(index).map(String::as_str).unwrap_or("0");

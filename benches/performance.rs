@@ -5,6 +5,9 @@ use std::{
 };
 
 use hooray::{
+    analysis::{
+        ApplicabilityAnalyzer, ApplicabilityInput, OsvAffectedRange, OsvEvent, OsvRangeType,
+    },
     graph::DependencyGraph,
     model::{
         Asset, AssetId, AssetKind, Component, ComponentId, Confidence, DependencyEdge, Evidence,
@@ -204,6 +207,31 @@ fn report_fixture(component_count: usize, findings_per_component: usize) -> Scan
     }
 }
 
+fn affected_ranges_fixture() -> Vec<OsvAffectedRange> {
+    (0..200)
+        .map(|range| OsvAffectedRange {
+            range_type: OsvRangeType::Semver,
+            ecosystem: Some("cargo".into()),
+            events: (0..10)
+                .flat_map(|interval| {
+                    let introduced = format!("{}.{}.0", range + 1, interval * 2);
+                    let fixed = format!("{}.{}.0", range + 1, interval * 2 + 1);
+                    [
+                        OsvEvent {
+                            introduced: Some(introduced),
+                            ..OsvEvent::default()
+                        },
+                        OsvEvent {
+                            fixed: Some(fixed),
+                            ..OsvEvent::default()
+                        },
+                    ]
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn main() {
     let (graph, components, target) = graph_fixture();
     let (iterations, elapsed) = measure(|| {
@@ -251,11 +279,48 @@ fn main() {
     });
     report("nearest_fixed_10000", iterations, elapsed);
 
+    let analysis_component = Component {
+        identity: component_id("component:analysis"),
+        name: "analysis".into(),
+        version: "100.10.5".into(),
+        purl: "pkg:cargo/analysis@100.10.5".into(),
+        scope: Scope::Runtime,
+        provenance: BTreeSet::new(),
+        licenses: BTreeSet::new(),
+        locations: BTreeSet::new(),
+    };
+    let ranges = affected_ranges_fixture();
+    let evidence = BTreeSet::new();
+    let (iterations, elapsed) = measure(|| {
+        black_box(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
+            component: black_box(&analysis_component),
+            inventory: None,
+            evidence: &evidence,
+            affected_ranges: black_box(&ranges),
+        }));
+    });
+    report("applicability_4000_events", iterations, elapsed);
+
     let large_report = report_fixture(250, 2);
     let (iterations, elapsed) = measure(|| {
         black_box(render(black_box(&large_report), ReportFormat::Sarif).expect("SARIF report"));
     });
     report("report_sarif_500", iterations, elapsed);
+
+    for (name, format) in [
+        ("report_table_500", ReportFormat::Table),
+        ("report_junit_500", ReportFormat::Junit),
+        ("report_html_500", ReportFormat::Html),
+        ("report_cdx_500", ReportFormat::CycloneDxVex),
+        ("report_spdx_500", ReportFormat::Spdx),
+        ("report_gitlab_500", ReportFormat::GitLabCodeQuality),
+        ("report_jsonl_500", ReportFormat::JsonLines),
+    ] {
+        let (iterations, elapsed) = measure(|| {
+            black_box(render(black_box(&large_report), format).expect("report"));
+        });
+        report(name, iterations, elapsed);
+    }
 
     let (iterations, elapsed) = measure(|| {
         let mut store = Store::open_memory().expect("memory store");
