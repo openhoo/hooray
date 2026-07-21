@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 (2026-07-21)
+
+### Performance
+
+- accelerate scanning hot paths (30c922b)
+
 ## 0.3.0 (2026-07-21)
 
 ### Other Changes
