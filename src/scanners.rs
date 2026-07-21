@@ -6,6 +6,7 @@ use std::{
     sync::LazyLock,
 };
 
+use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -162,6 +163,8 @@ pub fn scan_path(
     paths.sort();
 
     let mut output = ScanOutput::default();
+    let mut admitted = Vec::new();
+    let mut admitted_bytes = 0_u64;
     for path in paths {
         if output.scanned_files >= config.max_files {
             output.skipped_files += 1;
@@ -184,18 +187,49 @@ pub fn scan_path(
             .unwrap_or_else(|| path.file_name().map(Path::new).unwrap_or(&path))
             .to_string_lossy()
             .replace('\\', "/");
-        let mut analyzed = analyze_bytes(&display_path, &bytes, asset_id, config, signatures);
-        output.locations.append(&mut analyzed.locations);
-        output.findings.append(&mut analyzed.findings);
         output.scanned_files += 1;
         output.scanned_bytes += bytes.len() as u64;
+        admitted_bytes += bytes.len() as u64;
+        admitted.push((display_path, bytes));
+        if admitted.len() >= 32 || admitted_bytes >= 16 * 1024 * 1024 {
+            analyze_admitted(&mut admitted, &mut output, asset_id, config, signatures);
+            admitted_bytes = 0;
+        }
     }
+    analyze_admitted(&mut admitted, &mut output, asset_id, config, signatures);
     output
         .findings
         .sort_by(|left, right| left.id.cmp(&right.id));
     Ok(output)
 }
 
+fn analyze_admitted(
+    admitted: &mut Vec<(String, Vec<u8>)>,
+    output: &mut ScanOutput,
+    asset_id: &AssetId,
+    config: &ScannerConfig,
+    signatures: &MalwareSignatures,
+) {
+    if admitted.is_empty() {
+        return;
+    }
+    let batch = std::mem::take(admitted);
+    let analyzed: Vec<_> = if batch.len() >= 32 {
+        batch
+            .par_iter()
+            .map(|(path, bytes)| analyze_bytes(path, bytes, asset_id, config, signatures))
+            .collect()
+    } else {
+        batch
+            .iter()
+            .map(|(path, bytes)| analyze_bytes(path, bytes, asset_id, config, signatures))
+            .collect()
+    };
+    for mut file_output in analyzed {
+        output.locations.append(&mut file_output.locations);
+        output.findings.append(&mut file_output.findings);
+    }
+}
 fn read_path_bounded(
     path: &Path,
     limit: u64,
@@ -1790,6 +1824,47 @@ mod tests {
         assert_eq!(output.scanned_files, 1);
         assert!(output.skipped_files >= 1);
         assert!(output.scanned_bytes <= 32);
+    }
+
+    #[test]
+    fn parallel_file_analysis_preserves_deterministic_bounds_and_output() {
+        let directory = tempdir().unwrap();
+        for index in 0..40 {
+            fs::write(
+                directory.path().join(format!("source-{index:02}.py")),
+                format!("eval(user_input)\npassword = \"replace_me_please\"\n# {index}\n"),
+            )
+            .unwrap();
+        }
+        let config = ScannerConfig {
+            max_file_bytes: 1_024,
+            max_total_bytes: 100_000,
+            max_files: 32,
+            ..ScannerConfig::default()
+        };
+        let first = scan_path(
+            directory.path(),
+            &asset(),
+            &config,
+            &MalwareSignatures::default(),
+        )
+        .unwrap();
+        let second = scan_path(
+            directory.path(),
+            &asset(),
+            &config,
+            &MalwareSignatures::default(),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.scanned_files, 32);
+        assert_eq!(first.skipped_files, 1);
+        assert!(
+            first
+                .findings
+                .windows(2)
+                .all(|pair| pair[0].id <= pair[1].id)
+        );
     }
 
     #[test]

@@ -1,8 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     hint::black_box,
     time::{Duration, Instant},
 };
+
+use chrono::{TimeZone, Utc};
 
 use hooray::{
     analysis::{
@@ -16,9 +19,11 @@ use hooray::{
     },
     remediation::nearest_fixed_version,
     report::{ReportFormat, render},
-    scanners::{MalwareSignatures, ScannerConfig, analyze_bytes},
+    risk::{OperationalRiskAnalyzer, OperationalRiskConfig, OperationalRiskInput},
+    scanners::{MalwareSignatures, ScannerConfig, analyze_bytes, scan_path},
     store::Store,
 };
+use tempfile::TempDir;
 
 const SAMPLE_TIME: Duration = Duration::from_millis(750);
 
@@ -98,6 +103,20 @@ fn scanner_fixture() -> String {
         source.push_str("}\n");
     }
     source
+}
+
+fn scanner_tree_fixture(file_count: usize) -> TempDir {
+    let directory = TempDir::new().expect("scanner fixture directory");
+    let source = scanner_fixture();
+    let source = &source[..16 * 1024];
+    for index in 0..file_count {
+        fs::write(
+            directory.path().join(format!("source-{index:04}.rs")),
+            source,
+        )
+        .expect("scanner fixture file");
+    }
+    directory
 }
 
 fn remediation_fixture() -> Vec<String> {
@@ -232,6 +251,30 @@ fn affected_ranges_fixture() -> Vec<OsvAffectedRange> {
         .collect()
 }
 
+fn operational_risk_fixture(
+    component_count: usize,
+) -> (Inventory, BTreeMap<ComponentId, BTreeSet<Evidence>>) {
+    let report = report_fixture(component_count, 0);
+    let evidence = report
+        .inventory
+        .components
+        .keys()
+        .map(|component| {
+            (
+                component.clone(),
+                BTreeSet::from([Evidence {
+                    description: "provenance".into(),
+                    locations: BTreeSet::new(),
+                    references: BTreeSet::new(),
+                    properties: BTreeMap::from([("maintenance.status".into(), "abandoned".into())]),
+                    redacted: false,
+                }]),
+            )
+        })
+        .collect();
+    (report.inventory, evidence)
+}
+
 fn main() {
     let (graph, components, target) = graph_fixture();
     let (iterations, elapsed) = measure(|| {
@@ -268,6 +311,26 @@ fn main() {
         ));
     });
     report("scanner_rust_1mb", iterations, elapsed);
+
+    let scanner_tree = scanner_tree_fixture(256);
+    let scanner_tree_config = ScannerConfig {
+        max_file_bytes: 32 * 1024,
+        max_total_bytes: 16 * 1024 * 1024,
+        max_files: 256,
+        ..ScannerConfig::default()
+    };
+    let (iterations, elapsed) = measure(|| {
+        black_box(
+            scan_path(
+                black_box(scanner_tree.path()),
+                &asset,
+                &scanner_tree_config,
+                &signatures,
+            )
+            .expect("scanner tree"),
+        );
+    });
+    report("scanner_tree_256", iterations, elapsed);
 
     let versions = remediation_fixture();
     let (iterations, elapsed) = measure(|| {
@@ -321,6 +384,21 @@ fn main() {
         });
         report(name, iterations, elapsed);
     }
+
+    let (risk_inventory, risk_evidence) = operational_risk_fixture(10_000);
+    let risk_as_of = Utc
+        .with_ymd_and_hms(2026, 7, 21, 0, 0, 0)
+        .single()
+        .expect("risk timestamp");
+    let (iterations, elapsed) = measure(|| {
+        black_box(OperationalRiskAnalyzer::analyze(OperationalRiskInput {
+            inventory: &risk_inventory,
+            evidence_by_component: &risk_evidence,
+            as_of: risk_as_of,
+            config: OperationalRiskConfig::default(),
+        }));
+    });
+    report("operational_risk_10000", iterations, elapsed);
 
     let (iterations, elapsed) = measure(|| {
         let mut store = Store::open_memory().expect("memory store");

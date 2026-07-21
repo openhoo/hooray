@@ -194,6 +194,7 @@ pub struct OperationalRiskAnalyzer;
 impl OperationalRiskAnalyzer {
     pub fn analyze(input: OperationalRiskInput<'_>) -> BTreeMap<crate::model::FindingId, Finding> {
         let mut findings = BTreeMap::new();
+        let directness = DirectnessIndex::new(input.inventory);
         for component in input.inventory.components.values() {
             let Some(evidence) = input.evidence_by_component.get(&component.identity) else {
                 continue;
@@ -270,7 +271,7 @@ impl OperationalRiskAnalyzer {
                     confidence: Confidence::High,
                     applicability: ApplicabilityStatus::Affected,
                     component,
-                    direct: directness(input.inventory, &component.identity),
+                    direct: directness.classify(&component.identity),
                     remediation: None,
                     evidence: &relevant_evidence,
                     as_of: input.as_of.date_naive(),
@@ -310,22 +311,36 @@ impl OperationalRiskAnalyzer {
     }
 }
 
-fn directness(inventory: &Inventory, component: &ComponentId) -> Option<bool> {
-    let incoming: BTreeSet<_> = inventory.dependencies.iter().map(|edge| &edge.to).collect();
-    let roots: BTreeSet<_> = inventory
-        .components
-        .keys()
-        .filter(|id| !incoming.contains(id))
-        .collect();
-    if roots.contains(component) {
-        return Some(true);
+struct DirectnessIndex<'a> {
+    incoming: BTreeSet<&'a ComponentId>,
+    direct: BTreeSet<&'a ComponentId>,
+}
+
+impl<'a> DirectnessIndex<'a> {
+    fn new(inventory: &'a Inventory) -> Self {
+        let incoming: BTreeSet<_> = inventory.dependencies.iter().map(|edge| &edge.to).collect();
+        let roots: BTreeSet<_> = inventory
+            .components
+            .keys()
+            .filter(|id| !incoming.contains(id))
+            .collect();
+        let mut direct = roots.clone();
+        direct.extend(
+            inventory
+                .dependencies
+                .iter()
+                .filter(|edge| roots.contains(&edge.from))
+                .map(|edge| &edge.to),
+        );
+        Self { incoming, direct }
     }
-    inventory
-        .dependencies
-        .iter()
-        .any(|edge| &edge.to == component && roots.contains(&edge.from))
-        .then_some(true)
-        .or_else(|| incoming.contains(component).then_some(false))
+
+    fn classify(&self, component: &ComponentId) -> Option<bool> {
+        self.direct
+            .contains(component)
+            .then_some(true)
+            .or_else(|| self.incoming.contains(component).then_some(false))
+    }
 }
 
 fn supports_condition(evidence: &Evidence, condition: &str) -> bool {
