@@ -30,7 +30,7 @@ env:
 jobs:
   hooversion:
     name: Hooversion release
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (
@@ -87,7 +87,7 @@ jobs:
     name: Build and publish Linux artifact
     needs: hooversion
     if: needs.hooversion.outputs.current == 'true' && needs.hooversion.outputs.published == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -97,10 +97,17 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.hooversion.outputs.tag }}
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup default "$RUST_VERSION"
+      - name: Cache Rust dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            release-${{ runner.os }}-
+            rust-${{ runner.os }}-
 
       - name: Verify tag matches Cargo.toml
         env:

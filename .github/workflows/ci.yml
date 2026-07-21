@@ -16,12 +16,11 @@ concurrency:
 env:
   CARGO_DENY_VERSION: "0.19.8"
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.90.0"
 
 jobs:
-  commitlint:
-    name: Conventional Commits
-    runs-on: self-hosted
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -33,17 +32,21 @@ jobs:
         with:
           version: 0.1.1
 
-  rust:
-    name: Rust checks
-    runs-on: self-hosted
-    steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Cache Rust dependencies and tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/advisory-db
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-deny-${{ env.CARGO_DENY_VERSION }}
+          restore-keys: |
+            rust-${{ runner.os }}-
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
-          rustup default "$RUST_VERSION"
+      - name: Install cargo-deny when uncached
+        run: command -v cargo-deny >/dev/null || cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
 
       - name: Check formatting
         run: cargo fmt --check
@@ -54,20 +57,5 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
-  cargo-deny:
-    name: Dependency policy
-    runs-on: self-hosted
-    steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup default "$RUST_VERSION"
-
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
-
-      - name: Check advisories, licenses, bans, and sources
+      - name: Check dependency policy
         run: cargo deny check advisories bans licenses sources
