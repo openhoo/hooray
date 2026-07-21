@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 (2026-07-21)
+
+### Performance
+
+- accelerate analysis and reports (8a186de)
+
 ## 0.3.2 (2026-07-21)
 
 ### Performance
