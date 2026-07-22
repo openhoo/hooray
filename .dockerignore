@@ -1,0 +1,12 @@
+.git
+.dockerignore
+target
+hooray.db*
+.hooray-gitlab*
+gl-code-quality-report.json
+gl-sarif-report.sarif
+gl-sbom-hooray.cdx.json
+gl-junit-report.xml
+hooray.env
+*.sarif
+*.cdx.json

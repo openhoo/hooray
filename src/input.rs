@@ -341,6 +341,7 @@ impl InventoryBuilder {
         let inventory = Inventory {
             asset: self.asset,
             components: self.components,
+            locations: BTreeSet::new(),
             dependencies: self.dependencies,
         };
         inventory.validate()?;

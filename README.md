@@ -256,22 +256,40 @@ proxy when exposing the service beyond a host boundary.
 
 ### Integrations
 
-The CLI can generate bounded templates for pre-commit, GitHub Actions, and
-GitLab CI:
+The CLI generates bounded templates for pre-commit, GitHub Actions, universal
+GitLab CI, and GitLab 19.2+ Ultimate security ingestion:
 
 ```bash
 hooray integrations generate pre-commit --output .pre-commit-config.yaml
 hooray integrations generate github-actions --output hooray.yml
 hooray integrations generate gitlab-ci --output hooray.gitlab-ci.yml
+hooray integrations generate gitlab-security --output hooray.gitlab-security.yml
 ```
 
-Review generated templates before adoption and adapt their scan input and policy
-paths to the repository. The integration library also renders GitHub SARIF and
-check-run payloads, GitLab Code Quality and dependency-scanning payloads, Slack
+Both GitLab templates run one scan and publish Code Quality, JUnit, and dotenv
+reports before enforcing policy in a later `security-gate` stage. The
+`gitlab-security` template additionally declares SARIF security ingestion and
+CycloneDX SBOM ingestion for GitLab 19.2+ Ultimate. SARIF is the vulnerability,
+SAST, and supported secret-detection feed; CycloneDX populates GitLab's
+dependency list and continuous dependency scanning. Consumers with an existing
+top-level `stages` list must merge the `security-gate` stage.
+
+`HOORAY_IMAGE` is required and has no mutable fallback. Set it to the verified
+`ghcr.io/openhoo/hooray@sha256:<digest>` recorded in the matching GitHub Release.
+Before merging template support, an OpenHoo owner must bootstrap the GHCR package
+from this repository's Dockerfile, link it to `openhoo/hooray`, make it public,
+remove local credentials, and prove an anonymous digest pull, `--version`, and
+UID 1000 execution. Keep that bootstrap image until a normal release image is
+published and anonymously verified. The templates default `HOORAY_INPUT` to `.`
+and `HOORAY_POLICY` to `hooray-policy.yaml`; that policy file must exist because
+the scan engine always loads policy. Set `HOORAY_DISABLED=true` to skip both
+jobs.
+
+Review generated templates before adoption. The integration library also
+renders bounded GitHub SARIF and check-run payloads, GitLab Code Quality, Slack
 summaries, VS Code/LSP diagnostics, pull-request gates, and HTTPS-only signed
-webhooks. Webhook signatures are versioned, payloads and annotations are
-bounded, secrets must be 16–4,096 bytes, URLs cannot contain credentials, and
-signature verification uses constant-time comparison.
+webhooks. Webhook signatures are versioned, secrets must be 16–4,096 bytes,
+URLs cannot contain credentials, and verification uses constant-time comparison.
 
 ## Installation
 
@@ -314,13 +332,14 @@ hooray history diff PREVIOUS_RUN_ID CURRENT_RUN_ID [--format json|yaml] [--outpu
 hooray report RUN_ID [--format FORMAT] [--output FILE]
 hooray serve
 hooray monitor [--once]
-hooray integrations generate pre-commit|github-actions|gitlab-ci [--output FILE]
+hooray integrations generate pre-commit|github-actions|gitlab-ci|gitlab-security [--output FILE]
 ```
 
 `INPUT` must match the selected scan subcommand. Use `-` as input only with
 `scan sbom` or `scan auto`. Output defaults to JSON on standard output; use
-`--output FILE` for a file. The default policy is `hooray-policy.yaml` and the
-default history database is `hooray.db`.
+`--output FILE` for a file. `gitlab-artifacts` instead requires a new directory
+path. The default policy is `hooray-policy.yaml` and the default history database
+is `hooray.db`.
 
 Examples:
 
@@ -331,6 +350,9 @@ cat bom.cdx.json | hooray scan sbom - --format json-lines
 hooray scan artifact release.zip --format sarif --output hooray.sarif
 hooray scan container image.tar --format spdx --output inventory.spdx.json
 hooray scan auto ./input --format gitlab-code-quality --output gl-code-quality-report.json
+hooray scan auto ./input --format gitlab-sarif --output gl-sarif-report.sarif
+hooray scan auto ./input --format gitlab-cyclonedx --output gl-sbom-hooray.cdx.json
+hooray scan auto ./input --format gitlab-artifacts --output .hooray-gitlab
 ```
 
 ## Output formats
@@ -343,13 +365,21 @@ history, and standalone policy-evaluation commands support JSON and YAML only.
 | `json` | Canonical structured scan report |
 | `yaml` | Canonical report serialized as YAML |
 | `table` | Deterministic human-readable text table |
-| `sarif` | SARIF 2.1.0 for code-scanning ingestion |
+| `sarif` | Generic SARIF 2.1.0 |
+| `gitlab-sarif` | GitLab 19.2+ SARIF 2.1.0 security ingestion |
 | `junit` | JUnit XML for CI test-report ingestion |
 | `html` | Standalone escaped HTML report |
 | `cyclonedx-vex` | CycloneDX JSON with vulnerability analysis |
+| `gitlab-cyclonedx` | CycloneDX 1.6 inventory for GitLab dependency ingestion |
 | `spdx` | SPDX 2.3 JSON inventory |
 | `gitlab-code-quality` | GitLab Code Quality JSON |
 | `json-lines` | NDJSON envelopes for run, component, finding, policy, and summary records |
+| `gitlab-artifacts` | Atomic directory bundle containing all five GitLab artifacts |
+
+The `gitlab-artifacts` directory contains exactly
+`gl-code-quality-report.json`, `gl-sarif-report.sarif`,
+`gl-sbom-hooray.cdx.json`, `gl-junit-report.xml`, and `hooray.env`. The
+destination parent must already exist and the destination itself must not.
 
 Rendered reports validate model invariants, enforce item/text/output bounds, sort
 stable collections deterministically, escape format-specific content, and

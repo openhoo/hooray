@@ -646,6 +646,7 @@ mod tests {
                     locations: BTreeSet::new(),
                 },
             )]),
+            locations: BTreeSet::new(),
             dependencies: BTreeSet::new(),
         }
     }

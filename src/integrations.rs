@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::{
     model::{Finding, FindingId, FindingKind, Location, PolicyOutcome, ScanReport, Severity},
+    report::{ReportIndex, gitlab_code_quality_entry, gitlab_finding_location},
     store::ReportDiff,
 };
 
@@ -217,24 +218,24 @@ impl IntegrationGenerator {
         report: &ScanReport,
     ) -> Result<GeneratedArtifact, IntegrationError> {
         let selected = self.selected_findings(report);
+        let index = ReportIndex::new(report);
         let value = Value::Array(
             selected
                 .items
                 .iter()
-                .map(|finding| {
-                    let location = report_location(report, finding);
-                    json!({
-                        "description": self.finding_message(finding),
-                        "check_name": finding.rule_id.as_str(),
-                        "fingerprint": finding.id.as_str(),
-                        "severity": gitlab_quality_severity(finding.severity),
-                        "location": {
-                            "path": location.map_or(".", |value| value.path.as_str()),
-                            "lines": { "begin": location.and_then(|value| value.start).map_or(1, |value| value.line.max(1)) }
-                        },
-                        "categories": ["Security"],
-                        "hooray_truncated": selected.truncated
-                    })
+                .filter_map(|finding| {
+                    let location = gitlab_finding_location(report, &index, finding)?;
+                    let mut bounded = (*finding).clone();
+                    bounded.summary = Some(self.finding_title(finding));
+                    bounded.details = Some(self.finding_message(finding));
+                    bounded.evidence.clear();
+                    bounded.remediation = None;
+                    let mut entry = gitlab_code_quality_entry(report, &index, &bounded, &location);
+                    entry
+                        .as_object_mut()
+                        .expect("Code Quality entry is an object")
+                        .remove("hooray");
+                    Some(entry)
                 })
                 .collect(),
         );
@@ -363,10 +364,26 @@ impl IntegrationGenerator {
     }
 
     pub fn gitlab_ci_include(&self) -> Result<GeneratedArtifact, IntegrationError> {
-        self.text_artifact(
-            "text/yaml",
-            "hooray-security:\n  stage: test\n  image: rust:1.90\n  variables:\n    CARGO_NET_GIT_FETCH_WITH_CLI: \"true\"\n  script:\n    - cargo install hooray --locked\n    - hooray scan project . --format gitlab-code-quality --output gl-code-quality-report.json\n  artifacts:\n    when: always\n    reports:\n      codequality: gl-code-quality-report.json\n    expire_in: 1 week\n",
-        )
+        self.gitlab_ci_template(false)
+    }
+
+    pub fn gitlab_security_ci_include(&self) -> Result<GeneratedArtifact, IntegrationError> {
+        self.gitlab_ci_template(true)
+    }
+
+    fn gitlab_ci_template(
+        &self,
+        security_reports: bool,
+    ) -> Result<GeneratedArtifact, IntegrationError> {
+        let security = if security_reports {
+            "      sarif: .hooray-gitlab/gl-sarif-report.sarif\n      cyclonedx: .hooray-gitlab/gl-sbom-hooray.cdx.json\n"
+        } else {
+            ""
+        };
+        let template = format!(
+            "stages: [test, security-gate]\n\nhooray_security:\n  stage: test\n  image:\n    name: $HOORAY_IMAGE\n    entrypoint: [\"\"]\n  allow_failure: false\n  variables:\n    HOORAY_INPUT: \".\"\n    HOORAY_POLICY: \"hooray-policy.yaml\"\n  rules:\n    - if: '$HOORAY_DISABLED == \"true\"'\n      when: never\n    - when: on_success\n  script:\n    - |\n      set +e\n      hooray scan auto \"$HOORAY_INPUT\" --policy \"$HOORAY_POLICY\" --format gitlab-artifacts --output .hooray-gitlab\n      status=$?\n      set -e\n      test \"$status\" -le 1\n  artifacts:\n    when: always\n    expire_in: 1 week\n    paths: [.hooray-gitlab/]\n    reports:\n      codequality: .hooray-gitlab/gl-code-quality-report.json\n      junit: .hooray-gitlab/gl-junit-report.xml\n      dotenv: .hooray-gitlab/hooray.env\n{security}\nhooray_policy:\n  stage: security-gate\n  image: alpine:3.22\n  allow_failure: false\n  rules:\n    - if: '$HOORAY_DISABLED == \"true\"'\n      when: never\n    - when: always\n  needs:\n    - job: hooray_security\n      artifacts: true\n  script:\n    - |\n      file=.hooray-gitlab/hooray.env\n      test -f \"$file\"\n      test \"$(wc -l < \"$file\")\" -eq 2\n      test \"$(grep -c '^HOORAY_POLICY_DENIED=' \"$file\")\" -eq 1\n      test \"$(grep -c '^HOORAY_POLICY_DENIED_COUNT=' \"$file\")\" -eq 1\n      test -z \"$(grep -Ev '^(HOORAY_POLICY_DENIED=(true|false)|HOORAY_POLICY_DENIED_COUNT=[0-9]+)$' \"$file\")\"\n      denied=$(awk -F= '$1 == \"HOORAY_POLICY_DENIED\" {{ print $2 }}' \"$file\")\n      test \"$denied\" = false\n"
+        );
+        self.text_artifact("text/yaml", &template)
     }
 
     pub fn vscode_diagnostics(
@@ -840,16 +857,6 @@ fn github_annotation_level(severity: Severity) -> &'static str {
     }
 }
 
-fn gitlab_quality_severity(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Critical => "blocker",
-        Severity::High => "critical",
-        Severity::Medium => "major",
-        Severity::Low => "minor",
-        Severity::Unknown => "info",
-    }
-}
-
 fn lsp_severity(severity: Severity) -> u8 {
     match severity {
         Severity::Critical | Severity::High => 1,
@@ -949,6 +956,7 @@ mod tests {
                         locations,
                     },
                 )]),
+                locations: BTreeSet::new(),
                 dependencies: BTreeSet::new(),
             },
             findings: findings
@@ -1117,12 +1125,12 @@ mod tests {
 
     #[test]
     fn secret_findings_and_embedded_tokens_never_leak() {
-        let secret = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ";
+        let secret = "[github_token_redacted]";
         let mut finding = finding(
             "finding:secret",
             FindingKind::Secret,
             Severity::Critical,
-            false,
+            true,
         );
         finding.summary = Some(format!("Leaked {secret}"));
         finding.details = Some(format!("password={secret}"));
@@ -1130,7 +1138,7 @@ mod tests {
             description: secret.into(),
             locations: BTreeSet::new(),
             references: BTreeSet::new(),
-            properties: BTreeMap::new(),
+            properties: BTreeMap::from([("captured".into(), secret.into())]),
             redacted: true,
         });
         let report = report(vec![finding]);
@@ -1142,7 +1150,11 @@ mod tests {
         ] {
             let text = artifact.text().unwrap();
             assert!(!text.contains(secret));
-            assert!(text.contains("redact") || text.contains("Secret detected"));
+            let omitted_unlocatable = serde_json::from_slice::<Value>(&artifact.body)
+                .is_ok_and(|value| value.as_array().is_some_and(Vec::is_empty));
+            assert!(
+                omitted_unlocatable || text.contains("redact") || text.contains("Secret detected")
+            );
         }
         assert_eq!(
             generator(10).clean_text(&format!("token={secret} okay")),
@@ -1193,21 +1205,57 @@ mod tests {
         assert!(github_text.contains("upload-sarif@v3"));
         assert!(github_text.contains("hooray scan project . --format sarif --output hooray.sarif"));
 
-        let gitlab = generator.gitlab_ci_include().unwrap();
-        let gitlab: Value = serde_yaml::from_slice(&gitlab.body).unwrap();
-        assert_eq!(
-            gitlab["hooray-security"]["script"][1],
-            "hooray scan project . --format gitlab-code-quality --output gl-code-quality-report.json"
-        );
-        assert_eq!(
-            gitlab["hooray-security"]["artifacts"]["reports"]["codequality"],
-            "gl-code-quality-report.json"
-        );
-        assert!(
-            gitlab["hooray-security"]["artifacts"]["reports"]
-                .get("dependency_scanning")
-                .is_none()
-        );
+        for (artifact, security) in [
+            (generator.gitlab_ci_include().unwrap(), false),
+            (generator.gitlab_security_ci_include().unwrap(), true),
+        ] {
+            let gitlab: Value = serde_yaml::from_slice(&artifact.body).unwrap();
+            assert_eq!(gitlab["stages"], json!(["test", "security-gate"]));
+            let scanner = &gitlab["hooray_security"];
+            assert_eq!(scanner["image"]["name"], "$HOORAY_IMAGE");
+            assert_eq!(scanner["image"]["entrypoint"], json!([""]));
+            assert_eq!(scanner["allow_failure"], false);
+            assert_eq!(scanner["variables"]["HOORAY_INPUT"], ".");
+            assert_eq!(scanner["variables"]["HOORAY_POLICY"], "hooray-policy.yaml");
+            let reports = &scanner["artifacts"]["reports"];
+            assert_eq!(
+                reports["codequality"],
+                ".hooray-gitlab/gl-code-quality-report.json"
+            );
+            assert_eq!(reports["junit"], ".hooray-gitlab/gl-junit-report.xml");
+            assert_eq!(reports["dotenv"], ".hooray-gitlab/hooray.env");
+            assert_eq!(reports.get("sarif").is_some(), security);
+            assert_eq!(reports.get("cyclonedx").is_some(), security);
+            let scan_script = scanner["script"][0].as_str().unwrap();
+            assert!(scan_script.contains("set +e\nhooray scan auto \"$HOORAY_INPUT\" --policy \"$HOORAY_POLICY\" --format gitlab-artifacts --output .hooray-gitlab\nstatus=$?\nset -e\ntest \"$status\" -le 1"));
+            let gate = &gitlab["hooray_policy"];
+            assert_eq!(gate["stage"], "security-gate");
+            assert_eq!(gate["image"], "alpine:3.22");
+            assert_eq!(gate["rules"][1]["when"], "always");
+            assert_eq!(gate["needs"][0]["job"], "hooray_security");
+            assert_eq!(gate["needs"][0]["artifacts"], true);
+            let gate_script = gate["script"][0].as_str().unwrap();
+            assert!(gate_script.contains("file=.hooray-gitlab/hooray.env"));
+            assert!(!gate_script.contains("$HOORAY_POLICY_DENIED"));
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".hooray-gitlab")).unwrap();
+        std::fs::write(
+            temp.path().join(".hooray-gitlab/hooray.env"),
+            "HOORAY_POLICY_DENIED=true\nHOORAY_POLICY_DENIED_COUNT=1\n",
+        )
+        .unwrap();
+        let artifact = generator.gitlab_ci_include().unwrap();
+        let gitlab: Value = serde_yaml::from_slice(&artifact.body).unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(gitlab["hooray_policy"]["script"][0].as_str().unwrap())
+            .current_dir(temp.path())
+            .env("HOORAY_POLICY_DENIED", "false")
+            .status()
+            .unwrap();
+        assert!(!status.success());
     }
 
     #[test]

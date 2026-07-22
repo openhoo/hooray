@@ -233,6 +233,8 @@ pub struct Inventory {
     pub asset: Asset,
     #[serde(default)]
     pub components: BTreeMap<ComponentId, Component>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub locations: BTreeSet<Location>,
     #[serde(default)]
     pub dependencies: BTreeSet<DependencyEdge>,
 }
@@ -241,6 +243,10 @@ impl Inventory {
     pub fn validate(&self) -> Result<(), ModelInvariantError> {
         require_text("asset.name", &self.asset.name)?;
         let mut location_ids = BTreeSet::new();
+
+        for location in &self.locations {
+            validate_location(location, &self.asset.id, &mut location_ids)?;
+        }
 
         for (id, component) in &self.components {
             if id != &component.identity {
@@ -254,20 +260,7 @@ impl Inventory {
                 require_text("source.locator", &source.locator)?;
             }
             for location in &component.locations {
-                require_text("location.path", &location.path)?;
-                if location.asset_id != self.asset.id {
-                    return Err(ModelInvariantError::ForeignLocation(location.id.clone()));
-                }
-                if !location_ids.insert(&location.id) {
-                    return Err(ModelInvariantError::DuplicateLocation(location.id.clone()));
-                }
-                if let (Some(start), Some(end)) = (location.start, location.end)
-                    && end < start
-                {
-                    return Err(ModelInvariantError::InvalidLocationRange(
-                        location.id.clone(),
-                    ));
-                }
+                validate_location(location, &self.asset.id, &mut location_ids)?;
             }
         }
 
@@ -285,12 +278,39 @@ impl Inventory {
         Ok(())
     }
 
-    fn location_ids(&self) -> BTreeSet<&LocationId> {
-        self.components
-            .values()
-            .flat_map(|component| component.locations.iter().map(|location| &location.id))
+    pub(crate) fn location_ids(&self) -> BTreeSet<&LocationId> {
+        self.locations
+            .iter()
+            .chain(
+                self.components
+                    .values()
+                    .flat_map(|component| component.locations.iter()),
+            )
+            .map(|location| &location.id)
             .collect()
     }
+}
+
+fn validate_location<'a>(
+    location: &'a Location,
+    asset_id: &AssetId,
+    location_ids: &mut BTreeSet<&'a LocationId>,
+) -> Result<(), ModelInvariantError> {
+    require_text("location.path", &location.path)?;
+    if &location.asset_id != asset_id {
+        return Err(ModelInvariantError::ForeignLocation(location.id.clone()));
+    }
+    if !location_ids.insert(&location.id) {
+        return Err(ModelInvariantError::DuplicateLocation(location.id.clone()));
+    }
+    if let (Some(start), Some(end)) = (location.start, location.end)
+        && end < start
+    {
+        return Err(ModelInvariantError::InvalidLocationRange(
+            location.id.clone(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -898,12 +918,78 @@ mod tests {
     }
 
     #[test]
+    fn inventory_locations_validate_and_deserialize_legacy_payloads() {
+        let asset = asset();
+        let location = Location {
+            id: LocationId::new("location:global").unwrap(),
+            asset_id: asset.id.clone(),
+            path: "sample.py".into(),
+            start: Some(Position { line: 1, column: 1 }),
+            end: Some(Position { line: 1, column: 8 }),
+        };
+        let inventory = Inventory {
+            asset: asset.clone(),
+            components: BTreeMap::new(),
+            locations: BTreeSet::from([location.clone()]),
+            dependencies: BTreeSet::new(),
+        };
+        inventory.validate().unwrap();
+        assert!(inventory.location_ids().contains(&location.id));
+
+        let legacy: Inventory = serde_json::from_value(serde_json::json!({
+            "asset": asset,
+            "components": {},
+            "dependencies": []
+        }))
+        .unwrap();
+        assert!(legacy.locations.is_empty());
+
+        let mut component = component();
+        component.locations.insert(location.clone());
+        let duplicate = Inventory {
+            asset: inventory.asset.clone(),
+            components: BTreeMap::from([(component.identity.clone(), component)]),
+            locations: BTreeSet::from([location.clone()]),
+            dependencies: BTreeSet::new(),
+        };
+        assert!(matches!(
+            duplicate.validate(),
+            Err(ModelInvariantError::DuplicateLocation(id)) if id == location.id
+        ));
+
+        for invalid in [
+            Location {
+                path: "".into(),
+                ..location.clone()
+            },
+            Location {
+                asset_id: AssetId::new("asset:other").unwrap(),
+                ..location.clone()
+            },
+            Location {
+                start: Some(Position { line: 2, column: 1 }),
+                end: Some(Position { line: 1, column: 1 }),
+                ..location.clone()
+            },
+        ] {
+            let candidate = Inventory {
+                asset: inventory.asset.clone(),
+                components: BTreeMap::new(),
+                locations: BTreeSet::from([invalid]),
+                dependencies: BTreeSet::new(),
+            };
+            assert!(candidate.validate().is_err());
+        }
+    }
+
+    #[test]
     fn inventory_rejects_unknown_graph_endpoints() {
         let component = component();
         let id = component.identity.clone();
         let inventory = Inventory {
             asset: asset(),
             components: BTreeMap::from([(id.clone(), component)]),
+            locations: BTreeSet::new(),
             dependencies: BTreeSet::from([DependencyEdge {
                 from: id,
                 to: ComponentId::new("component:missing").unwrap(),
@@ -961,6 +1047,7 @@ mod tests {
             inventory: Inventory {
                 asset: asset(),
                 components: BTreeMap::from([(component_id, component)]),
+                locations: BTreeSet::new(),
                 dependencies: BTreeSet::new(),
             },
             findings: BTreeMap::from([(finding_id, finding)]),
@@ -1020,6 +1107,7 @@ mod tests {
             inventory: Inventory {
                 asset: asset(),
                 components: BTreeMap::from([(component_id, component)]),
+                locations: BTreeSet::new(),
                 dependencies: BTreeSet::new(),
             },
             findings: BTreeMap::from([(finding_id, finding)]),

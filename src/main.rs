@@ -205,6 +205,7 @@ enum IntegrationKind {
     PreCommit,
     GithubActions,
     GitlabCi,
+    GitlabSecurity,
 }
 
 #[derive(Debug, Args)]
@@ -215,33 +216,45 @@ struct OutputArgs {
     output: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     Json,
     Yaml,
     Table,
     Sarif,
+    GitlabSarif,
     Junit,
     Html,
     CycloneDxVex,
+    GitlabCyclonedx,
     Spdx,
     GitlabCodeQuality,
     JsonLines,
+    GitlabArtifacts,
 }
 
-impl From<OutputFormat> for ReportFormat {
-    fn from(value: OutputFormat) -> Self {
+#[derive(Debug, thiserror::Error)]
+#[error("'{0}' is a directory artifact bundle, not a single report format")]
+struct ReportFormatConversionError(&'static str);
+
+impl TryFrom<OutputFormat> for ReportFormat {
+    type Error = ReportFormatConversionError;
+
+    fn try_from(value: OutputFormat) -> Result<Self, Self::Error> {
         match value {
-            OutputFormat::Json => Self::Json,
-            OutputFormat::Yaml => Self::Yaml,
-            OutputFormat::Table => Self::Table,
-            OutputFormat::Sarif => Self::Sarif,
-            OutputFormat::Junit => Self::Junit,
-            OutputFormat::Html => Self::Html,
-            OutputFormat::CycloneDxVex => Self::CycloneDxVex,
-            OutputFormat::Spdx => Self::Spdx,
-            OutputFormat::GitlabCodeQuality => Self::GitLabCodeQuality,
-            OutputFormat::JsonLines => Self::JsonLines,
+            OutputFormat::Json => Ok(Self::Json),
+            OutputFormat::Yaml => Ok(Self::Yaml),
+            OutputFormat::Table => Ok(Self::Table),
+            OutputFormat::Sarif => Ok(Self::Sarif),
+            OutputFormat::GitlabSarif => Ok(Self::GitLabSarif),
+            OutputFormat::Junit => Ok(Self::Junit),
+            OutputFormat::Html => Ok(Self::Html),
+            OutputFormat::CycloneDxVex => Ok(Self::CycloneDxVex),
+            OutputFormat::GitlabCyclonedx => Ok(Self::GitLabCycloneDx),
+            OutputFormat::Spdx => Ok(Self::Spdx),
+            OutputFormat::GitlabCodeQuality => Ok(Self::GitLabCodeQuality),
+            OutputFormat::JsonLines => Ok(Self::JsonLines),
+            OutputFormat::GitlabArtifacts => Err(ReportFormatConversionError("gitlab-artifacts")),
         }
     }
 }
@@ -319,8 +332,7 @@ async fn run_scan(config: &Config, args: ScanArgs) -> Result<CommandOutcome> {
         .scan(request)
         .await
         .context("scan orchestration failed")?;
-    let bytes = report::render(&report, args.output.format.into())?;
-    write_bytes(&bytes, &args.output.output)?;
+    write_report_output(&report, &args.output)?;
     Ok(classify_report(&report))
 }
 
@@ -408,8 +420,7 @@ fn run_history(config: &Config, args: HistoryArgs) -> Result<CommandOutcome> {
 fn run_report(config: &Config, args: ReportArgs) -> Result<CommandOutcome> {
     let store = open_store(config)?;
     let report = required_run(&store, &args.run_id)?;
-    let bytes = report::render(&report, args.output.format.into())?;
-    write_bytes(&bytes, &args.output.output)?;
+    write_report_output(&report, &args.output)?;
     Ok(classify_report(&report))
 }
 
@@ -584,6 +595,7 @@ fn run_integrations(args: IntegrationsArgs) -> Result<CommandOutcome> {
         IntegrationKind::PreCommit => generator.pre_commit_config()?,
         IntegrationKind::GithubActions => generator.github_actions_workflow()?,
         IntegrationKind::GitlabCi => generator.gitlab_ci_include()?,
+        IntegrationKind::GitlabSecurity => generator.gitlab_security_ci_include()?,
     };
     write_bytes(&artifact.body, &args.output)?;
     Ok(CommandOutcome::Passed)
@@ -608,14 +620,27 @@ fn classify_report(report: &ScanReport) -> CommandOutcome {
     }
 }
 
+fn write_report_output(report: &ScanReport, args: &OutputArgs) -> Result<()> {
+    if args.format == OutputFormat::GitlabArtifacts {
+        report::write_gitlab_artifacts(&args.output, report)?;
+    } else {
+        let bytes = report::render(report, ReportFormat::try_from(args.format)?)?;
+        write_bytes(&bytes, &args.output)?;
+    }
+    Ok(())
+}
+
 fn write_output<T: Serialize>(value: &T, args: &OutputArgs) -> Result<()> {
+    if !matches!(args.format, OutputFormat::Json | OutputFormat::Yaml) {
+        bail!("this command supports only json and yaml output");
+    }
     if args.output == Path::new("-") {
         let stdout = io::stdout();
         let mut writer = stdout.lock();
         match args.format {
             OutputFormat::Json => serde_json::to_writer_pretty(&mut writer, value)?,
             OutputFormat::Yaml => serde_yaml::to_writer(&mut writer, value)?,
-            _ => bail!("this command supports only json and yaml output"),
+            _ => unreachable!("format checked above"),
         }
         writer.write_all(b"\n")?;
         writer.flush()?;
@@ -625,7 +650,7 @@ fn write_output<T: Serialize>(value: &T, args: &OutputArgs) -> Result<()> {
         match args.format {
             OutputFormat::Json => serde_json::to_writer_pretty(&mut writer, value)?,
             OutputFormat::Yaml => serde_yaml::to_writer(&mut writer, value)?,
-            _ => bail!("this command supports only json and yaml output"),
+            _ => unreachable!("format checked above"),
         }
         writer.write_all(b"\n")?;
         writer.flush()?;
@@ -755,6 +780,7 @@ mod tests {
                     metadata: BTreeMap::new(),
                 },
                 components: BTreeMap::new(),
+                locations: BTreeSet::new(),
                 dependencies: BTreeSet::new(),
             },
             findings,
@@ -1007,7 +1033,8 @@ mod tests {
         for (kind, marker) in [
             (IntegrationKind::PreCommit, "repos:"),
             (IntegrationKind::GithubActions, "upload-sarif@v3"),
-            (IntegrationKind::GitlabCi, "codequality:"),
+            (IntegrationKind::GitlabCi, "hooray_policy:"),
+            (IntegrationKind::GitlabSecurity, "sarif:"),
         ] {
             let destination = temp.path().join(format!("{kind:?}.yaml"));
             assert_eq!(
@@ -1026,17 +1053,27 @@ mod tests {
                     .contains(marker)
             );
         }
-
         for command in [
             "hooray scan project . --format json",
             "hooray scan project . --format sarif --output hooray.sarif",
-            "hooray scan project . --format gitlab-code-quality --output gl-code-quality-report.json",
+            "hooray scan auto . --policy hooray-policy.yaml --format gitlab-artifacts --output .hooray-gitlab",
+            "hooray scan auto . --format gitlab-sarif --output gl-sarif-report.sarif",
+            "hooray scan auto . --format gitlab-cyclonedx --output gl-sbom-hooray.cdx.json",
         ] {
             assert!(
                 Cli::try_parse_from(command.split_whitespace()).is_ok(),
                 "{command}"
             );
         }
+        assert_eq!(
+            ReportFormat::try_from(OutputFormat::GitlabSarif).unwrap(),
+            ReportFormat::GitLabSarif
+        );
+        assert_eq!(
+            ReportFormat::try_from(OutputFormat::GitlabCyclonedx).unwrap(),
+            ReportFormat::GitLabCycloneDx
+        );
+        assert!(ReportFormat::try_from(OutputFormat::GitlabArtifacts).is_err());
     }
 
     #[test]
@@ -1079,6 +1116,96 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("does not support --once"));
+    }
+
+    #[test]
+    fn structured_output_rejects_bundle_before_opening_destination() {
+        let temp = TempDir::new().unwrap();
+        let destination = temp.path().join("unsupported.out");
+        assert!(
+            write_output(
+                &json!({"safe": true}),
+                &output(destination.clone(), OutputFormat::GitlabArtifacts)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("only json and yaml")
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn stored_report_bundle_dispatch_preserves_policy_outcome_and_destination_rules() {
+        let temp = TempDir::new().unwrap();
+        let config = config(&temp);
+        save_reports(
+            &config,
+            &[report("run:bundle", "2026-01-01T00:00:00.000Z", &[], 1)],
+        );
+        let destination = temp.path().join("gitlab");
+        let outcome = run_report(
+            &config,
+            ReportArgs {
+                run_id: RunId::new("run:bundle").unwrap(),
+                output: output(destination.clone(), OutputFormat::GitlabArtifacts),
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, CommandOutcome::PolicyDenied);
+        let names: BTreeSet<_> = std::fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "gl-code-quality-report.json".to_owned(),
+                "gl-junit-report.xml".to_owned(),
+                "gl-sarif-report.sarif".to_owned(),
+                "gl-sbom-hooray.cdx.json".to_owned(),
+                "hooray.env".to_owned(),
+            ])
+        );
+
+        std::fs::write(destination.join("sentinel"), "keep").unwrap();
+        assert!(
+            run_report(
+                &config,
+                ReportArgs {
+                    run_id: RunId::new("run:bundle").unwrap(),
+                    output: output(destination.clone(), OutputFormat::GitlabArtifacts),
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("sentinel")).unwrap(),
+            "keep"
+        );
+
+        let missing = temp.path().join("missing").join("gitlab");
+        assert!(
+            run_report(
+                &config,
+                ReportArgs {
+                    run_id: RunId::new("run:bundle").unwrap(),
+                    output: output(missing.clone(), OutputFormat::GitlabArtifacts),
+                },
+            )
+            .is_err()
+        );
+        assert!(!missing.exists());
+
+        assert!(
+            run_report(
+                &config,
+                ReportArgs {
+                    run_id: RunId::new("run:bundle").unwrap(),
+                    output: output(PathBuf::from("-"), OutputFormat::GitlabArtifacts),
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]

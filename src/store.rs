@@ -1078,8 +1078,8 @@ mod tests {
     use super::*;
     use crate::model::{
         Asset, AssetId, AssetKind, Component, ComponentId, Confidence, DependencyEdge, Evidence,
-        FindingStatus, Inventory, PolicyDecision, PolicyId, PolicyOutcome, PolicySummary,
-        Remediation, RuleId, RunMetadata, Scope, Severity,
+        FindingStatus, Inventory, Location, LocationId, PolicyDecision, PolicyId, PolicyOutcome,
+        PolicySummary, Position, Remediation, RuleId, RunMetadata, Scope, Severity,
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -1129,6 +1129,7 @@ mod tests {
                     metadata: BTreeMap::new(),
                 },
                 components: BTreeMap::new(),
+                locations: BTreeSet::new(),
                 dependencies: BTreeSet::<DependencyEdge>::new(),
             },
             findings: ids
@@ -1160,6 +1161,13 @@ mod tests {
         let mut r = report(id, time, &["finding:rich"]);
         r.inventory.asset.id = AssetId::new(asset_id).unwrap();
         r.inventory.asset.name = format!("asset-{id}");
+        r.inventory.locations.insert(Location {
+            id: LocationId::new("location:rich").unwrap(),
+            asset_id: r.inventory.asset.id.clone(),
+            path: "sample.py".into(),
+            start: Some(Position { line: 1, column: 1 }),
+            end: Some(Position { line: 1, column: 8 }),
+        });
         let c = component(
             "component:rich",
             "rich-component",
@@ -1479,7 +1487,7 @@ mod tests {
         );
     }
     #[test]
-    fn file_reopen_duplicate_run_and_factory_paths_preserve_committed_state() {
+    fn location_round_trip_survives_file_reopen_and_duplicate_run() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested-store.sqlite");
         assert!(matches!(

@@ -218,6 +218,7 @@ fn report_fixture(component_count: usize, findings_per_component: usize) -> Scan
                 metadata: BTreeMap::new(),
             },
             components,
+            locations: BTreeSet::new(),
             dependencies,
         },
         findings,
@@ -375,8 +376,10 @@ fn main() {
         ("report_junit_500", ReportFormat::Junit),
         ("report_html_500", ReportFormat::Html),
         ("report_cdx_500", ReportFormat::CycloneDxVex),
+        ("report_gitlab_cdx_500", ReportFormat::GitLabCycloneDx),
         ("report_spdx_500", ReportFormat::Spdx),
         ("report_gitlab_500", ReportFormat::GitLabCodeQuality),
+        ("report_gitlab_sarif_500", ReportFormat::GitLabSarif),
         ("report_jsonl_500", ReportFormat::JsonLines),
     ] {
         let (iterations, elapsed) = measure(|| {

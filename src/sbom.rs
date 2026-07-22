@@ -111,6 +111,7 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
     let inventory = Inventory {
         asset,
         components: state.components,
+        locations: BTreeSet::new(),
         dependencies: state.dependencies,
     };
     inventory.validate()?;

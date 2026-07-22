@@ -885,8 +885,8 @@ mod tests {
     use super::*;
     use crate::model::{
         Asset, AssetId, AssetKind, Component, ComponentId, Confidence, Evidence, FindingId,
-        FindingStatus, PolicyDecision, PolicyId, PolicyOutcome, PolicySummary, RuleId, RunMetadata,
-        Scope,
+        FindingStatus, Location, LocationId, PolicyDecision, PolicyId, PolicyOutcome,
+        PolicySummary, Position, RuleId, RunMetadata, Scope,
     };
 
     fn report(id: &str) -> ScanReport {
@@ -908,6 +908,13 @@ mod tests {
                     metadata: BTreeMap::new(),
                 },
                 components: BTreeMap::new(),
+                locations: BTreeSet::from([Location {
+                    id: LocationId::new("location:sample").unwrap(),
+                    asset_id: AssetId::new("asset:test").unwrap(),
+                    path: "sample.py".into(),
+                    start: Some(Position { line: 1, column: 1 }),
+                    end: Some(Position { line: 1, column: 8 }),
+                }]),
                 dependencies: BTreeSet::new(),
             },
             findings: BTreeMap::new(),
@@ -1665,7 +1672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_reports_with_content_negotiation() {
+    async fn report_round_trip_preserves_global_locations_with_content_negotiation() {
         let application = seeded_app(Config::default(), &[report("run:test")]);
 
         let response = application
@@ -1683,6 +1690,10 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let decoded: ScanReport = serde_yaml::from_slice(&bytes).unwrap();
         assert_eq!(decoded.run.id.as_str(), "run:test");
+        assert_eq!(
+            decoded.inventory.locations.iter().next().unwrap().path,
+            "sample.py"
+        );
 
         let response = application
             .oneshot(

@@ -14,6 +14,16 @@ on:
         description: Preview Hooversion without release commits, tags, or assets
         type: boolean
         default: false
+      image_tag:
+        description: Existing release tag to recover (must be v<image_version>)
+        type: string
+        required: false
+        default: ""
+      image_version:
+        description: Existing release version to recover
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -28,17 +38,53 @@ env:
   RUST_VERSION: "1.90.0"
 
 jobs:
+  prepare:
+    name: Validate release mode
+    runs-on: ubuntu-latest
+    outputs:
+      image_recovery: ${{ steps.mode.outputs.image_recovery }}
+      image_tag: ${{ steps.mode.outputs.image_tag }}
+      image_version: ${{ steps.mode.outputs.image_version }}
+    steps:
+      - name: Validate workflow inputs
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IMAGE_TAG: ${{ inputs.image_tag || '' }}
+          IMAGE_VERSION: ${{ inputs.image_version || '' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+          if [ -n "$IMAGE_TAG" ] || [ -n "$IMAGE_VERSION" ]; then
+            test "$EVENT_NAME" = workflow_dispatch
+            test -n "$IMAGE_TAG"
+            test -n "$IMAGE_VERSION"
+            test "$DRY_RUN" = false
+            test "$IMAGE_TAG" = "v$IMAGE_VERSION"
+            {
+              echo "image_recovery=true"
+              echo "image_tag=$IMAGE_TAG"
+              echo "image_version=$IMAGE_VERSION"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "image_recovery=false" >> "$GITHUB_OUTPUT"
+          fi
+
   hooversion:
     name: Hooversion release
+    needs: prepare
     runs-on: ubuntu-latest
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      needs.prepare.outputs.image_recovery == 'false' &&
       (
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main' &&
-        github.event.workflow_run.head_repository.full_name == github.repository &&
-        !startsWith(github.event.workflow_run.head_commit.message, 'chore(release):')
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository &&
+          !startsWith(github.event.workflow_run.head_commit.message, 'chore(release):')
+        )
       )
     permissions:
       contents: write
@@ -143,3 +189,167 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.hooversion.outputs.tag }}
         run: gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+
+  ghcr:
+    name: Publish GHCR image
+    needs:
+      - prepare
+      - hooversion
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      (
+        (
+          needs.prepare.outputs.image_recovery == 'true' &&
+          needs.hooversion.result == 'skipped'
+        ) ||
+        (
+          needs.prepare.outputs.image_recovery == 'false' &&
+          needs.hooversion.result == 'success' &&
+          needs.hooversion.outputs.current == 'true' &&
+          needs.hooversion.outputs.published == 'true'
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.image_recovery == 'true' && needs.prepare.outputs.image_tag || needs.hooversion.outputs.tag }}
+
+      - name: Publish or recover verified image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+          RECOVERY: ${{ needs.prepare.outputs.image_recovery }}
+          RECOVERY_TAG: ${{ needs.prepare.outputs.image_tag }}
+          RECOVERY_VERSION: ${{ needs.prepare.outputs.image_version }}
+          RELEASE_TAG: ${{ needs.hooversion.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.hooversion.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/openhoo/hooray"
+          sha="$(git rev-parse HEAD)"
+          anon_config="$(mktemp -d)"
+          publish_config="$(mktemp -d)"
+          trap 'rm -rf "$anon_config" "$publish_config" release.json patch.json attempt-manifest.json' EXIT
+
+          if [ "$RECOVERY" = true ]; then
+            tag="$RECOVERY_TAG"
+            version="$RECOVERY_VERSION"
+          else
+            tag="$RELEASE_TAG"
+            version="$RELEASE_VERSION"
+          fi
+          test "$tag" = "v$version"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          test -n "$cargo_version"
+          test "$cargo_version" = "$version"
+
+          gh api "repos/$REPOSITORY/releases/tags/$tag" > release.json
+          test "$(jq -r '.draft' release.json)" = false
+          release_id="$(jq -r '.id' release.json)"
+          test "$release_id" != null
+
+          attempt="$image:release-$version-$sha"
+          marker_count="$(jq -r '.body // ""' release.json | grep -c 'Hooray-OCI-Digest:' || true)"
+          marker=""
+
+          verify_image() {
+            ref="$1"
+            expected_digest="$2"
+            docker --config "$anon_config" pull "$ref"
+            actual_digest="$(docker image inspect "$ref" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
+            test "$actual_digest" = "$expected_digest"
+            docker --config "$anon_config" run --rm "$ref" --version | grep -Fx "hooray $version"
+            test "$(docker --config "$anon_config" run --rm --entrypoint /usr/bin/id "$ref" -u)" = 1000
+            test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
+            test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$sha"
+            test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "https://github.com/openhoo/hooray"
+            test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}')" = MIT
+          }
+
+          if [ "$RECOVERY" = false ]; then
+            test "$marker_count" -eq 0
+            registry_token="$(curl --fail --silent --show-error \
+              --user "$REGISTRY_USER:$REGISTRY_TOKEN" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:openhoo/hooray:pull" \
+              | jq -er '.token')"
+            lookup_status="$(curl --silent --show-error \
+              --output attempt-manifest.json \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer $registry_token" \
+              --header 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/openhoo/hooray/manifests/release-$version-$sha")"
+            case "$lookup_status" in
+              200)
+                echo "Release attempt tag already exists: $attempt" >&2
+                exit 1
+                ;;
+              404) ;;
+              *)
+                echo "Release attempt tag lookup failed with HTTP $lookup_status" >&2
+                cat attempt-manifest.json >&2
+                exit 1
+                ;;
+            esac
+
+            docker build \
+              --build-arg "VERSION=$version" \
+              --build-arg "VCS_REF=$sha" \
+              --tag "$attempt" \
+              .
+            docker run --rm "$attempt" --version | grep -Fx "hooray $version"
+            test "$(docker run --rm --entrypoint /usr/bin/id "$attempt" -u)" = 1000
+            test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
+            test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$sha"
+            test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "https://github.com/openhoo/hooray"
+            test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}')" = MIT
+
+            printf '%s' "$REGISTRY_TOKEN" | docker --config "$publish_config" login ghcr.io --username "$REGISTRY_USER" --password-stdin
+            docker --config "$publish_config" push "$attempt"
+            digest="$(docker --config "$anon_config" manifest inspect --verbose "$attempt" | jq -r '.Descriptor.digest')"
+            test "$(printf '%s' "$digest" | grep -Ec '^sha256:[0-9a-f]{64}$')" -eq 1
+            docker --config "$publish_config" logout ghcr.io
+            docker image rm "$attempt" >/dev/null
+
+            verify_image "$image@$digest" "$digest"
+            marker="Hooray-OCI-Digest: $image@$digest"
+          else
+            if [ "$marker_count" -eq 0 ]; then
+              docker --config "$anon_config" manifest inspect "$attempt" >/dev/null
+              digest="$(docker --config "$anon_config" manifest inspect --verbose "$attempt" | jq -r '.Descriptor.digest')"
+              test "$(printf '%s' "$digest" | grep -Ec '^sha256:[0-9a-f]{64}$')" -eq 1
+              verify_image "$image@$digest" "$digest"
+              marker="Hooray-OCI-Digest: $image@$digest"
+            elif [ "$marker_count" -eq 1 ]; then
+              marker="$(jq -r '.body // ""' release.json | grep 'Hooray-OCI-Digest:')"
+              test "$(printf '%s' "$marker" | grep -Ec '^Hooray-OCI-Digest: ghcr\.io/openhoo/hooray@sha256:[0-9a-f]{64}$')" -eq 1
+              digest="${marker##*@}"
+              verify_image "$image@$digest" "$digest"
+            else
+              echo "Release has duplicate OCI digest markers" >&2
+              exit 1
+            fi
+          fi
+
+          if [ "$marker_count" -eq 0 ]; then
+            jq --arg marker "$marker" \
+              '{body: ((.body // "") + (if ((.body // "") | length) == 0 or ((.body // "") | endswith("\n")) then "" else "\n" end) + $marker + "\n")}' \
+              release.json > patch.json
+            gh api --method PATCH "repos/$REPOSITORY/releases/$release_id" --input patch.json >/dev/null
+          fi
+
+          printf '%s' "$REGISTRY_TOKEN" | docker --config "$publish_config" login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          docker tag "$image@$digest" "$image:$version"
+          docker tag "$image@$digest" "$image:latest"
+          docker --config "$publish_config" push "$image:$version"
+          docker --config "$publish_config" push "$image:latest"
+          docker --config "$publish_config" logout ghcr.io

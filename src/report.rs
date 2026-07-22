@@ -1,19 +1,23 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{self, Write as FmtWrite},
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component as PathComponent, Path, PathBuf},
     str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::model::{
-    ApplicabilityStatus, ComponentId, Finding, FindingId, Location, LocationId, PolicyDecision,
-    PolicyOutcome, ScanReport, Severity,
+    ApplicabilityStatus, AssetKind, Component, ComponentId, Finding, FindingId, FindingStatus,
+    Location, LocationId, PolicyDecision, PolicyOutcome, ScanReport, Scope, Severity, SourceKind,
 };
 
 pub const CANONICAL_REPORT_VERSION: &str = "1.0.0";
@@ -28,23 +32,27 @@ pub enum ReportFormat {
     Yaml,
     Table,
     Sarif,
+    GitLabSarif,
     Junit,
     Html,
     CycloneDxVex,
+    GitLabCycloneDx,
     Spdx,
     GitLabCodeQuality,
     JsonLines,
 }
 
 impl ReportFormat {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Json,
         Self::Yaml,
         Self::Table,
         Self::Sarif,
+        Self::GitLabSarif,
         Self::Junit,
         Self::Html,
         Self::CycloneDxVex,
+        Self::GitLabCycloneDx,
         Self::Spdx,
         Self::GitLabCodeQuality,
         Self::JsonLines,
@@ -56,9 +64,11 @@ impl ReportFormat {
             Self::Yaml => "yaml",
             Self::Table => "table",
             Self::Sarif => "sarif",
+            Self::GitLabSarif => "gitlab-sarif",
             Self::Junit => "junit",
             Self::Html => "html",
             Self::CycloneDxVex => "cyclonedx-vex",
+            Self::GitLabCycloneDx => "gitlab-cyclonedx",
             Self::Spdx => "spdx",
             Self::GitLabCodeQuality => "gitlab-code-quality",
             Self::JsonLines => "jsonl",
@@ -70,10 +80,10 @@ impl ReportFormat {
             Self::Json | Self::Spdx | Self::GitLabCodeQuality => "json",
             Self::Yaml => "yaml",
             Self::Table => "txt",
-            Self::Sarif => "sarif",
+            Self::Sarif | Self::GitLabSarif => "sarif",
             Self::Junit => "xml",
             Self::Html => "html",
-            Self::CycloneDxVex => "cdx.json",
+            Self::CycloneDxVex | Self::GitLabCycloneDx => "cdx.json",
             Self::JsonLines => "jsonl",
         }
     }
@@ -84,9 +94,11 @@ impl ReportFormat {
             Self::Yaml => "application/yaml",
             Self::Table => "text/plain; charset=utf-8",
             Self::Sarif => "application/sarif+json",
+            Self::GitLabSarif => "application/sarif+json",
             Self::Junit => "application/xml",
             Self::Html => "text/html; charset=utf-8",
             Self::CycloneDxVex => "application/vnd.cyclonedx+json",
+            Self::GitLabCycloneDx => "application/vnd.cyclonedx+json",
             Self::JsonLines => "application/x-ndjson",
         }
     }
@@ -107,9 +119,11 @@ impl FromStr for ReportFormat {
             "yaml" | "yml" => Ok(Self::Yaml),
             "table" | "text" => Ok(Self::Table),
             "sarif" | "sarif-2.1.0" => Ok(Self::Sarif),
+            "gitlab-sarif" | "gitlab-sarif-2.1.0" => Ok(Self::GitLabSarif),
             "junit" | "junit-xml" => Ok(Self::Junit),
             "html" => Ok(Self::Html),
             "cyclonedx" | "cyclonedx-vex" | "cdx" | "cdx-vex" => Ok(Self::CycloneDxVex),
+            "gitlab-cyclonedx" | "gitlab-cyclonedx-1.6" => Ok(Self::GitLabCycloneDx),
             "spdx" | "spdx-json" | "spdx-2.3" => Ok(Self::Spdx),
             "gitlab" | "gitlab-code-quality" | "code-quality" => Ok(Self::GitLabCodeQuality),
             "jsonl" | "ndjson" | "json-lines" => Ok(Self::JsonLines),
@@ -134,6 +148,40 @@ pub enum ReportError {
     Yaml(#[from] serde_yaml::Error),
     #[error("could not write report: {0}")]
     Io(#[from] io::Error),
+    #[error("invalid GitLab artifact destination '{path}': {reason}")]
+    InvalidDestination { path: PathBuf, reason: String },
+    #[error("GitLab artifact destination already exists: {0}")]
+    DestinationExists(PathBuf),
+    #[error("atomic no-clobber publication is unsupported on this platform for '{0}'")]
+    UnsupportedAtomicPublication(PathBuf),
+    #[error("could not create GitLab artifact staging directory '{path}': {source}")]
+    StagingCreate { path: PathBuf, source: io::Error },
+    #[error("could not write GitLab artifact '{path}': {source}")]
+    StagingWrite { path: PathBuf, source: io::Error },
+    #[error("could not synchronize GitLab artifact staging directory '{path}': {source}")]
+    StagingSync { path: PathBuf, source: io::Error },
+    #[error(
+        "could not atomically publish GitLab artifacts from '{staging}' to '{destination}': {source}"
+    )]
+    Publish {
+        staging: PathBuf,
+        destination: PathBuf,
+        source: io::Error,
+    },
+    #[error(
+        "GitLab artifacts were fully published at '{destination}', but synchronizing parent '{parent}' failed: {source}; do not delete or overwrite the completed bundle"
+    )]
+    PublishedNotDurable {
+        destination: PathBuf,
+        parent: PathBuf,
+        source: io::Error,
+    },
+    #[error("{primary}; additionally could not clean staging directory '{path}': {cleanup}")]
+    Cleanup {
+        primary: Box<ReportError>,
+        path: PathBuf,
+        cleanup: io::Error,
+    },
 }
 
 #[derive(Serialize)]
@@ -171,10 +219,16 @@ fn render_with_limit(
         ReportFormat::Yaml => render_yaml(&sanitized, limit),
         ReportFormat::Table => render_table(&sanitized, limit, &ReportIndex::new(&sanitized)),
         ReportFormat::Sarif => render_sarif(&sanitized, limit, &ReportIndex::new(&sanitized)),
+        ReportFormat::GitLabSarif => {
+            render_gitlab_sarif(&sanitized, limit, &ReportIndex::new(&sanitized))
+        }
         ReportFormat::Junit => render_junit(&sanitized, limit, &ReportIndex::new(&sanitized)),
         ReportFormat::Html => render_html(&sanitized, limit, &ReportIndex::new(&sanitized)),
         ReportFormat::CycloneDxVex => {
             render_cyclonedx_vex(&sanitized, limit, &ReportIndex::new(&sanitized))
+        }
+        ReportFormat::GitLabCycloneDx => {
+            render_gitlab_cyclonedx(&sanitized, limit, &ReportIndex::new(&sanitized))
         }
         ReportFormat::Spdx => render_spdx(&sanitized, limit, &ReportIndex::new(&sanitized)),
         ReportFormat::GitLabCodeQuality => {
@@ -369,6 +423,188 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     }
 }
 
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn write_gitlab_artifacts(
+    output_dir: impl AsRef<Path>,
+    report: &ScanReport,
+) -> Result<(), ReportError> {
+    report.validate()?;
+    validate_limits(report)?;
+    let report = sanitize_report(report)?;
+    let destination = output_dir.as_ref();
+    if destination.as_os_str().is_empty()
+        || destination == Path::new("-")
+        || destination.file_name().is_none_or(|name| name.is_empty())
+    {
+        return Err(ReportError::InvalidDestination {
+            path: destination.to_path_buf(),
+            reason: "expected a non-empty named directory destination other than '-'".into(),
+        });
+    }
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(ReportError::InvalidDestination {
+            path: destination.to_path_buf(),
+            reason: "parent directory does not exist".into(),
+        });
+    }
+    if destination.exists() {
+        return Err(ReportError::DestinationExists(destination.to_path_buf()));
+    }
+    let index = ReportIndex::new(&report);
+    let denied = report.policy_summary.denied;
+    let files = [
+        (
+            "gl-code-quality-report.json",
+            render_gitlab(&report, MAX_REPORT_BYTES, &index)?,
+        ),
+        (
+            "gl-sarif-report.sarif",
+            render_gitlab_sarif(&report, MAX_REPORT_BYTES, &index)?,
+        ),
+        (
+            "gl-sbom-hooray.cdx.json",
+            render_gitlab_cyclonedx(&report, MAX_REPORT_BYTES, &index)?,
+        ),
+        (
+            "gl-junit-report.xml",
+            render_junit(&report, MAX_REPORT_BYTES, &index)?,
+        ),
+        (
+            "hooray.env",
+            format!(
+                "HOORAY_POLICY_DENIED={}\nHOORAY_POLICY_DENIED_COUNT={}\n",
+                denied > 0,
+                denied
+            )
+            .into_bytes(),
+        ),
+    ];
+    let counter = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let staging = parent.join(format!(".hooray-gitlab-{}-{counter}", std::process::id()));
+    fs::create_dir(&staging).map_err(|source| ReportError::StagingCreate {
+        path: staging.clone(),
+        source,
+    })?;
+    let operation = (|| {
+        for (name, bytes) in files {
+            write_bundle_file(&staging.join(name), &bytes)?;
+        }
+        File::open(&staging)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| ReportError::StagingSync {
+                path: staging.clone(),
+                source,
+            })?;
+        publish_directory_no_replace(&staging, destination)?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| ReportError::PublishedNotDurable {
+                destination: destination.to_path_buf(),
+                parent: parent.to_path_buf(),
+                source,
+            })?;
+        Ok(())
+    })();
+    match operation {
+        Ok(()) => Ok(()),
+        Err(error @ ReportError::PublishedNotDurable { .. }) => Err(error),
+        Err(error) => match fs::remove_dir_all(&staging) {
+            Ok(()) => Err(error),
+            Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(error),
+            Err(cleanup) => Err(ReportError::Cleanup {
+                primary: Box::new(error),
+                path: staging,
+                cleanup,
+            }),
+        },
+    }
+}
+
+fn write_bundle_file(path: &Path, bytes: &[u8]) -> Result<(), ReportError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| ReportError::StagingWrite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| ReportError::StagingWrite {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn publish_directory_no_replace(staging: &Path, destination: &Path) -> Result<(), ReportError> {
+    const AT_FDCWD: i32 = -100;
+    const RENAME_NOREPLACE: u32 = 1;
+    unsafe extern "C" {
+        fn renameat2(
+            olddirfd: i32,
+            oldpath: *const i8,
+            newdirfd: i32,
+            newpath: *const i8,
+            flags: u32,
+        ) -> i32;
+    }
+    let old = CString::new(staging.as_os_str().as_bytes()).map_err(|_| {
+        ReportError::InvalidDestination {
+            path: staging.to_path_buf(),
+            reason: "staging path contains NUL".into(),
+        }
+    })?;
+    let new = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        ReportError::InvalidDestination {
+            path: destination.to_path_buf(),
+            reason: "destination path contains NUL".into(),
+        }
+    })?;
+    // SAFETY: both pointers reference live NUL-terminated byte strings for this call; AT_FDCWD
+    // resolves relative paths against the unchanged process cwd, and no Rust aliases are exposed.
+    let result = unsafe {
+        renameat2(
+            AT_FDCWD,
+            old.as_ptr(),
+            AT_FDCWD,
+            new.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let source = io::Error::last_os_error();
+    if source.kind() == io::ErrorKind::AlreadyExists {
+        Err(ReportError::DestinationExists(destination.to_path_buf()))
+    } else {
+        Err(ReportError::Publish {
+            staging: staging.to_path_buf(),
+            destination: destination.to_path_buf(),
+            source,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn publish_directory_no_replace(_staging: &Path, destination: &Path) -> Result<(), ReportError> {
+    Err(ReportError::UnsupportedAtomicPublication(
+        destination.to_path_buf(),
+    ))
+}
+
 fn render_json(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
     pretty_json(
         &CanonicalEnvelope {
@@ -459,15 +695,10 @@ fn render_table(
         for evidence in &finding.evidence {
             output.push_str("          evidence: ");
             output.push_str(&clean_cell(&evidence.description));
-            output.push_str(if evidence.redacted {
-                " [redacted]"
-            } else {
-                " [not-redacted]"
-            });
-            for (key, value) in &evidence.properties {
-                output.push_str(&format!("; {}={}", clean_cell(key), clean_cell(value)));
-            }
             output.push('\n');
+            for (key, value) in &evidence.properties {
+                output.push_str(&format!("            {key}: {}\n", clean_cell(value)));
+            }
         }
         for decision in index.policies(&finding.id) {
             output.push_str(&format!(
@@ -481,7 +712,7 @@ fn render_table(
     output.finish()
 }
 
-struct ReportIndex<'a> {
+pub(crate) struct ReportIndex<'a> {
     roots: BTreeSet<&'a ComponentId>,
     adjacency: BTreeMap<&'a ComponentId, Vec<&'a ComponentId>>,
     locations: BTreeMap<&'a LocationId, &'a Location>,
@@ -489,7 +720,7 @@ struct ReportIndex<'a> {
 }
 
 impl<'a> ReportIndex<'a> {
-    fn new(report: &'a ScanReport) -> Self {
+    pub(crate) fn new(report: &'a ScanReport) -> Self {
         let mut roots: BTreeSet<_> = report.inventory.components.keys().collect();
         let mut adjacency: BTreeMap<_, Vec<_>> = report
             .inventory
@@ -506,9 +737,15 @@ impl<'a> ReportIndex<'a> {
         }
         let locations = report
             .inventory
-            .components
-            .values()
-            .flat_map(|component| component.locations.iter())
+            .locations
+            .iter()
+            .chain(
+                report
+                    .inventory
+                    .components
+                    .values()
+                    .flat_map(|component| component.locations.iter()),
+            )
             .map(|location| (&location.id, location))
             .collect();
         let mut policies: BTreeMap<_, Vec<_>> = BTreeMap::new();
@@ -561,7 +798,128 @@ impl<'a> ReportIndex<'a> {
         self.policies.get(finding_id).map_or(&[], Vec::as_slice)
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitLabFindingLocation {
+    pub(crate) path: String,
+    pub(crate) line: u32,
+}
 
+pub(crate) fn gitlab_repository_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with("//")
+        || normalized
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+            && normalized
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+    {
+        return None;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    if lower.starts_with("bom-ref:")
+        || lower.starts_with("purl:")
+        || lower.starts_with("pkg:")
+        || lower.split_once(':').is_some_and(|(scheme, value)| {
+            !value.is_empty()
+                && matches!(
+                    scheme,
+                    "md5"
+                        | "sha1"
+                        | "sha224"
+                        | "sha256"
+                        | "sha384"
+                        | "sha512"
+                        | "blake2"
+                        | "blake3"
+                )
+        })
+    {
+        return None;
+    }
+    let path = Path::new(&normalized);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            PathComponent::CurDir => {}
+            PathComponent::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            PathComponent::ParentDir | PathComponent::RootDir | PathComponent::Prefix(_) => {
+                return None;
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+pub(crate) fn gitlab_finding_location(
+    report: &ScanReport,
+    index: &ReportIndex<'_>,
+    finding: &Finding,
+) -> Option<GitLabFindingLocation> {
+    let direct = finding.location_id.iter();
+    let evidence = finding
+        .evidence
+        .iter()
+        .flat_map(|item| item.locations.iter());
+    for id in direct.chain(evidence) {
+        let Some(location) = index.locations.get(id) else {
+            continue;
+        };
+        if let Some(path) = gitlab_repository_path(&location.path) {
+            return Some(GitLabFindingLocation {
+                path,
+                line: location.start.map_or(1, |position| position.line.max(1)),
+            });
+        }
+    }
+    finding
+        .component_id
+        .as_ref()
+        .and_then(|id| report.inventory.components.get(id))
+        .and_then(gitlab_component_input_file)
+        .map(|path| GitLabFindingLocation { path, line: 1 })
+}
+
+pub(crate) fn gitlab_component_input_file(component: &Component) -> Option<String> {
+    component
+        .provenance
+        .iter()
+        .filter(|source| matches!(source.kind, SourceKind::Lockfile | SourceKind::Manifest))
+        .find_map(|source| gitlab_repository_path(&source.locator))
+}
+
+pub(crate) fn gitlab_code_quality_entry(
+    _report: &ScanReport,
+    index: &ReportIndex<'_>,
+    finding: &Finding,
+    location: &GitLabFindingLocation,
+) -> Value {
+    json!({
+        "description": finding_detail_text(index, finding),
+        "check_name": finding.rule_id.as_str(),
+        "fingerprint": finding.id.as_str(),
+        "severity": gitlab_severity(finding.severity),
+        "location": {"path": location.path, "lines": {"begin": location.line}},
+        "categories": [finding.kind.as_str()],
+        "hooray": {
+            "format_version": CANONICAL_REPORT_VERSION,
+            "finding_id": finding.id.as_str(),
+            "component_id": finding.component_id.as_ref().map(|id| id.as_str()),
+            "dependency_paths": index.paths(finding),
+            "remediation": finding.remediation,
+            "policy_outcomes": index.policies(&finding.id),
+            "evidence": finding.evidence
+        }
+    })
+}
 fn render_sarif(
     report: &ScanReport,
     limit: usize,
@@ -639,6 +997,397 @@ fn render_sarif(
     )
 }
 
+const GITLAB_SARIF_MAX_RESULTS: usize = 5_000;
+const GITLAB_SARIF_MAX_BYTES: usize = 10_000_000;
+
+fn render_gitlab_sarif(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
+    let mut omitted_resolved = 0usize;
+    let mut omitted_without_location = 0usize;
+    let mut candidates = Vec::new();
+    for finding in report.findings.values() {
+        if finding.status == FindingStatus::Resolved {
+            omitted_resolved += 1;
+        } else if let Some(location) = gitlab_finding_location(report, index, finding) {
+            candidates.push((gitlab_rank(finding), finding, location));
+        } else {
+            omitted_without_location += 1;
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    let total_candidates = candidates.len();
+    candidates.truncate(GITLAB_SARIF_MAX_RESULTS);
+    let byte_limit = limit.min(GITLAB_SARIF_MAX_BYTES);
+    let render_prefix = |count: usize| {
+        gitlab_sarif_document(
+            report,
+            index,
+            &candidates[..count],
+            omitted_resolved,
+            omitted_without_location,
+            total_candidates.saturating_sub(count),
+        )
+    };
+    let full = serde_json::to_vec(&render_prefix(candidates.len()))?;
+    if full.len() < byte_limit {
+        let mut bytes = full;
+        bytes.push(b'\n');
+        return Ok(bytes);
+    }
+    let empty = serde_json::to_vec(&render_prefix(0))?;
+    if empty.len() >= byte_limit {
+        return Err(report_limit(byte_limit));
+    }
+    let mut low = 0usize;
+    let mut high = candidates.len();
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if serde_json::to_vec(&render_prefix(middle))?.len() < byte_limit {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let mut bytes = serde_json::to_vec(&render_prefix(low))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn gitlab_sarif_document(
+    report: &ScanReport,
+    index: &ReportIndex<'_>,
+    candidates: &[(f64, &Finding, GitLabFindingLocation)],
+    omitted_resolved: usize,
+    omitted_without_location: usize,
+    omitted_by_limit: usize,
+) -> Value {
+    let canonical_ids = canonical_sarif_rule_ids(candidates.iter().map(|(_, finding, _)| *finding));
+    let mut representatives = BTreeMap::new();
+    let results: Vec<Value> = candidates
+        .iter()
+        .map(|(rank, finding, location)| {
+            let rule_id = canonical_ids
+                .get(&finding.id)
+                .expect("every retained finding has a canonical rule ID");
+            representatives.entry(rule_id.clone()).or_insert(*finding);
+            let policies: Vec<Value> = index
+                .policies(&finding.id)
+                .iter()
+                .map(|decision| json!({"policyId": decision.policy_id.as_str(), "outcome": policy_outcome(decision.outcome), "reason": truncate_chars(&decision.reason, 1024)}))
+                .collect();
+            json!({
+                "ruleId": rule_id,
+                "level": sarif_level(finding.severity),
+                "rank": rank,
+                "message": {"text": truncate_chars(finding.summary.as_deref().or(finding.details.as_deref()).unwrap_or(finding.rule_id.as_str()), 1024)},
+                "locations": [{"physicalLocation": {"artifactLocation": {"uri": location.path}, "region": {"startLine": location.line}}}],
+                "fingerprints": {"hoorayFindingId/v1": finding.id.as_str()},
+                "partialFingerprints": {"primaryLocationLineHash": finding.id.as_str()},
+                "properties": {
+                    "findingId": finding.id.as_str(), "originalRuleId": finding.rule_id.as_str(), "kind": finding.kind.as_str(),
+                    "componentId": finding.component_id.as_ref().map(|id| id.as_str()), "policyOutcomes": policies,
+                    "remediation": finding.remediation.as_ref().map(|item| truncate_chars(&item.description, 1024))
+                }
+            })
+        })
+        .collect();
+    let rules: Vec<Value> = representatives
+        .into_iter()
+        .map(|(id, finding)| json!({
+            "id": id,
+            "name": truncate_chars(finding.rule_id.as_str(), 255),
+            "shortDescription": {"text": truncate_chars(finding.summary.as_deref().unwrap_or(finding.rule_id.as_str()), 1024)},
+            "fullDescription": {"text": truncate_chars(finding.details.as_deref().or(finding.summary.as_deref()).unwrap_or(finding.rule_id.as_str()), 1024)},
+            "defaultConfiguration": {"level": sarif_level(finding.severity)},
+            "properties": {"tags": gitlab_sarif_tags(finding)}
+        }))
+        .collect();
+    let version = report
+        .run
+        .scanner_version
+        .as_deref()
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "Hooray", "organization": "OpenHoo", "informationUri": "https://github.com/openhoo/hooray", "version": version, "semanticVersion": version, "rules": rules}},
+            "automationDetails": {"id": report.run.id.as_str()}, "results": results,
+            "properties": {"totalFindings": report.findings.len(), "includedFindings": candidates.len(), "omittedResolved": omitted_resolved, "omittedWithoutLocation": omitted_without_location, "omittedByLimit": omitted_by_limit}
+        }]
+    })
+}
+
+fn canonical_sarif_rule_ids<'a>(
+    findings: impl IntoIterator<Item = &'a Finding>,
+) -> BTreeMap<FindingId, String> {
+    let findings: Vec<_> = findings.into_iter().collect();
+    let mut bases: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for finding in &findings {
+        let base = normalized_cve(finding.advisory_id.as_deref().unwrap_or(""))
+            .unwrap_or_else(|| finding.rule_id.as_str().to_owned());
+        bases
+            .entry(base)
+            .or_default()
+            .insert(finding.rule_id.as_str().to_owned());
+    }
+    findings
+        .into_iter()
+        .map(|finding| {
+            let base = normalized_cve(finding.advisory_id.as_deref().unwrap_or(""))
+                .unwrap_or_else(|| finding.rule_id.as_str().to_owned());
+            let id = if bases[&base].len() > 1 {
+                let digest = Sha256::digest(finding.rule_id.as_str().as_bytes());
+                format!("{base}-{}", hex_prefix(&digest, 8))
+            } else {
+                base
+            };
+            (finding.id.clone(), id)
+        })
+        .collect()
+}
+
+fn gitlab_rank(finding: &Finding) -> f64 {
+    finding.risk.as_ref().map_or_else(
+        || match finding.severity {
+            Severity::Critical => 95.0,
+            Severity::High => 80.0,
+            Severity::Medium => 55.0,
+            Severity::Low => 25.0,
+            Severity::Unknown => 0.0,
+        },
+        |risk| f64::from(risk.score()) / 100.0,
+    )
+}
+
+fn gitlab_sarif_tags(finding: &Finding) -> Vec<String> {
+    let mut tags = BTreeSet::new();
+    for candidate in finding.advisory_id.iter().chain(finding.aliases.iter()) {
+        if let Some(cve) = normalized_cve(candidate) {
+            tags.insert(format!("cve:{}", &cve[4..]));
+        }
+        if let Some(cwe) = normalized_cwe(candidate) {
+            tags.insert(format!("cwe:{cwe}"));
+        }
+    }
+    tags.insert(format!("hooray:{}", finding.kind.as_str()));
+    tags.into_iter().take(10).collect()
+}
+
+fn normalized_cve(value: &str) -> Option<String> {
+    let upper = value.trim().to_ascii_uppercase();
+    let rest = upper.strip_prefix("CVE-")?;
+    let (year, number) = rest.split_once('-')?;
+    (year.len() == 4
+        && year.chars().all(|c| c.is_ascii_digit())
+        && number.len() >= 4
+        && number.chars().all(|c| c.is_ascii_digit()))
+    .then_some(format!("CVE-{year}-{number}"))
+}
+
+fn normalized_cwe(value: &str) -> Option<String> {
+    let upper = value.trim().to_ascii_uppercase();
+    let number = upper
+        .strip_prefix("CWE-")
+        .or_else(|| upper.strip_prefix("CWE:"))?;
+    (!number.is_empty() && number.chars().all(|c| c.is_ascii_digit())).then(|| number.to_owned())
+}
+
+fn truncate_chars(value: &str, maximum: usize) -> String {
+    value.chars().take(maximum).collect()
+}
+
+fn hex_prefix(bytes: &[u8], count: usize) -> String {
+    bytes[..count]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+fn render_gitlab_cyclonedx(
+    report: &ScanReport,
+    limit: usize,
+    _index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
+    let asset_ref = format!(
+        "asset:{}",
+        Sha256::digest(report.inventory.asset.id.as_str().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let mut metadata_component = json!({
+        "type": cyclonedx_asset_type(report.inventory.asset.kind),
+        "bom-ref": asset_ref,
+        "name": report.inventory.asset.name
+    });
+    if let Some(version) = &report.inventory.asset.version {
+        metadata_component["version"] = json!(version);
+    }
+    let components: Vec<Value> = report.inventory.components.values().map(|component| {
+        let mut properties = Vec::new();
+        if let Some(path) = gitlab_component_input_file(component) {
+            properties.push(json!({"name": "gitlab:dependency_scanning:input_file:path", "value": path}));
+            if let Some((manager, language)) = gitlab_package_metadata(&component.purl) {
+                properties.push(json!({"name": "gitlab:dependency_scanning:package_manager:name", "value": manager}));
+                properties.push(json!({"name": "gitlab:dependency_scanning:language:name", "value": language}));
+            }
+        }
+        if let Some(category) = gitlab_dependency_category(component.scope) {
+            properties.push(json!({"name": "gitlab:dependency_scanning:category", "value": category}));
+        }
+        let mut value = json!({
+            "type": "library", "bom-ref": component.identity.as_str(), "name": component.name,
+            "version": component.version, "purl": component.purl
+        });
+        if !properties.is_empty() { value["properties"] = Value::Array(properties); }
+        if let Some(licenses) = cyclonedx_licenses(component) { value["licenses"] = licenses; }
+        value
+    }).collect();
+    let dependencies: Vec<Value> = report
+        .inventory
+        .components
+        .keys()
+        .map(|id| {
+            let depends_on: Vec<&str> = report
+                .inventory
+                .dependencies
+                .iter()
+                .filter(|edge| &edge.from == id)
+                .map(|edge| edge.to.as_str())
+                .collect();
+            json!({"ref": id.as_str(), "dependsOn": depends_on})
+        })
+        .collect();
+    pretty_json(
+        &json!({
+            "$schema": "https://cyclonedx.org/schema/bom-1.6.schema.json", "bomFormat": "CycloneDX", "specVersion": "1.6",
+            "serialNumber": format!("urn:uuid:{}", deterministic_uuid(report.run.id.as_str())), "version": 1,
+            "metadata": {
+                "timestamp": report.run.started_at,
+                "tools": {"components": [{"type": "application", "name": "hooray", "version": report.run.scanner_version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))}]},
+                "component": metadata_component,
+                "properties": [{"name": "gitlab:meta:schema_version", "value": "1"}]
+            },
+            "components": components, "dependencies": dependencies
+        }),
+        limit,
+    )
+}
+
+fn cyclonedx_asset_type(kind: AssetKind) -> &'static str {
+    match kind {
+        AssetKind::Repository | AssetKind::Other => "application",
+        AssetKind::Filesystem => "file",
+        AssetKind::ContainerImage => "container",
+        AssetKind::Sbom => "data",
+        AssetKind::Package => "library",
+    }
+}
+
+fn gitlab_package_metadata(purl: &str) -> Option<(&'static str, &'static str)> {
+    let kind = purl
+        .strip_prefix("pkg:")?
+        .split('/')
+        .next()?
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "cargo" => Some(("cargo", "Rust")),
+        "npm" => Some(("npm", "JavaScript")),
+        "pypi" => Some(("pip", "Python")),
+        "golang" => Some(("go", "Go")),
+        "maven" => Some(("maven", "Java")),
+        "nuget" => Some(("nuget", "C#")),
+        _ => None,
+    }
+}
+
+fn gitlab_dependency_category(scope: Scope) -> Option<&'static str> {
+    match scope {
+        Scope::Runtime | Scope::Optional => Some("production"),
+        Scope::Build | Scope::Development => Some("development"),
+        Scope::Test => Some("test"),
+        Scope::Unknown => None,
+    }
+}
+
+fn cyclonedx_licenses(component: &Component) -> Option<Value> {
+    let records: Vec<_> = component
+        .licenses
+        .iter()
+        .filter_map(|license| {
+            let expression = license
+                .expression
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let name = license
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let url = license
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            (expression.is_some() || name.is_some()).then_some((expression, name, url))
+        })
+        .collect();
+    if records.len() == 1 {
+        let (Some(expression), None, _) = records[0] else {
+            return cyclonedx_license_objects(&records);
+        };
+        if spdx::Expression::parse(expression).is_ok() {
+            return Some(json!([{"expression": expression}]));
+        }
+    }
+    cyclonedx_license_objects(&records)
+}
+
+fn cyclonedx_license_objects(
+    records: &[(Option<&str>, Option<&str>, Option<&str>)],
+) -> Option<Value> {
+    let mut rendered = BTreeSet::new();
+    for (expression, name, url) in records {
+        let single_id = expression.and_then(single_spdx_id);
+        let mut license = serde_json::Map::new();
+        if let Some(id) = single_id {
+            license.insert("id".into(), json!(id));
+        } else if let Some(name) = name {
+            license.insert("name".into(), json!(name));
+        } else {
+            continue;
+        }
+        if let Some(url) = url {
+            license.insert("url".into(), json!(url));
+        }
+        rendered.insert(
+            serde_json::to_string(&json!({"license": license}))
+                .expect("license JSON is serializable"),
+        );
+    }
+    (!rendered.is_empty()).then(|| {
+        Value::Array(
+            rendered
+                .into_iter()
+                .map(|item| serde_json::from_str(&item).expect("rendered license JSON parses"))
+                .collect(),
+        )
+    })
+}
+
+fn single_spdx_id(expression: &str) -> Option<&str> {
+    let trimmed = expression.trim();
+    spdx::license_id(trimmed).map(|_| trimmed)
+}
+
 fn render_junit(
     report: &ScanReport,
     limit: usize,
@@ -656,13 +1405,17 @@ fn render_junit(
         xml_attr(&report.run.started_at)
     ));
     for finding in report.findings.values() {
+        let file = gitlab_finding_location(report, index, finding)
+            .map(|location| format!(" file=\"{}\"", xml_attr(&location.path)))
+            .unwrap_or_default();
         output.push_str(&format!(
-            "    <testcase classname=\"hooray.{}\" name=\"{}\">\n",
+            "    <testcase classname=\"hooray.{}\" name=\"{}\"{}>\n",
             finding.kind.as_str(),
-            xml_attr(finding.id.as_str())
+            xml_attr(finding.id.as_str()),
+            file
         ));
         let body = finding_detail_text(index, finding);
-        if finding.status != crate::model::FindingStatus::Resolved {
+        if finding.status != FindingStatus::Resolved {
             output.push_str(&format!(
                 "      <failure type=\"{}\" message=\"{}\">{}</failure>\n",
                 xml_attr(finding.severity.as_str()),
@@ -827,20 +1580,15 @@ fn render_gitlab(
     limit: usize,
     index: &ReportIndex<'_>,
 ) -> Result<Vec<u8>, ReportError> {
-    let findings: Vec<Value> = report.findings.values().map(|finding| {
-        let location = finding.location_id.as_ref().and_then(|id| index.locations.get(id).copied());
-        let path = location.map(|item| item.path.as_str()).unwrap_or(".");
-        let line = location.and_then(|item| item.start.map(|position| position.line)).unwrap_or(1).max(1);
-        json!({
-            "description": finding_detail_text(index, finding), "check_name": finding.rule_id.as_str(),
-            "fingerprint": finding.id.as_str(), "severity": gitlab_severity(finding.severity),
-            "location": {"path": path, "lines": {"begin": line}},
-            "categories": [finding.kind.as_str()],
-            "hooray": {"format_version": CANONICAL_REPORT_VERSION, "finding_id": finding.id.as_str(),
-                "component_id": finding.component_id.as_ref().map(|id| id.as_str()), "dependency_paths": index.paths(finding),
-                "remediation": finding.remediation, "policy_outcomes": index.policies(&finding.id), "evidence": finding.evidence}
+    let findings: Vec<Value> = report
+        .findings
+        .values()
+        .filter(|finding| finding.status != FindingStatus::Resolved)
+        .filter_map(|finding| {
+            let location = gitlab_finding_location(report, index, finding)?;
+            Some(gitlab_code_quality_entry(report, index, finding, &location))
         })
-    }).collect();
+        .collect();
     pretty_json(&findings, limit)
 }
 
@@ -1120,7 +1868,8 @@ fn cdx_severity(severity: Severity) -> &'static str {
 
 fn gitlab_severity(severity: Severity) -> &'static str {
     match severity {
-        Severity::Unknown | Severity::Low => "minor",
+        Severity::Unknown => "info",
+        Severity::Low => "minor",
         Severity::Medium => "major",
         Severity::High => "critical",
         Severity::Critical => "blocker",
@@ -1332,6 +2081,7 @@ mod tests {
                     metadata: BTreeMap::from([("credential".into(), json!("hidden"))]),
                 },
                 components,
+                locations: BTreeSet::new(),
                 dependencies: BTreeSet::from([DependencyEdge {
                     from: root_id,
                     to: component_id,
@@ -1655,6 +2405,229 @@ mod tests {
                 "{format}"
             );
         }
+    }
+
+    #[test]
+    fn gitlab_paths_locations_and_code_quality_are_truthful() {
+        for invalid in [
+            "",
+            ".",
+            "../secret",
+            "/etc/passwd",
+            "C:\\repo\\file.rs",
+            "//server/share/file.rs",
+            "\\\\server\\share\\file.rs",
+            "bom-ref:x",
+            "purl:x",
+            "sha256:abc",
+        ] {
+            assert_eq!(gitlab_repository_path(invalid), None, "{invalid}");
+        }
+        assert_eq!(
+            gitlab_repository_path("./src/main.rs"),
+            Some("src/main.rs".into())
+        );
+        assert_eq!(
+            gitlab_repository_path(" report.txt "),
+            Some(" report.txt ".into())
+        );
+        let mut report = fixture();
+        let locations = report
+            .inventory
+            .components
+            .values()
+            .flat_map(|component| component.locations.iter().cloned())
+            .collect();
+        report.inventory.locations = locations;
+        for component in report.inventory.components.values_mut() {
+            component.locations.clear();
+        }
+        let index = ReportIndex::new(&report);
+        let finding = report.findings.values().next().unwrap();
+        assert_eq!(
+            gitlab_finding_location(&report, &index, finding)
+                .unwrap()
+                .path,
+            "src/a & b.rs"
+        );
+        report.findings.values_mut().next().unwrap().status = FindingStatus::Resolved;
+        let value: Value =
+            serde_json::from_slice(&render(&report, ReportFormat::GitLabCodeQuality).unwrap())
+                .unwrap();
+        assert_eq!(value, json!([]));
+    }
+
+    #[test]
+    fn gitlab_sarif_has_gitlab_identity_rank_counts_and_location() {
+        let value: Value =
+            serde_json::from_slice(&render(&fixture(), ReportFormat::GitLabSarif).unwrap())
+                .unwrap();
+        let run = &value["runs"][0];
+        assert_eq!(run["tool"]["driver"]["name"], "Hooray");
+        assert_eq!(run["tool"]["driver"]["organization"], "OpenHoo");
+        assert_eq!(run["results"][0]["ruleId"], "CVE-2026-0001");
+        assert_eq!(run["results"][0]["rank"], 90.0);
+        assert_eq!(
+            run["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "src/a & b.rs"
+        );
+        assert_eq!(run["properties"]["includedFindings"], 1);
+        assert_eq!(run["tool"]["driver"]["rules"].as_array().unwrap().len(), 1);
+    }
+
+    struct CycloneDxSchemaRetriever;
+
+    impl jsonschema::Retrieve for CycloneDxSchemaRetriever {
+        fn retrieve(
+            &self,
+            uri: &jsonschema::Uri<String>,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            let content = match uri.as_str() {
+                "http://cyclonedx.org/schema/spdx.schema.json"
+                | "https://cyclonedx.org/schema/spdx.schema.json" => {
+                    include_str!("../tests/fixtures/cyclonedx-1.6/spdx.schema.json")
+                }
+                "http://cyclonedx.org/schema/jsf-0.82.schema.json"
+                | "https://cyclonedx.org/schema/jsf-0.82.schema.json" => {
+                    include_str!("../tests/fixtures/cyclonedx-1.6/jsf-0.82.schema.json")
+                }
+                _ => return Err(format!("offline schema not found: {uri}").into()),
+            };
+            Ok(serde_json::from_str(content)?)
+        }
+    }
+
+    #[test]
+    fn gitlab_cyclonedx_has_inventory_gitlab_metadata_and_input_file() {
+        let mut report = fixture();
+        let component = report
+            .inventory
+            .components
+            .get_mut(&ComponentId::new("component:dep").unwrap())
+            .unwrap();
+        component.provenance.insert(crate::model::Source {
+            kind: SourceKind::Lockfile,
+            locator: "./Cargo.lock".into(),
+            digest: None,
+        });
+        component.licenses.insert(crate::model::License {
+            expression: Some("MIT".into()),
+            name: None,
+            url: None,
+        });
+        let bytes = render(&report, ReportFormat::GitLabCycloneDx).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["metadata"]["properties"][0]["name"],
+            "gitlab:meta:schema_version"
+        );
+        assert!(value.get("vulnerabilities").is_none());
+        let dep = value["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["bom-ref"] == "component:dep")
+            .unwrap();
+        assert!(
+            dep["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |item| item["name"] == "gitlab:dependency_scanning:input_file:path"
+                        && item["value"] == "Cargo.lock"
+                )
+        );
+        assert_eq!(dep["licenses"][0]["expression"], "MIT");
+        let schema: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/cyclonedx-1.6/bom-1.6.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .with_retriever(CycloneDxSchemaRetriever)
+            .build(&schema)
+            .unwrap();
+        assert!(
+            validator.is_valid(&value),
+            "{:?}",
+            validator.iter_errors(&value).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn gitlab_cyclonedx_does_not_render_license_refs_as_spdx_ids() {
+        let mut report = fixture();
+        let component = report.inventory.components.values_mut().next().unwrap();
+        component.licenses.insert(crate::model::License {
+            expression: Some("LicenseRef-Proprietary".into()),
+            name: Some("Proprietary".into()),
+            url: None,
+        });
+        let component_id = component.identity.clone();
+        let value: Value =
+            serde_json::from_slice(&render(&report, ReportFormat::GitLabCycloneDx).unwrap())
+                .unwrap();
+        let rendered = value["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["bom-ref"] == component_id.as_str())
+            .unwrap();
+        assert_eq!(rendered["licenses"][0]["license"]["name"], "Proprietary");
+        assert!(rendered["licenses"][0]["license"].get("id").is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn gitlab_artifact_bundle_is_complete_private_and_no_clobber() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("bundle");
+        assert!(matches!(
+            write_gitlab_artifacts("", &fixture()),
+            Err(ReportError::InvalidDestination { .. })
+        ));
+        write_gitlab_artifacts(&destination, &fixture()).unwrap();
+        let names: BTreeSet<_> = fs::read_dir(&destination)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "gl-code-quality-report.json".into(),
+                "gl-sarif-report.sarif".into(),
+                "gl-sbom-hooray.cdx.json".into(),
+                "gl-junit-report.xml".into(),
+                "hooray.env".into()
+            ])
+        );
+        for name in &names {
+            assert_eq!(
+                fs::metadata(destination.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(destination.join("hooray.env")).unwrap(),
+            "HOORAY_POLICY_DENIED=true\nHOORAY_POLICY_DENIED_COUNT=1\n"
+        );
+        assert!(matches!(
+            write_gitlab_artifacts(&destination, &fixture()),
+            Err(ReportError::DestinationExists(_))
+        ));
+        assert!(directory.path().read_dir().unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".hooray-gitlab-")
+        }));
     }
 
     #[cfg(unix)]

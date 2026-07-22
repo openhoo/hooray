@@ -525,6 +525,7 @@ mod tests {
                 metadata: BTreeMap::<String, Value>::new(),
             },
             components,
+            locations: BTreeSet::new(),
             dependencies,
         }
     }

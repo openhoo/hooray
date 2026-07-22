@@ -541,6 +541,7 @@ mod tests {
                     locations: BTreeSet::new(),
                 },
             )]),
+            locations: BTreeSet::new(),
             dependencies: BTreeSet::new(),
         }
     }
@@ -636,6 +637,7 @@ mod tests {
                     },
                 ),
             ]),
+            locations: BTreeSet::new(),
             dependencies: BTreeSet::from([crate::model::DependencyEdge {
                 from: root_id.clone(),
                 to: dependency_id.clone(),

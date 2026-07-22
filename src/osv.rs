@@ -726,6 +726,7 @@ mod tests {
                 .into_iter()
                 .map(|component| (component.identity.clone(), component))
                 .collect(),
+            locations: BTreeSet::new(),
             dependencies: BTreeSet::new(),
         }
     }

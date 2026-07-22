@@ -656,6 +656,7 @@ mod tests {
                 metadata: BTreeMap::<String, Value>::new(),
             },
             components: BTreeMap::from([(component.identity.clone(), component)]),
+            locations: BTreeSet::new(),
             dependencies: BTreeSet::<DependencyEdge>::new(),
         }
     }

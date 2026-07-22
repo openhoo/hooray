@@ -366,16 +366,8 @@ fn filesystem_findings(
         &scanner_config,
         &MalwareSignatures::default(),
     )?;
-    let known_locations: BTreeSet<_> = inventory
-        .components
-        .values()
-        .flat_map(|component| {
-            component
-                .locations
-                .iter()
-                .map(|location| location.id.clone())
-        })
-        .collect();
+    inventory.locations.extend(output.locations);
+    let known_locations = inventory.location_ids();
     Ok(output
         .findings
         .into_iter()
@@ -692,7 +684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_pipeline_never_calls_provider_and_persists_policy_result() {
+    async fn filesystem_locations_survive_offline_pipeline_and_persistence() {
         let temp = TempDir::new().unwrap();
         let project = temp.path().join("project");
         fs::create_dir(&project).unwrap();
@@ -704,6 +696,11 @@ mod tests {
         fs::write(
             project.join("Cargo.lock"),
             "version = 3\n[[package]]\nname='demo'\nversion='1.0.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("sample.py"),
+            "subprocess.run(user_input, shell=True)\n",
         )
         .unwrap();
         let policy = temp.path().join("policy.yaml");
@@ -735,6 +732,22 @@ mod tests {
                     .values()
                     .any(|finding| finding.kind == FindingKind::License)
             );
+            let sast = report
+                .findings
+                .values()
+                .find(|finding| finding.rule_id.as_str() == "sast.python.shell-true")
+                .unwrap();
+            let location_id = sast.location_id.as_ref().unwrap();
+            let location = report
+                .inventory
+                .locations
+                .iter()
+                .find(|location| &location.id == location_id)
+                .unwrap();
+            assert_eq!(location.path, "sample.py");
+            assert!(report.validate().is_ok());
+            assert_eq!(report.inventory.components.len(), 1);
+            assert!(report.inventory.dependencies.is_empty());
 
             fs::write(
                 project.join("credentials.txt"),
@@ -1015,6 +1028,7 @@ mod tests {
                     metadata: BTreeMap::new(),
                 },
                 components: BTreeMap::new(),
+                locations: BTreeSet::new(),
                 dependencies: BTreeSet::new(),
             },
             findings: BTreeMap::new(),

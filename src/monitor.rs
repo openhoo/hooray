@@ -1083,6 +1083,7 @@ mod tests {
                 metadata: BTreeMap::new(),
             },
             components: BTreeMap::new(),
+            locations: BTreeSet::new(),
             dependencies: BTreeSet::new(),
         }
     }
