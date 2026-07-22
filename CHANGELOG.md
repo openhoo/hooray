@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 (2026-07-22)
+
+### Features
+
+- **gitlab:** add native report integrations (c97980f)
+
 ## 0.3.4 (2026-07-21)
 
 ### Performance
