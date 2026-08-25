@@ -182,6 +182,21 @@ impl Policy {
     }
 
     pub fn validate(&self) -> Result<(), PolicyError> {
+        self.compiled().map(|_| ())
+    }
+
+    /// Compiles the policy once for evaluation. Structural checks run first
+    /// so semantic errors keep their precedence; glob sets and expiry stamps
+    /// are built exactly here, never thrown away by a separate validation
+    /// pass that would recompile them.
+    fn compiled(&self) -> Result<CompiledPolicy<'_>, PolicyError> {
+        self.validate_structure()?;
+        CompiledPolicy::new(self)
+    }
+
+    /// Semantic checks that do not involve compilation. Glob-pattern and
+    /// expiry-format validation live in `CompiledPolicy::new` instead.
+    fn validate_structure(&self) -> Result<(), PolicyError> {
         if self.version != POLICY_SCHEMA_VERSION {
             return Err(PolicyError::UnsupportedVersion(self.version));
         }
@@ -202,9 +217,6 @@ impl Policy {
                     rule_id: rule.id.to_string(),
                 });
             }
-            validate_globs(rule, "purls", &rule.selectors.purls)?;
-            validate_globs(rule, "rule_ids", &rule.selectors.rule_ids)?;
-            validate_globs(rule, "advisory_ids", &rule.selectors.advisory_ids)?;
             for cve in &rule.selectors.cves {
                 require_text(format!("rule '{}'.selectors.cves", rule.id), cve)?;
             }
@@ -234,7 +246,6 @@ impl Policy {
                 format!("exception '{}'.ticket", exception.id),
                 &exception.ticket,
             )?;
-            parse_expiry(exception)?;
             if exception.selectors.is_empty() {
                 return Err(PolicyError::BroadException(exception.id.clone()));
             }
@@ -255,8 +266,7 @@ impl Policy {
         inventory: &Inventory,
         now: DateTime<FixedOffset>,
     ) -> Result<PolicyEvaluation, PolicyError> {
-        self.validate()?;
-        let compiled = CompiledPolicy::new(self)?;
+        let compiled = self.compiled()?;
         let decisions = findings
             .values()
             .map(|finding| compiled.evaluate_finding(finding, inventory, now))
@@ -369,7 +379,7 @@ impl<'a> CompiledPolicy<'a> {
         } else if let Some(rule) = self
             .rules
             .iter()
-            .find(|rule| rule.matches(finding, component, self.policy.fail_closed))
+            .find(|rule| rule.matches(finding, component))
         {
             decision(
                 rule.rule.id.as_str(),
@@ -402,12 +412,10 @@ impl<'a> CompiledPolicy<'a> {
 }
 
 impl CompiledRule<'_> {
-    fn matches(
-        &self,
-        finding: &Finding,
-        component: Option<&Component>,
-        fail_closed: FailClosed,
-    ) -> bool {
+    // Fail-closed applicability/license pre-checks already deny in
+    // `evaluate_finding` before any rule matching, so `matches` only encodes
+    // selector semantics.
+    fn matches(&self, finding: &Finding, component: Option<&Component>) -> bool {
         let selectors = &self.rule.selectors;
         if !selectors.kinds.is_empty() && !selectors.kinds.contains(&finding.kind) {
             return false;
@@ -426,9 +434,6 @@ impl CompiledRule<'_> {
                 .applicability
                 .as_ref()
                 .map_or(ApplicabilityStatus::Unknown, |value| value.status);
-            if status == ApplicabilityStatus::Unknown && fail_closed.unknown_applicability {
-                return false;
-            }
             if !selectors.applicability.contains(&status) {
                 return false;
             }
@@ -484,9 +489,6 @@ impl CompiledRule<'_> {
         }
         if !selectors.license_expressions.is_empty() {
             let expressions = component.map(known_license_expressions).unwrap_or_default();
-            if expressions.is_empty() && fail_closed.unknown_licenses {
-                return false;
-            }
             if expressions.is_disjoint(&selectors.license_expressions) {
                 return false;
             }
@@ -591,14 +593,6 @@ fn parse_expiry(exception: &PolicyException) -> Result<DateTime<FixedOffset>, Po
         exception_id: exception.id.clone(),
         value: exception.expires_at.clone(),
     })
-}
-
-fn validate_globs(
-    rule: &PolicyRule,
-    selector: &'static str,
-    patterns: &BTreeSet<String>,
-) -> Result<(), PolicyError> {
-    compile_globs(rule, selector, patterns).map(|_| ())
 }
 
 fn compile_globs(

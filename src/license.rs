@@ -1,12 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
-    path::{Component as PathComponent, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::model::{
@@ -69,7 +67,7 @@ pub fn analyze_with_files(
         if is_notice_name(&path) {
             notices.push(Notice {
                 path,
-                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                sha256: crate::util::sha256_hex(&bytes),
                 text: String::from_utf8_lossy(&bytes).into_owned(),
             });
         } else if is_license_name(&path) {
@@ -91,40 +89,13 @@ pub fn analyze_with_files(
 
     for component in inventory.components.values() {
         if component.licenses.is_empty() {
-            if asset_component.is_some_and(|candidate| candidate.identity == component.identity)
-                && !detected.is_empty()
-            {
-                for detection in &detected {
-                    let license = detection.expression.as_ref().map(|expression| License {
-                        expression: Some(expression.clone()),
-                        name: detection.name.clone(),
-                        url: None,
-                    });
-                    findings.push(finding(
-                        &detected_rule,
-                        component,
-                        license.as_ref(),
-                        LicenseFindingShape {
-                            salt: None,
-                            severity: Severity::Low,
-                            confidence: detection.confidence,
-                        },
-                        &format!(
-                            "License file suggests {}",
-                            detection
-                                .expression
-                                .as_deref()
-                                .or(detection.name.as_deref())
-                                .unwrap_or("an unknown or undetermined license")
-                        ),
-                        detection.evidence(),
-                    ));
-                }
-            } else {
-                findings.push(finding(&unknown_rule, component, None, LicenseFindingShape { salt: None, severity: Severity::Medium, confidence: Confidence::High },
-                    "No license metadata or attributable license file was found",
-                    Evidence { description: "Component has no declared licenses and no recognized LICENSE/COPYING text can be attributed to it".into(), locations: component.locations.iter().map(|v| v.id.clone()).collect(), references: BTreeSet::new(), properties: BTreeMap::from([("classification".into(), "unknown".into())]), redacted: false }));
-            }
+            findings.extend(findings_for_unlicensed_component(
+                component,
+                &detected,
+                asset_component,
+                &unknown_rule,
+                &detected_rule,
+            ));
             continue;
         }
         for license in &component.licenses {
@@ -144,75 +115,150 @@ pub fn analyze_with_files(
             } else {
                 None
             };
-            match license.expression.as_deref() {
-                Some(expression) if spdx::Expression::parse(expression).is_ok() => {
-                    findings.push(finding(
-                        &detected_rule,
-                        component,
-                        Some(license),
-                        LicenseFindingShape {
-                            salt: salt.as_deref(),
-                            severity: Severity::Low,
-                            confidence: Confidence::High,
-                        },
-                        &format!("Valid SPDX license expression: {expression}"),
-                        declared_evidence(component, license, true),
-                    ));
-                }
-                Some(expression) => {
-                    findings.push(finding(
-                        &invalid_rule,
-                        component,
-                        Some(license),
-                        LicenseFindingShape {
-                            salt: salt.as_deref(),
-                            severity: Severity::High,
-                            confidence: Confidence::High,
-                        },
-                        &format!("Invalid SPDX license expression: {expression}"),
-                        declared_evidence(component, license, false),
-                    ));
-                }
-                None if license
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| spdx::Expression::parse(name).is_ok()) =>
-                {
-                    findings.push(finding(
-                        &detected_rule,
-                        component,
-                        Some(license),
-                        LicenseFindingShape {
-                            salt: salt.as_deref(),
-                            severity: Severity::Low,
-                            confidence: Confidence::Medium,
-                        },
-                        &format!(
-                            "License name is a valid SPDX expression: {}",
-                            license.name.as_deref().unwrap()
-                        ),
-                        declared_evidence(component, license, true),
-                    ));
-                }
-                None => {
-                    findings.push(finding(
-                        &unknown_rule,
-                        component,
-                        Some(license),
-                        LicenseFindingShape {
-                            salt: salt.as_deref(),
-                            severity: Severity::Medium,
-                            confidence: Confidence::High,
-                        },
-                        "License metadata does not contain an SPDX expression",
-                        declared_evidence(component, license, false),
-                    ));
-                }
-            }
+            let classified = classify_declared_license(license);
+            let rule = match classified.rule {
+                DeclaredRule::Detected => &detected_rule,
+                DeclaredRule::InvalidSpdx => &invalid_rule,
+                DeclaredRule::Unknown => &unknown_rule,
+            };
+            findings.push(finding(
+                rule,
+                component,
+                Some(license),
+                LicenseFindingShape {
+                    salt: salt.as_deref(),
+                    severity: classified.severity,
+                    confidence: classified.confidence,
+                },
+                &classified.summary,
+                declared_evidence(component, license, classified.spdx_valid),
+            ));
         }
     }
     findings.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(LicenseAnalysis { findings, notices })
+}
+
+fn findings_for_unlicensed_component(
+    component: &crate::model::Component,
+    detected: &[Detection],
+    asset_component: Option<&crate::model::Component>,
+    unknown_rule: &RuleId,
+    detected_rule: &RuleId,
+) -> Vec<Finding> {
+    if asset_component.is_some_and(|candidate| candidate.identity == component.identity)
+        && !detected.is_empty()
+    {
+        detected
+            .iter()
+            .map(|detection| {
+                let license = detection.expression.as_ref().map(|expression| License {
+                    expression: Some(expression.clone()),
+                    name: detection.name.clone(),
+                    url: None,
+                });
+                finding(
+                    detected_rule,
+                    component,
+                    license.as_ref(),
+                    LicenseFindingShape {
+                        salt: None,
+                        severity: Severity::Low,
+                        confidence: detection.confidence,
+                    },
+                    &format!(
+                        "License file suggests {}",
+                        detection
+                            .expression
+                            .as_deref()
+                            .or(detection.name.as_deref())
+                            .unwrap_or("an unknown or undetermined license")
+                    ),
+                    detection.evidence(),
+                )
+            })
+            .collect()
+    } else {
+        let evidence = Evidence {
+            description:
+                "Component has no declared licenses and no recognized LICENSE/COPYING text can be attributed to it"
+                    .into(),
+            locations: component.locations.iter().map(|v| v.id.clone()).collect(),
+            references: BTreeSet::new(),
+            properties: BTreeMap::from([("classification".into(), "unknown".into())]),
+            redacted: false,
+        };
+        vec![finding(
+            unknown_rule,
+            component,
+            None,
+            LicenseFindingShape {
+                salt: None,
+                severity: Severity::Medium,
+                confidence: Confidence::High,
+            },
+            "No license metadata or attributable license file was found",
+            evidence,
+        )]
+    }
+}
+
+enum DeclaredRule {
+    Detected,
+    InvalidSpdx,
+    Unknown,
+}
+
+// Data-only verdict for one declared license; finding construction stays in
+// the caller so classification remains trivially testable.
+struct ClassifiedLicense {
+    rule: DeclaredRule,
+    severity: Severity,
+    confidence: Confidence,
+    summary: String,
+    spdx_valid: bool,
+}
+
+fn classify_declared_license(license: &License) -> ClassifiedLicense {
+    match license.expression.as_deref() {
+        Some(expression) if spdx::Expression::parse(expression).is_ok() => ClassifiedLicense {
+            rule: DeclaredRule::Detected,
+            severity: Severity::Low,
+            confidence: Confidence::High,
+            summary: format!("Valid SPDX license expression: {expression}"),
+            spdx_valid: true,
+        },
+        Some(expression) => ClassifiedLicense {
+            rule: DeclaredRule::InvalidSpdx,
+            severity: Severity::High,
+            confidence: Confidence::High,
+            summary: format!("Invalid SPDX license expression: {expression}"),
+            spdx_valid: false,
+        },
+        None if license
+            .name
+            .as_deref()
+            .is_some_and(|name| spdx::Expression::parse(name).is_ok()) =>
+        {
+            ClassifiedLicense {
+                rule: DeclaredRule::Detected,
+                severity: Severity::Low,
+                confidence: Confidence::Medium,
+                summary: format!(
+                    "License name is a valid SPDX expression: {}",
+                    license.name.as_deref().unwrap()
+                ),
+                spdx_valid: true,
+            }
+        }
+        None => ClassifiedLicense {
+            rule: DeclaredRule::Unknown,
+            severity: Severity::Medium,
+            confidence: Confidence::High,
+            summary: "License metadata does not contain an SPDX expression".into(),
+            spdx_valid: false,
+        },
+    }
 }
 
 fn asset_component(inventory: &Inventory) -> Option<&crate::model::Component> {
@@ -255,6 +301,117 @@ impl Detection {
     }
 }
 
+struct LicenseSignature {
+    needles: &'static [&'static str],
+    expression: Option<&'static str>,
+    name: &'static str,
+    confidence: Confidence,
+    matched: &'static str,
+}
+
+/// Probe order is precedence: the first row whose needles all occur in the
+/// whitespace-normalized text wins. Near-duplicates (GPL or-later before
+/// only, BSD-3 before BSD-2) must stay above their weaker siblings.
+const SIGNATURES: &[LicenseSignature] = &[
+    LicenseSignature {
+        needles: &[
+            "permission is hereby granted, free of charge, to any person obtaining a copy",
+            "the software is provided \"as is\"",
+        ],
+        expression: Some("MIT"),
+        name: "MIT License",
+        confidence: Confidence::High,
+        matched: "MIT canonical clauses",
+    },
+    LicenseSignature {
+        needles: &[
+            "apache license",
+            "version 2.0, january 2004",
+            "http://www.apache.org/licenses/",
+        ],
+        expression: Some("Apache-2.0"),
+        name: "Apache License 2.0",
+        confidence: Confidence::High,
+        matched: "Apache-2.0 title and canonical URL",
+    },
+    LicenseSignature {
+        needles: &[
+            "gnu general public license",
+            "version 3",
+            "either version 3 of the license, or (at your option) any later version",
+        ],
+        expression: Some("GPL-3.0-or-later"),
+        name: "GNU GPL v3 or later",
+        confidence: Confidence::High,
+        matched: "GPL-3.0-or-later grant",
+    },
+    LicenseSignature {
+        needles: &["gnu general public license", "version 3"],
+        expression: Some("GPL-3.0-only"),
+        name: "GNU GPL v3",
+        confidence: Confidence::Medium,
+        matched: "GPL v3 title",
+    },
+    LicenseSignature {
+        needles: &["gnu lesser general public license", "version 3"],
+        expression: Some("LGPL-3.0-only"),
+        name: "GNU LGPL v3",
+        confidence: Confidence::Medium,
+        matched: "LGPL v3 title",
+    },
+    LicenseSignature {
+        needles: &["mozilla public license version 2.0"],
+        expression: Some("MPL-2.0"),
+        name: "Mozilla Public License 2.0",
+        confidence: Confidence::High,
+        matched: "MPL-2.0 title",
+    },
+    LicenseSignature {
+        needles: &[
+            "redistribution and use in source and binary forms",
+            "neither the name",
+        ],
+        expression: Some("BSD-3-Clause"),
+        name: "BSD 3-Clause License",
+        confidence: Confidence::Medium,
+        matched: "BSD 3-Clause clauses",
+    },
+    LicenseSignature {
+        needles: &["redistribution and use in source and binary forms"],
+        expression: Some("BSD-2-Clause"),
+        name: "BSD 2-Clause License",
+        confidence: Confidence::Medium,
+        matched: "BSD redistribution clauses",
+    },
+    LicenseSignature {
+        needles: &[
+            "isc license",
+            "permission to use, copy, modify, and/or distribute this software for any purpose",
+        ],
+        expression: Some("ISC"),
+        name: "ISC License",
+        confidence: Confidence::High,
+        matched: "ISC canonical grant",
+    },
+    LicenseSignature {
+        needles: &["boost software license - version 1.0"],
+        expression: Some("BSL-1.0"),
+        name: "Boost Software License 1.0",
+        confidence: Confidence::High,
+        matched: "BSL-1.0 title",
+    },
+    LicenseSignature {
+        needles: &[
+            "the unlicense",
+            "this is free and unencumbered software released into the public domain",
+        ],
+        expression: Some("Unlicense"),
+        name: "The Unlicense",
+        confidence: Confidence::High,
+        matched: "Unlicense canonical dedication",
+    },
+];
+
 fn detect_license_text(path: &str, bytes: &[u8]) -> Detection {
     let text = String::from_utf8_lossy(bytes);
     let normalized = text
@@ -262,119 +419,27 @@ fn detect_license_text(path: &str, bytes: &[u8]) -> Detection {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let (expression, name, confidence, matched) = if normalized
-        .contains("permission is hereby granted, free of charge, to any person obtaining a copy")
-        && normalized.contains("the software is provided \"as is\"")
-    {
-        (
-            Some("MIT".into()),
-            Some("MIT License".into()),
-            Confidence::High,
-            "MIT canonical clauses",
-        )
-    } else if normalized.contains("apache license")
-        && normalized.contains("version 2.0, january 2004")
-        && normalized.contains("http://www.apache.org/licenses/")
-    {
-        (
-            Some("Apache-2.0".into()),
-            Some("Apache License 2.0".into()),
-            Confidence::High,
-            "Apache-2.0 title and canonical URL",
-        )
-    } else if normalized.contains("gnu general public license")
-        && normalized.contains("version 3")
-        && normalized
-            .contains("either version 3 of the license, or (at your option) any later version")
-    {
-        (
-            Some("GPL-3.0-or-later".into()),
-            Some("GNU GPL v3 or later".into()),
-            Confidence::High,
-            "GPL-3.0-or-later grant",
-        )
-    } else if normalized.contains("gnu general public license") && normalized.contains("version 3")
-    {
-        (
-            Some("GPL-3.0-only".into()),
-            Some("GNU GPL v3".into()),
-            Confidence::Medium,
-            "GPL v3 title",
-        )
-    } else if normalized.contains("gnu lesser general public license")
-        && normalized.contains("version 3")
-    {
-        (
-            Some("LGPL-3.0-only".into()),
-            Some("GNU LGPL v3".into()),
-            Confidence::Medium,
-            "LGPL v3 title",
-        )
-    } else if normalized.contains("mozilla public license version 2.0") {
-        (
-            Some("MPL-2.0".into()),
-            Some("Mozilla Public License 2.0".into()),
-            Confidence::High,
-            "MPL-2.0 title",
-        )
-    } else if normalized.contains("redistribution and use in source and binary forms")
-        && normalized.contains("neither the name")
-    {
-        (
-            Some("BSD-3-Clause".into()),
-            Some("BSD 3-Clause License".into()),
-            Confidence::Medium,
-            "BSD 3-Clause clauses",
-        )
-    } else if normalized.contains("redistribution and use in source and binary forms") {
-        (
-            Some("BSD-2-Clause".into()),
-            Some("BSD 2-Clause License".into()),
-            Confidence::Medium,
-            "BSD redistribution clauses",
-        )
-    } else if normalized.contains("isc license")
-        && normalized.contains(
-            "permission to use, copy, modify, and/or distribute this software for any purpose",
-        )
-    {
-        (
-            Some("ISC".into()),
-            Some("ISC License".into()),
-            Confidence::High,
-            "ISC canonical grant",
-        )
-    } else if normalized.contains("boost software license - version 1.0") {
-        (
-            Some("BSL-1.0".into()),
-            Some("Boost Software License 1.0".into()),
-            Confidence::High,
-            "BSL-1.0 title",
-        )
-    } else if normalized.contains("the unlicense")
-        && normalized
-            .contains("this is free and unencumbered software released into the public domain")
-    {
-        (
-            Some("Unlicense".into()),
-            Some("The Unlicense".into()),
-            Confidence::High,
-            "Unlicense canonical dedication",
-        )
-    } else {
-        (
-            None,
-            Some("unknown or undetermined license text".into()),
-            Confidence::Low,
-            "no canonical license signature",
-        )
-    };
-    Detection {
-        path: path.to_owned(),
-        expression,
-        name,
-        confidence,
-        matched,
+    let signature = SIGNATURES.iter().find(|signature| {
+        signature
+            .needles
+            .iter()
+            .all(|needle| normalized.contains(needle))
+    });
+    match signature {
+        Some(signature) => Detection {
+            path: path.to_owned(),
+            expression: signature.expression.map(str::to_owned),
+            name: Some(signature.name.into()),
+            confidence: signature.confidence,
+            matched: signature.matched,
+        },
+        None => Detection {
+            path: path.to_owned(),
+            expression: None,
+            name: Some("unknown or undetermined license text".into()),
+            confidence: Confidence::Low,
+            matched: "no canonical license signature",
+        },
     }
 }
 
@@ -522,30 +587,19 @@ fn collect_license_files(
 }
 
 fn normalize_relative(path: &Path) -> Result<String, LicenseError> {
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            PathComponent::Normal(value) => parts.push(
-                value
-                    .to_str()
-                    .ok_or_else(|| LicenseError::PathTraversal(path.to_owned()))?,
-            ),
-            PathComponent::CurDir => {}
-            _ => return Err(LicenseError::PathTraversal(path.to_owned())),
-        }
-    }
-    if parts.is_empty() {
-        return Err(LicenseError::PathTraversal(path.to_owned()));
-    }
-    Ok(parts.join("/"))
+    crate::input::normalize_relative(path).map_err(|_| LicenseError::PathTraversal(path.to_owned()))
 }
 
 fn is_license_name(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_uppercase();
-    Regex::new(r"^(LICENSE|LICENCE|COPYING)([._-].*)?$")
-        .expect("constant regex")
-        .is_match(&name)
+    ["LICENSE", "LICENCE", "COPYING"].iter().any(|stem| {
+        name.len() >= stem.len()
+            && name.starts_with(stem)
+            && (name.len() == stem.len()
+                || matches!(name.as_bytes()[stem.len()], b'.' | b'_' | b'-'))
+    })
 }
+
 fn is_notice_name(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_uppercase();
     name == "NOTICE"

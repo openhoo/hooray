@@ -7,8 +7,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    model::{Finding, FindingId, FindingKind, Location, PolicyOutcome, ScanReport, Severity},
-    report::{ReportIndex, gitlab_code_quality_entry, gitlab_finding_location},
+    model::{
+        Finding, FindingId, FindingKind, Location, LocationId, PolicyOutcome, ScanReport, Severity,
+    },
+    report::{ReportIndex, gitlab_code_quality_entry, gitlab_finding_location, sarif_level},
     store::ReportDiff,
 };
 
@@ -125,6 +127,7 @@ impl IntegrationGenerator {
 
     pub fn github_sarif(&self, report: &ScanReport) -> Result<GeneratedArtifact, IntegrationError> {
         let selected = self.selected_findings(report);
+        let locations = location_index(report);
         let rules: Vec<Value> = selected
             .items
             .iter()
@@ -153,7 +156,7 @@ impl IntegrationGenerator {
                     "partialFingerprints": { "hoorayFindingId": finding.id.as_str() },
                     "properties": { "kind": finding.kind.as_str(), "severity": finding.severity.as_str() }
                 });
-                if let Some(location) = report_location(report, finding) {
+                if let Some(location) = report_location(&locations, finding) {
                     result["locations"] = json!([sarif_location(location)]);
                 }
                 result
@@ -178,11 +181,12 @@ impl IntegrationGenerator {
     ) -> Result<GeneratedArtifact, IntegrationError> {
         let details_url = details_url.map(validate_https_url).transpose()?;
         let selected = self.selected_findings(report);
+        let locations = location_index(report);
         let annotations: Vec<Value> = selected
             .items
             .iter()
             .map(|finding| {
-                let location = report_location(report, finding);
+                let location = report_location(&locations, finding);
                 json!({
                     "path": location.map_or(".", |value| value.path.as_str()),
                     "start_line": location.and_then(|value| value.start).map_or(1, |value| value.line.max(1)),
@@ -251,18 +255,8 @@ impl IntegrationGenerator {
         event: &str,
         payload: &Value,
     ) -> Result<SignedWebhook, IntegrationError> {
+        validate_webhook_config(Some(url), secret, event)?;
         let url = validate_https_url(url)?;
-        if !(MIN_WEBHOOK_SECRET_BYTES..=MAX_WEBHOOK_SECRET_BYTES).contains(&secret.len()) {
-            return Err(IntegrationError::InvalidWebhookSecret);
-        }
-        if event.is_empty()
-            || event.len() > MAX_EVENT_BYTES
-            || !event
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        {
-            return Err(IntegrationError::InvalidWebhookEvent);
-        }
         let body = serde_json::to_vec(payload)?;
         self.ensure_payload_size(body.len())?;
         let signature = webhook_signature(secret, event, &body);
@@ -287,9 +281,7 @@ impl IntegrationGenerator {
         body: &[u8],
         supplied: &str,
     ) -> bool {
-        if !(MIN_WEBHOOK_SECRET_BYTES..=MAX_WEBHOOK_SECRET_BYTES).contains(&secret.len())
-            || event.is_empty()
-            || event.len() > MAX_EVENT_BYTES
+        if validate_webhook_config(None, secret, event).is_err()
             || body.len() > self.limits.max_payload_bytes
         {
             return false;
@@ -356,21 +348,25 @@ impl IntegrationGenerator {
     /// capped at JIRA_MAX_LISTED_FINDINGS entries like the Slack summary.
     pub fn jira_issue(&self, report: &ScanReport) -> Value {
         let selected = self.selected_findings(report);
+        let mut outcomes_by_finding: BTreeMap<&FindingId, (bool, bool)> = BTreeMap::new();
+        for decision in &report.policy_decisions {
+            let Some(finding_id) = decision.finding_id.as_ref() else {
+                continue;
+            };
+            let outcomes = outcomes_by_finding.entry(finding_id).or_default();
+            match decision.outcome {
+                PolicyOutcome::Deny => outcomes.0 = true,
+                PolicyOutcome::Warn => outcomes.1 = true,
+                PolicyOutcome::Allow => {}
+            }
+        }
         let mut denied_lines: Vec<String> = Vec::new();
         let mut warned_lines: Vec<String> = Vec::new();
         for finding in &selected.items {
-            let mut denied = false;
-            let mut warned = false;
-            for decision in &report.policy_decisions {
-                if decision.finding_id.as_ref() != Some(&finding.id) {
-                    continue;
-                }
-                match decision.outcome {
-                    PolicyOutcome::Deny => denied = true,
-                    PolicyOutcome::Warn => warned = true,
-                    PolicyOutcome::Allow => {}
-                }
-            }
+            let (denied, warned) = outcomes_by_finding
+                .get(&finding.id)
+                .copied()
+                .unwrap_or((false, false));
             let line = format!(
                 "* *{}* {{{}}} — {}",
                 finding.severity,
@@ -387,36 +383,14 @@ impl IntegrationGenerator {
         let warn_budget = JIRA_MAX_LISTED_FINDINGS - denied_lines.len();
         let warn_omitted = warned_lines.len().saturating_sub(warn_budget);
         warned_lines.truncate(warn_budget);
-        let listed = denied_lines.len() + warned_lines.len();
 
-        let mut description = String::from("h2. Policy summary\n");
-        description.push_str(&format!("* Denied: {}\n", report.policy_summary.denied));
-        description.push_str(&format!("* Warnings: {}\n", report.policy_summary.warned));
-        description.push_str(&format!("* Findings: {}\n", report.findings.len()));
-        description.push_str(&format!(
-            "* Run: {}{}{}\n",
-            "{{",
-            report.run.id.as_str(),
-            "}}"
-        ));
-        if !denied_lines.is_empty() {
-            description.push_str("\nh2. Top policy denials\n");
-            for line in &denied_lines {
-                description.push_str(line);
-                description.push('\n');
-            }
-        }
-        if !warned_lines.is_empty() {
-            description.push_str("\nh2. Top warnings\n");
-            for line in &warned_lines {
-                description.push_str(line);
-                description.push('\n');
-            }
-        }
-        if selected.truncated || warn_omitted > 0 {
-            description.push_str(&bounded_summary(selected.total, listed));
-            description.push('\n');
-        }
+        let description = jira_description(
+            &denied_lines,
+            &warned_lines,
+            warn_omitted,
+            &selected,
+            report,
+        );
         let summary: String = format!(
             "Hooray scan: {} denied, {} warnings ({})",
             report.policy_summary.denied,
@@ -439,7 +413,10 @@ impl IntegrationGenerator {
     pub fn pre_commit_config(&self) -> Result<GeneratedArtifact, IntegrationError> {
         self.text_artifact(
             "text/yaml",
-            "repos:\n  - repo: https://github.com/openhoo/hooray\n    rev: v0.2.1\n    hooks:\n      - id: hooray\n        name: Hooray security policy\n        entry: hooray scan project . --format json\n        language: rust\n        pass_filenames: false\n        stages: [pre-commit, pre-push]\n",
+            &format!(
+                "repos:\n  - repo: https://github.com/openhoo/hooray\n    rev: v{}\n    hooks:\n      - id: hooray\n        name: Hooray security policy\n        entry: hooray scan project . --format json\n        language: rust\n        pass_filenames: false\n        stages: [pre-commit, pre-push]\n",
+                env!("CARGO_PKG_VERSION"),
+            ),
         )
     }
 
@@ -478,10 +455,11 @@ impl IntegrationGenerator {
         report: &ScanReport,
     ) -> Result<GeneratedArtifact, IntegrationError> {
         let selected = self.selected_findings(report);
+        let locations = location_index(report);
         let diagnostics: Vec<Value> = selected
             .items
             .iter()
-            .map(|finding| vscode_diagnostic(report, finding, self))
+            .map(|finding| vscode_diagnostic(&locations, finding, self))
             .collect();
         self.json_artifact(
             json!({
@@ -501,14 +479,15 @@ impl IntegrationGenerator {
     ) -> Result<GeneratedArtifact, IntegrationError> {
         let uri = validate_document_uri(document_uri)?;
         let selected = self.selected_findings(report);
+        let locations = location_index(report);
         let diagnostics: Vec<Value> = selected
             .items
             .iter()
             .filter(|finding| {
-                report_location(report, finding)
+                report_location(&locations, finding)
                     .is_none_or(|location| uri.ends_with(&percent_encode_path(&location.path)))
             })
-            .map(|finding| lsp_diagnostic(report, finding, self))
+            .map(|finding| lsp_diagnostic(&locations, finding, self))
             .collect();
         self.json_artifact(
             json!({
@@ -646,20 +625,31 @@ struct Selection<'a> {
     truncated: bool,
 }
 
-fn report_location<'a>(report: &'a ScanReport, finding: &Finding) -> Option<&'a Location> {
-    let location_id = finding.location_id.as_ref()?;
-    // Project scans merge scanner locations solely into inventory.locations,
-    // while lockfile scans attach them to components. Mirror ReportIndex
-    // chaining (components first, then inventory) so every payload resolves
-    // both shapes deterministically instead of degrading project-scan
-    // findings to missing locations.
+/// Read-once view of every inventory and component location, keyed by id.
+/// Component-carried entries win over inventory duplicates, matching the
+/// components-first resolution previously recomputed per finding and the
+/// overwrite order of `ReportIndex::new`.
+type LocationIndex<'a> = BTreeMap<&'a LocationId, &'a Location>;
+
+fn location_index(report: &ScanReport) -> LocationIndex<'_> {
     report
         .inventory
-        .components
-        .values()
-        .flat_map(|component| component.locations.iter())
-        .chain(report.inventory.locations.iter())
-        .find(|location| &location.id == location_id)
+        .locations
+        .iter()
+        .chain(
+            report
+                .inventory
+                .components
+                .values()
+                .flat_map(|component| component.locations.iter()),
+        )
+        .map(|location| (&location.id, location))
+        .collect()
+}
+
+fn report_location<'a>(locations: &LocationIndex<'a>, finding: &Finding) -> Option<&'a Location> {
+    let location_id = finding.location_id.as_ref()?;
+    locations.get(location_id).copied()
 }
 
 fn sarif_location(location: &Location) -> Value {
@@ -679,11 +669,11 @@ fn sarif_location(location: &Location) -> Value {
 }
 
 fn vscode_diagnostic(
-    report: &ScanReport,
+    locations: &LocationIndex<'_>,
     finding: &Finding,
     generator: &IntegrationGenerator,
 ) -> Value {
-    let location = report_location(report, finding);
+    let location = report_location(locations, finding);
     json!({
         "uri": location.map(|value| format!("file:///{}", percent_encode_path(value.path.trim_start_matches('/')))),
         "range": lsp_range(location),
@@ -697,12 +687,12 @@ fn vscode_diagnostic(
 }
 
 fn lsp_diagnostic(
-    report: &ScanReport,
+    locations: &LocationIndex<'_>,
     finding: &Finding,
     generator: &IntegrationGenerator,
 ) -> Value {
     json!({
-        "range": lsp_range(report_location(report, finding)),
+        "range": lsp_range(report_location(locations, finding)),
         "severity": lsp_severity(finding.severity),
         "code": finding.rule_id.as_str(),
         "codeDescription": { "href": format!("https://github.com/openhoo/hooray#{}", finding.kind.as_str()) },
@@ -745,6 +735,45 @@ fn bounded_summary(total: usize, included: usize) -> String {
     } else {
         format!("Included all {total} findings.")
     }
+}
+
+fn jira_description(
+    denied_lines: &[String],
+    warned_lines: &[String],
+    warn_omitted: usize,
+    selected: &Selection<'_>,
+    report: &ScanReport,
+) -> String {
+    let listed = denied_lines.len() + warned_lines.len();
+    let mut description = String::from("h2. Policy summary\n");
+    description.push_str(&format!("* Denied: {}\n", report.policy_summary.denied));
+    description.push_str(&format!("* Warnings: {}\n", report.policy_summary.warned));
+    description.push_str(&format!("* Findings: {}\n", report.findings.len()));
+    description.push_str(&format!(
+        "* Run: {}{}{}\n",
+        "{{",
+        report.run.id.as_str(),
+        "}}"
+    ));
+    if !denied_lines.is_empty() {
+        description.push_str("\nh2. Top policy denials\n");
+        for line in denied_lines {
+            description.push_str(line);
+            description.push('\n');
+        }
+    }
+    if !warned_lines.is_empty() {
+        description.push_str("\nh2. Top warnings\n");
+        for line in warned_lines {
+            description.push_str(line);
+            description.push('\n');
+        }
+    }
+    if selected.truncated || warn_omitted > 0 {
+        description.push_str(&bounded_summary(selected.total, listed));
+        description.push('\n');
+    }
+    description
 }
 
 fn validate_https_url(value: &str) -> Result<String, IntegrationError> {
@@ -816,6 +845,31 @@ fn webhook_signature(secret: &[u8], event: &str, body: &[u8]) -> String {
     outer.update(b"hooray.webhook.v1\0");
     outer.update(inner_digest);
     hex_lower(&outer.finalize())
+}
+/// Shared webhook configuration contract enforced identically when signing,
+/// verifying, and constructing notifiers: HTTPS endpoint URL, secret length
+/// bounds, and event-name shape (non-empty, bounded length, alphanumeric
+/// plus `.`, `_`, `-`).
+pub fn validate_webhook_config(
+    url: Option<&str>,
+    secret: &[u8],
+    event: &str,
+) -> Result<(), IntegrationError> {
+    if let Some(url) = url {
+        validate_https_url(url)?;
+    }
+    if !(MIN_WEBHOOK_SECRET_BYTES..=MAX_WEBHOOK_SECRET_BYTES).contains(&secret.len()) {
+        return Err(IntegrationError::InvalidWebhookSecret);
+    }
+    if event.is_empty()
+        || event.len() > MAX_EVENT_BYTES
+        || !event
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(IntegrationError::InvalidWebhookEvent);
+    }
+    Ok(())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -945,14 +999,6 @@ fn severity_rank(severity: Severity) -> u8 {
         Severity::Medium => 2,
         Severity::High => 3,
         Severity::Critical => 4,
-    }
-}
-
-fn sarif_level(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Critical | Severity::High => "error",
-        Severity::Medium => "warning",
-        Severity::Low | Severity::Unknown => "note",
     }
 }
 
@@ -1128,7 +1174,8 @@ mod tests {
             component.locations.clear();
         }
         let finding = report.findings.values().next().unwrap();
-        let location = report_location(&report, finding).expect("location resolves");
+        let locations = location_index(&report);
+        let location = report_location(&locations, finding).expect("location resolves");
         assert_eq!(location.path, "src/finding:sast.rs");
     }
 
@@ -1456,7 +1503,10 @@ mod tests {
         let pre_commit = generator.pre_commit_config().unwrap();
         let pre_commit: Value = serde_yaml::from_slice(&pre_commit.body).unwrap();
         let hook = &pre_commit["repos"][0]["hooks"][0];
-        assert_eq!(pre_commit["repos"][0]["rev"], "v0.2.1");
+        assert_eq!(
+            pre_commit["repos"][0]["rev"],
+            format!("v{}", env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(hook["entry"], "hooray scan project . --format json");
         assert_eq!(hook["pass_filenames"], false);
 

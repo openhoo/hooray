@@ -14,14 +14,17 @@ use hooray::{
     config::Config,
     engine::{Engine, ScanRequest, load_policy},
     input::ScanInput,
-    integrations::{IntegrationGenerator, IntegrationLimits, SignedWebhook},
+    integrations::{
+        IntegrationGenerator, IntegrationLimits, SignedWebhook, validate_webhook_config,
+    },
     model::{FindingId, RunId, ScanReport},
     monitor::{
         AdvisoryCursor, AdvisoryRefresh, AlertEvent, Evaluation, MonitorConfig, MonitorError,
-        MonitorFuture, MonitorRunner, MonitorService, Notifier, SystemClock,
+        MonitorFuture, MonitorRunner, MonitorService, Notifier, SystemClock, encode_time,
     },
     report::{self, ReportFormat},
     store::{MonitorTarget, ReportDiff, Store},
+    util::sha256_hex,
 };
 use serde::Serialize;
 
@@ -553,7 +556,7 @@ fn run_monitor_targets(config: &Config, args: MonitorTargetsArgs) -> Result<Comm
     let mut store = open_store(config)?;
     match args.command {
         MonitorTargetsCommand::Add(args) => {
-            let now = encode_monitor_time(Utc::now().timestamp());
+            let now = encode_time(Utc::now().timestamp());
             let target = MonitorTarget {
                 target_id: args.target_id,
                 source: args.source,
@@ -588,12 +591,6 @@ fn run_monitor_targets(config: &Config, args: MonitorTargetsArgs) -> Result<Comm
         }
     }
     Ok(CommandOutcome::Passed)
-}
-
-/// Mirrors `monitor::encode_time`: a zero-padded 20-digit string whose
-/// lexicographic order matches chronological order of the unix timestamps.
-fn encode_monitor_time(timestamp: i64) -> String {
-    format!("{:020}", (timestamp as u64) ^ (1_u64 << 63))
 }
 
 fn render_monitor_targets_table(targets: &[MonitorTarget]) -> String {
@@ -664,7 +661,7 @@ impl MonitorRunner for CliMonitorRunner {
                 .unwrap_or_default()
                 .saturating_add(1);
             let token = generation.to_string();
-            let digest = stable_digest(format!("osv-periodic-refresh-v1:{token}").as_bytes());
+            let digest = sha256_hex(format!("osv-periodic-refresh-v1:{token}").as_bytes());
             Ok(AdvisoryRefresh {
                 changed: cursor.digest.as_deref() != Some(digest.as_str()),
                 cursor: AdvisoryCursor {
@@ -686,7 +683,7 @@ impl MonitorRunner for CliMonitorRunner {
                 "policy exceeds configured input bound".into(),
             ));
         }
-        Ok(stable_digest(&bytes))
+        Ok(sha256_hex(&bytes))
     }
 
     fn source_fingerprint<'a>(
@@ -707,11 +704,19 @@ impl MonitorRunner for CliMonitorRunner {
                     .follow_links(false)
                     .sort_by_file_name()
                     .into_iter()
-                    .filter_map(Result::ok)
-                    .filter(|entry| entry.file_type().is_file())
+                    .filter_map(|entry| match entry {
+                        Err(error) => Some(Err(error)),
+                        Ok(entry) if entry.file_type().is_file() => Some(Ok(entry.into_path())),
+                        Ok(_) => None,
+                    })
                     .take(self.config.max_archive_entries)
-                    .map(|entry| entry.into_path())
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        MonitorError::Runner(format!(
+                            "failed to walk source '{}': {error}",
+                            root.display()
+                        ))
+                    })?
             };
             paths.sort();
             let mut digest = Sha256::new();
@@ -785,40 +790,14 @@ struct WebhookNotifier {
 
 impl WebhookNotifier {
     fn new(config: &Config, url: &str, secret: Vec<u8>) -> Result<Self> {
-        // integrations.rs enforces these rules only inside signed_webhook at
-        // delivery time; enforcing them here keeps undeliverable
+        // integrations.rs enforces these rules at delivery time inside
+        // signed_webhook too; enforcing them here keeps undeliverable
         // configurations from starting and silently dead-lettering every
-        // alert. The integration constants and validate_https_url helper are
-        // private, so the rules (secret 16..=4096 bytes; https URL of at most
-        // 2048 bytes with a host, no credentials, no fragment) are mirrored
-        // here.
-        if !(16..=4_096).contains(&secret.len()) {
-            bail!(
-                "--webhook-secret must be between 16 and 4096 bytes (got {})",
-                secret.len()
-            );
-        }
-        if url.len() > 2_048 {
-            bail!("--webhook-url must not exceed 2048 bytes");
-        }
+        // alert.
+        validate_webhook_config(Some(url), &secret, WEBHOOK_EVENT)
+            .map_err(|error| anyhow!("--webhook-url/--webhook-secret-env rejected: {error}"))?;
         let parsed = reqwest::Url::parse(url)
             .map_err(|error| anyhow!("invalid --webhook-url '{url}': {error}"))?;
-        if parsed.scheme() != "https" {
-            bail!(
-                "--webhook-url must use the https scheme (got '{}')",
-                parsed.scheme()
-            );
-        }
-        if parsed.host_str().is_none() {
-            bail!("--webhook-url requires a host");
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            // Deliberately not echoed: the URL embeds credentials.
-            bail!("--webhook-url must not contain credentials");
-        }
-        if parsed.fragment().is_some() {
-            bail!("--webhook-url must not contain a fragment");
-        }
         let generator = IntegrationGenerator::new(IntegrationLimits::default())
             .context("invalid webhook integration limits")?;
         let http = reqwest::Client::builder()
@@ -835,8 +814,13 @@ impl WebhookNotifier {
     }
 
     fn resolve_secret(secret_env: &str) -> Result<Vec<u8>> {
-        let secret = std::env::var(secret_env)
-            .map_err(|_| anyhow!("--webhook-secret-env '{secret_env}' is not set to a value"))?;
+        let secret = std::env::var(secret_env).map_err(|error| match error {
+            std::env::VarError::NotUnicode(raw) => anyhow!(
+                "--webhook-secret-env '{secret_env}' is set but its value is not valid UTF-8 ({} bytes)",
+                raw.len()
+            ),
+            _ => anyhow!("--webhook-secret-env '{secret_env}' is not set to a value"),
+        })?;
         if secret.is_empty() {
             bail!("--webhook-secret-env '{secret_env}' is empty");
         }
@@ -870,11 +854,6 @@ impl Notifier for WebhookNotifier {
             Ok(())
         })
     }
-}
-
-fn stable_digest(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Reads at most `cap + 1` bytes so callers can enforce an input bound
@@ -933,27 +912,21 @@ fn write_output<T: Serialize>(value: &T, args: &OutputArgs) -> Result<()> {
     if !matches!(args.format, OutputFormat::Json | OutputFormat::Yaml) {
         bail!("this command supports only json and yaml output");
     }
-    if args.output == Path::new("-") {
-        let stdout = io::stdout();
-        let mut writer = stdout.lock();
-        match args.format {
-            OutputFormat::Json => serde_json::to_writer_pretty(&mut writer, value)?,
-            OutputFormat::Yaml => serde_yaml::to_writer(&mut writer, value)?,
-            _ => unreachable!("format checked above"),
-        }
-        writer.write_all(b"\n")?;
-        writer.flush()?;
+    let mut writer: Box<dyn Write> = if args.output == Path::new("-") {
+        Box::new(io::stdout().lock())
     } else {
-        let mut writer = File::create(&args.output)
-            .with_context(|| format!("failed to create {}", args.output.display()))?;
-        match args.format {
-            OutputFormat::Json => serde_json::to_writer_pretty(&mut writer, value)?,
-            OutputFormat::Yaml => serde_yaml::to_writer(&mut writer, value)?,
-            _ => unreachable!("format checked above"),
-        }
-        writer.write_all(b"\n")?;
-        writer.flush()?;
+        Box::new(
+            File::create(&args.output)
+                .with_context(|| format!("failed to create {}", args.output.display()))?,
+        )
+    };
+    if args.format == OutputFormat::Json {
+        serde_json::to_writer_pretty(&mut writer, value)?;
+    } else {
+        serde_yaml::to_writer(&mut writer, value)?;
     }
+    writer.write_all(b"\n")?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -1612,6 +1585,50 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn monitor_fingerprint_fails_closed_on_unreadable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("project");
+        let sealed = source.join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join("hidden.rs"), "fn hidden() {}\n").unwrap();
+        std::fs::write(source.join("visible.rs"), "fn visible() {}\n").unwrap();
+        let runner = CliMonitorRunner {
+            config: config(&temp),
+        };
+        let target = hooray::monitor::MonitorTarget {
+            id: "unreadable-dir-test".into(),
+            source: source.display().to_string(),
+            interval_seconds: 60,
+            next_due_at: 0,
+            source_fingerprint: None,
+            inventory: None,
+            advisory_digest: None,
+            policy_digest: None,
+            finding_ids: BTreeSet::new(),
+            updated_at: 0,
+        };
+        // Lock the directory only for the fingerprint call; permissions must
+        // be restored so TempDir cleanup can recurse.
+        std::fs::set_permissions(&sealed, PermissionsExt::from_mode(0o000)).unwrap();
+        let result = runner.source_fingerprint(&target).await;
+        let enforced = std::fs::File::open(&sealed).is_err();
+        std::fs::set_permissions(&sealed, PermissionsExt::from_mode(0o755)).unwrap();
+        if !enforced {
+            // Privileged environment (e.g. root): permission bits are not
+            // enforced, so the walk legitimately succeeds.
+            return;
+        }
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("failed to walk source"),
+            "an unreadable directory must fail the cycle, got: {error}"
+        );
+    }
+
     #[test]
     fn read_bounded_never_reads_past_the_cap() {
         let temp = TempDir::new().unwrap();
@@ -1851,7 +1868,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("https"), "{error}");
+        assert!(error.contains("HTTPS is required"), "{error}");
     }
 
     #[test]
@@ -1904,7 +1921,7 @@ mod tests {
             ),
             (
                 format!("https://hooks.example/{}", "a".repeat(2100)),
-                "2048",
+                "too long",
                 "",
             ),
         ];
@@ -2094,15 +2111,16 @@ mod tests {
 
     #[test]
     fn encoded_monitor_times_match_monitor_storage_format() {
-        // Same transform as monitor::encode_time, so registered targets stay
-        // decodable by the monitor service and sort chronologically as text.
-        assert_eq!(encode_monitor_time(0), "09223372036854775808");
+        // Registered targets stay decodable by the monitor service and sort
+        // chronologically as text because both sides share
+        // monitor::encode_time for store timestamps.
+        assert_eq!(encode_time(0), "09223372036854775808");
         let epoch = 1_700_000_000_i64;
         assert_eq!(
-            encode_monitor_time(epoch),
+            encode_time(epoch),
             format!("{:020}", epoch as u64 ^ (1_u64 << 63))
         );
-        assert!(encode_monitor_time(2) > encode_monitor_time(1));
+        assert!(encode_time(2) > encode_time(1));
     }
 
     #[test]

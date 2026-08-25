@@ -1,5 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::ControlFlow;
+
+use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::model::{
     Applicability, ApplicabilityStatus, Component, ComponentId, Evidence, Inventory, Scope,
@@ -49,7 +52,7 @@ impl ApplicabilityAnalyzer {
     pub fn analyze(input: ApplicabilityInput<'_>) -> Applicability {
         let mut rationale = Vec::new();
         let ecosystem = purl_ecosystem(&input.component.purl);
-        let evidence = EvidenceView::new(input.evidence);
+        let evidence = EvidenceProperties::new(input.evidence);
         let version = version_parts(&input.component.version);
         let (paths, paths_truncated) = input
             .inventory
@@ -74,65 +77,21 @@ impl ApplicabilityAnalyzer {
         describe_signal(&mut rationale, "dependency reachability", reachable);
         describe_signal(&mut rationale, "source/import evidence", imported);
 
-        if let Some(expected) = evidence.value("package.ecosystem") {
-            match ecosystem {
-                Some(actual) if !expected.eq_ignore_ascii_case(actual) => {
-                    rationale.push(format!(
-                        "explicit package ecosystem {expected} does not match purl ecosystem {actual}"
-                    ));
-                    return applicability(ApplicabilityStatus::NotAffected, rationale);
-                }
-                Some(actual) => rationale.push(format!("package ecosystem matched {actual}")),
-                None => rationale.push(format!(
-                    "package ecosystem evidence says {expected}, but the purl ecosystem is unavailable"
-                )),
-            }
-        }
-
-        let matching_ranges: Vec<_> = input
-            .affected_ranges
-            .iter()
-            .filter(|range| {
-                range.ecosystem.as_deref().is_none_or(|expected| {
-                    ecosystem.is_some_and(|actual| expected.eq_ignore_ascii_case(actual))
-                })
-            })
-            .collect();
-        if input
-            .affected_ranges
-            .iter()
-            .any(|range| range.ecosystem.is_some())
-            && matching_ranges.is_empty()
-            && ecosystem.is_some()
-        {
-            rationale.push("no OSV affected range matches the component ecosystem".to_owned());
-            return applicability(ApplicabilityStatus::NotAffected, rationale);
-        }
-        if matching_ranges.is_empty() {
-            rationale.push("no applicable OSV version range was supplied".to_owned());
-            return applicability(ApplicabilityStatus::Unknown, rationale);
-        }
+        let matching_ranges = match filter_ecosystem_ranges(
+            &mut rationale,
+            &evidence,
+            ecosystem,
+            input.affected_ranges,
+        ) {
+            ControlFlow::Break(result) => return result,
+            ControlFlow::Continue(ranges) => ranges,
+        };
 
         let mut outcomes = BTreeSet::new();
         for range in matching_ranges {
-            match evaluate_range(range, &input.component.version, version.as_deref()) {
-                RangeOutcome::Affected(detail) => {
-                    outcomes.insert(ApplicabilityStatus::Affected);
-                    rationale.push(detail);
-                }
-                RangeOutcome::Fixed(detail) => {
-                    outcomes.insert(ApplicabilityStatus::Fixed);
-                    rationale.push(detail);
-                }
-                RangeOutcome::NotAffected(detail) => {
-                    outcomes.insert(ApplicabilityStatus::NotAffected);
-                    rationale.push(detail);
-                }
-                RangeOutcome::Unknown(detail) => {
-                    outcomes.insert(ApplicabilityStatus::Unknown);
-                    rationale.push(detail);
-                }
-            }
+            let outcome = evaluate_range(range, &input.component.version, version.as_deref());
+            outcomes.insert(outcome.status());
+            rationale.push(outcome.detail().to_owned());
         }
 
         let contradictory_context = evidence.conflicts("dependency.reachable")
@@ -216,12 +175,72 @@ fn describe_signal(rationale: &mut Vec<String>, name: &str, signal: Option<bool>
     ));
 }
 
-struct EvidenceView<'a> {
+/// Resolves the ecosystem evidence gate and collects the affected ranges that
+/// apply to the component's purl ecosystem. `ControlFlow::Break` carries a
+/// finished `Applicability` for the early-exit paths.
+fn filter_ecosystem_ranges<'a>(
+    rationale: &mut Vec<String>,
+    evidence: &EvidenceProperties<'_>,
+    ecosystem: Option<&str>,
+    affected_ranges: &'a [OsvAffectedRange],
+) -> ControlFlow<Applicability, Vec<&'a OsvAffectedRange>> {
+    if let Some(expected) = evidence.value("package.ecosystem") {
+        match ecosystem {
+            Some(actual) if !expected.eq_ignore_ascii_case(actual) => {
+                rationale.push(format!(
+                    "explicit package ecosystem {expected} does not match purl ecosystem {actual}"
+                ));
+                return ControlFlow::Break(applicability(
+                    ApplicabilityStatus::NotAffected,
+                    std::mem::take(rationale),
+                ));
+            }
+            Some(actual) => rationale.push(format!("package ecosystem matched {actual}")),
+            None => rationale.push(format!(
+                "package ecosystem evidence says {expected}, but the purl ecosystem is unavailable"
+            )),
+        }
+    }
+
+    let matching_ranges: Vec<_> = affected_ranges
+        .iter()
+        .filter(|range| {
+            range.ecosystem.as_deref().is_none_or(|expected| {
+                ecosystem.is_some_and(|actual| expected.eq_ignore_ascii_case(actual))
+            })
+        })
+        .collect();
+    if affected_ranges
+        .iter()
+        .any(|range| range.ecosystem.is_some())
+        && matching_ranges.is_empty()
+        && ecosystem.is_some()
+    {
+        rationale.push("no OSV affected range matches the component ecosystem".to_owned());
+        return ControlFlow::Break(applicability(
+            ApplicabilityStatus::NotAffected,
+            std::mem::take(rationale),
+        ));
+    }
+    if matching_ranges.is_empty() {
+        rationale.push("no applicable OSV version range was supplied".to_owned());
+        return ControlFlow::Break(applicability(
+            ApplicabilityStatus::Unknown,
+            std::mem::take(rationale),
+        ));
+    }
+    ControlFlow::Continue(matching_ranges)
+}
+
+/// Read-only view over the evidence properties collected for one component.
+/// Shared by applicability analysis and risk scoring so both interpret the
+/// same property grammar identically.
+pub(crate) struct EvidenceProperties<'a> {
     values: BTreeMap<&'a str, BTreeSet<&'a str>>,
 }
 
-impl<'a> EvidenceView<'a> {
-    fn new(evidence: &'a BTreeSet<Evidence>) -> Self {
+impl<'a> EvidenceProperties<'a> {
+    pub(crate) fn new(evidence: &'a BTreeSet<Evidence>) -> Self {
         let mut values: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for item in evidence {
             for (key, value) in &item.properties {
@@ -231,12 +250,14 @@ impl<'a> EvidenceView<'a> {
         Self { values }
     }
 
-    fn value(&self, key: &str) -> Option<&str> {
+    pub(crate) fn value(&self, key: &str) -> Option<&str> {
         let values = self.values.get(key)?;
         (values.len() == 1).then(|| *values.first().expect("non-empty evidence values"))
     }
 
-    fn boolean(&self, key: &str) -> Option<bool> {
+    /// Parses every recorded value for `key` and yields one truth value only
+    /// when all values parse and agree; accepts true/false, yes/no, and 1/0.
+    pub(crate) fn boolean(&self, key: &str) -> Option<bool> {
         let values = self.values.get(key)?;
         let parsed: BTreeSet<bool> = values
             .iter()
@@ -246,8 +267,36 @@ impl<'a> EvidenceView<'a> {
             .then(|| *parsed.first().expect("non-empty boolean evidence"))
     }
 
-    fn conflicts(&self, key: &str) -> bool {
+    pub(crate) fn conflicts(&self, key: &str) -> bool {
         self.values.get(key).is_some_and(|values| values.len() > 1)
+    }
+
+    pub(crate) fn integer(&self, key: &str) -> Option<i64> {
+        self.value(key)?.parse().ok()
+    }
+
+    pub(crate) fn date(&self, key: &str) -> Option<NaiveDate> {
+        let value = self.value(key)?;
+        NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .ok()
+            .or_else(|| {
+                DateTime::parse_from_rfc3339(value)
+                    .ok()
+                    .map(|date| date.date_naive())
+            })
+    }
+
+    pub(crate) fn date_time(&self, key: &str) -> Option<DateTime<Utc>> {
+        let value = self.value(key)?;
+        DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|date| date.with_timezone(&Utc))
+            .or_else(|| {
+                NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                    .ok()?
+                    .and_hms_opt(0, 0, 0)
+                    .map(|date| date.and_utc())
+            })
     }
 }
 
@@ -279,6 +328,26 @@ enum RangeOutcome {
     Unknown(String),
 }
 
+impl RangeOutcome {
+    fn status(&self) -> ApplicabilityStatus {
+        match self {
+            RangeOutcome::Affected(_) => ApplicabilityStatus::Affected,
+            RangeOutcome::Fixed(_) => ApplicabilityStatus::Fixed,
+            RangeOutcome::NotAffected(_) => ApplicabilityStatus::NotAffected,
+            RangeOutcome::Unknown(_) => ApplicabilityStatus::Unknown,
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            RangeOutcome::Affected(detail)
+            | RangeOutcome::Fixed(detail)
+            | RangeOutcome::NotAffected(detail)
+            | RangeOutcome::Unknown(detail) => detail,
+        }
+    }
+}
+
 fn evaluate_range(
     range: &OsvAffectedRange,
     version: &str,
@@ -297,79 +366,136 @@ fn evaluate_range(
         return RangeOutcome::Unknown("OSV range contains no events".to_owned());
     }
 
-    let mut active = false;
-    let mut saw_comparable = false;
-    let mut crossed_fixed: Option<&str> = None;
-    let mut crossed_last_affected: Option<&str> = None;
+    let mut state = RangeState::default();
     for event in &range.events {
-        if let Some(introduced) = event.introduced.as_deref() {
-            if introduced == "0" {
-                active = true;
-                saw_comparable = true;
-                crossed_fixed = None;
-                crossed_last_affected = None;
-            } else if let Some(ordering) = compare_version_parts(version_parts, introduced) {
-                saw_comparable = true;
-                if ordering != Ordering::Less {
-                    active = true;
-                    crossed_fixed = None;
-                    crossed_last_affected = None;
-                }
-            }
+        if let Some(outcome) = apply_event(&mut state, event, version_parts, version) {
+            return outcome;
         }
-        if let Some(fixed) = event.fixed.as_deref()
-            && let Some(ordering) = compare_version_parts(version_parts, fixed)
-        {
-            saw_comparable = true;
+    }
+    state.outcome(version)
+}
+
+/// Version-range walk state for one OSV affected range.
+#[derive(Debug, Default)]
+struct RangeState<'a> {
+    active: bool,
+    saw_comparable: bool,
+    crossed_fixed: Option<&'a str>,
+    crossed_last_affected: Option<&'a str>,
+}
+
+impl<'a> RangeState<'a> {
+    /// Enters the interval introduced by an event and forgets any earlier
+    /// boundary crossings.
+    fn activate(&mut self) {
+        self.active = true;
+        self.saw_comparable = true;
+        self.crossed_fixed = None;
+        self.crossed_last_affected = None;
+    }
+
+    fn cross_introduced(&mut self, version_parts: Option<&[String]>, introduced: &str) {
+        if let Some(ordering) = compare_version_parts(version_parts, introduced) {
+            self.saw_comparable = true;
             if ordering != Ordering::Less {
-                active = false;
-                crossed_fixed = Some(fixed);
+                self.activate();
             }
         }
-        if let Some(last) = event.last_affected.as_deref()
-            && let Some(ordering) = compare_version_parts(version_parts, last)
-        {
-            saw_comparable = true;
+    }
+
+    fn cross_fixed(&mut self, version_parts: Option<&[String]>, fixed: &'a str) {
+        if let Some(ordering) = compare_version_parts(version_parts, fixed) {
+            self.saw_comparable = true;
+            if ordering != Ordering::Less {
+                self.active = false;
+                self.crossed_fixed = Some(fixed);
+            }
+        }
+    }
+
+    fn cross_last_affected(
+        &mut self,
+        version_parts: Option<&[String]>,
+        last: &'a str,
+        version: &str,
+    ) -> Option<RangeOutcome> {
+        if let Some(ordering) = compare_version_parts(version_parts, last) {
+            self.saw_comparable = true;
             if ordering == Ordering::Greater {
-                active = false;
-                crossed_last_affected = Some(last);
-            } else if active {
-                return RangeOutcome::Affected(format!(
+                self.active = false;
+                self.crossed_last_affected = Some(last);
+            } else if self.active {
+                return Some(RangeOutcome::Affected(format!(
                     "component version {version} is within a range ending at last-affected {last}"
-                ));
+                )));
             }
         }
-        if let Some(limit) = event.limit.as_deref()
-            && let Some(ordering) = compare_version_parts(version_parts, limit)
-        {
-            saw_comparable = true;
+        None
+    }
+
+    fn cross_limit(&mut self, version_parts: Option<&[String]>, limit: &'a str) {
+        if let Some(ordering) = compare_version_parts(version_parts, limit) {
+            self.saw_comparable = true;
             if ordering != Ordering::Less {
-                active = false;
-                crossed_last_affected = Some(limit);
+                self.active = false;
+                self.crossed_last_affected = Some(limit);
             }
         }
     }
-    if active {
-        RangeOutcome::Affected(format!(
-            "component version {version} falls within the supplied OSV event interval"
-        ))
-    } else if let Some(fixed) = crossed_fixed {
-        RangeOutcome::Fixed(format!(
-            "component version {version} is at or after fixed event {fixed}"
-        ))
-    } else if let Some(boundary) = crossed_last_affected {
-        RangeOutcome::NotAffected(format!(
-            "component version {version} is after the affected boundary {boundary}"
-        ))
-    } else if saw_comparable {
-        RangeOutcome::NotAffected(format!(
-            "component version {version} precedes the introduced event"
-        ))
-    } else {
-        RangeOutcome::Unknown(format!(
-            "component version {version} could not be compared to the supplied OSV events"
-        ))
+
+    /// Resolves the final outcome once every event has been applied.
+    fn outcome(self, version: &str) -> RangeOutcome {
+        if self.active {
+            RangeOutcome::Affected(format!(
+                "component version {version} falls within the supplied OSV event interval"
+            ))
+        } else if let Some(fixed) = self.crossed_fixed {
+            RangeOutcome::Fixed(format!(
+                "component version {version} is at or after fixed event {fixed}"
+            ))
+        } else if let Some(boundary) = self.crossed_last_affected {
+            RangeOutcome::NotAffected(format!(
+                "component version {version} is after the affected boundary {boundary}"
+            ))
+        } else if self.saw_comparable {
+            RangeOutcome::NotAffected(format!(
+                "component version {version} precedes the introduced event"
+            ))
+        } else {
+            RangeOutcome::Unknown(format!(
+                "component version {version} could not be compared to the supplied OSV events"
+            ))
+        }
     }
+}
+
+/// Applies one OSV event to the range walk; `Some` short-circuits evaluation
+/// with an immediately decided outcome.
+fn apply_event<'a>(
+    state: &mut RangeState<'a>,
+    event: &'a OsvEvent,
+    version_parts: Option<&[String]>,
+    version: &str,
+) -> Option<RangeOutcome> {
+    match event.introduced.as_deref() {
+        Some("0") => state.activate(),
+        Some(introduced) => state.cross_introduced(version_parts, introduced),
+        None => {}
+    }
+    if let Some(fixed) = event.fixed.as_deref() {
+        state.cross_fixed(version_parts, fixed);
+    }
+    if let Some(outcome) = event
+        .last_affected
+        .as_deref()
+        .and_then(|last| state.cross_last_affected(version_parts, last, version))
+    {
+        return Some(outcome);
+    }
+    if let Some(limit) = event.limit.as_deref() {
+        state.cross_limit(version_parts, limit);
+    }
+    None
 }
 
 fn compare_version_parts(left: Option<&[String]>, right: &str) -> Option<Ordering> {

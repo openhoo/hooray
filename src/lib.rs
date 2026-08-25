@@ -16,3 +16,4 @@ pub mod risk;
 pub mod sbom;
 pub mod scanners;
 pub mod store;
+pub mod util;

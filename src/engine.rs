@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     analysis::{ApplicabilityAnalyzer, ApplicabilityInput},
     config::Config,
-    graph::DependencyGraph,
+    graph::{DependencyGraph, GraphError},
     input::ScanInput,
     license,
     model::{
@@ -24,7 +24,7 @@ use crate::{
     },
     osv::{OsvClient, OsvError},
     policy::{Policy, PolicyError},
-    remediation,
+    remediation::{self, RemediationError},
     risk::{
         OperationalRiskAnalyzer, OperationalRiskConfig, OperationalRiskInput, RiskInput, RiskScorer,
     },
@@ -162,7 +162,13 @@ impl<'a> Engine<'a> {
             }
         };
 
-        contextualize_and_score(&inventory, &mut findings, as_of)?;
+        // Components and dependencies never change after inventory creation
+        // (later stages only extend locations and evidence), so the graph is
+        // built once here and shared with scoring and remediation below. The
+        // first scoring pass caches applicability that upgrade planning reads;
+        // evidence mutations afterwards make the second pass authoritative.
+        let graph = DependencyGraph::from_inventory(&inventory)?;
+        contextualize_and_score(&inventory, &graph, &mut findings, as_of)?;
         merge_findings(
             &mut findings,
             license_findings(&request.input, &inventory, self.config)?,
@@ -171,9 +177,9 @@ impl<'a> Engine<'a> {
             &mut findings,
             filesystem_findings(&request.input, &mut inventory, self.config)?,
         );
-        attach_dependency_remediation(&inventory, &mut findings)?;
+        attach_dependency_remediation(&inventory, &graph, &mut findings)?;
         merge_operational_risk(&inventory, &mut findings, as_of);
-        contextualize_and_score(&inventory, &mut findings, as_of)?;
+        contextualize_and_score(&inventory, &graph, &mut findings, as_of)?;
 
         if let Some(baseline) = baseline.as_ref() {
             mark_history(&mut findings, baseline, &started_at);
@@ -320,12 +326,16 @@ pub fn load_policy(path: &Path) -> Result<Policy, EngineError> {
     }
 }
 
-fn contextualize_and_score(
+/// Shared scoring pass behind `hooray scan` and the POST /v1/scans API route:
+/// both feed identical applicability, dependency-classification, and risk
+/// inputs so policy selectors observe the same risk values everywhere. `graph`
+/// must be built from `inventory` by the caller; see `Engine::scan`.
+pub(crate) fn contextualize_and_score(
     inventory: &Inventory,
+    graph: &DependencyGraph,
     findings: &mut BTreeMap<FindingId, Finding>,
     as_of: DateTime<Utc>,
-) -> Result<(), crate::graph::GraphError> {
-    let graph = DependencyGraph::from_inventory(inventory)?;
+) -> Result<(), GraphError> {
     for finding in findings.values_mut() {
         let Some(component_id) = finding.component_id.as_ref() else {
             continue;
@@ -384,6 +394,10 @@ fn filesystem_findings(
     config: &Config,
 ) -> Result<Vec<Finding>, scanners::ScanError> {
     let path = input_path(input);
+    // Config deliberately exposes a single archive-entry budget: max_files
+    // shares config.max_archive_entries below, so one knob bounds regular file
+    // visits AND archive member extraction. Give file visits their own Config
+    // field before tuning the two limits independently.
     let scanner_config = ScannerConfig {
         max_file_bytes: config.max_input_bytes.min(8 * 1024 * 1024),
         max_total_bytes: config.max_input_bytes,
@@ -426,9 +440,9 @@ fn filesystem_findings(
 
 fn attach_dependency_remediation(
     inventory: &Inventory,
+    graph: &DependencyGraph,
     findings: &mut BTreeMap<FindingId, Finding>,
-) -> Result<(), crate::graph::GraphError> {
-    let graph = DependencyGraph::from_inventory(inventory)?;
+) -> Result<(), GraphError> {
     for finding in findings
         .values_mut()
         .filter(|finding| finding.kind == FindingKind::Vulnerability)
@@ -441,15 +455,48 @@ fn attach_dependency_remediation(
         };
         let kind = graph.classify(component_id)?;
         let paths = graph.all_paths(component_id, MAX_DEPENDENCY_DEPTH, MAX_DEPENDENCY_PATHS)?;
-        if let Ok(plan) = remediation::plan_upgrade(finding, component, kind, paths) {
-            let plan_json = serde_json::to_string(&plan).expect("upgrade plan is serializable");
-            finding.evidence.insert(Evidence {
-                description: "Deterministic dependency path and upgrade plan".to_owned(),
-                locations: BTreeSet::new(),
-                references: BTreeSet::new(),
-                properties: BTreeMap::from([("remediation.upgrade-plan".to_owned(), plan_json)]),
-                redacted: false,
-            });
+        match remediation::plan_upgrade(finding, component, kind, paths) {
+            Ok(plan) => {
+                let plan_json = serde_json::to_string(&plan).expect("upgrade plan is serializable");
+                finding.evidence.insert(Evidence {
+                    description: "Deterministic dependency path and upgrade plan".to_owned(),
+                    locations: BTreeSet::new(),
+                    references: BTreeSet::new(),
+                    properties: BTreeMap::from([(
+                        "remediation.upgrade-plan".to_owned(),
+                        plan_json,
+                    )]),
+                    redacted: false,
+                });
+            }
+            // Expected planner misses are data-shape outcomes, not failures:
+            // annotate them so reports distinguish "no fix available" from a
+            // silently dropped plan.
+            Err(
+                error @ (RemediationError::NonApplicable(_, _)
+                | RemediationError::MissingRemediation(_)
+                | RemediationError::NoFixedVersion(_)
+                | RemediationError::UnsupportedPackageUrl(_)),
+            ) => {
+                finding.evidence.insert(Evidence {
+                    description: "Dependency upgrade plan unavailable".to_owned(),
+                    locations: BTreeSet::new(),
+                    references: BTreeSet::new(),
+                    properties: BTreeMap::from([(
+                        "remediation.upgrade-plan-unavailable".to_owned(),
+                        error.to_string(),
+                    )]),
+                    redacted: false,
+                });
+            }
+            // Both variants are pre-filtered above (kind filter plus the
+            // identity-keyed component lookup validated by Inventory::validate).
+            Err(
+                unexpected @ (RemediationError::NotVulnerability(_)
+                | RemediationError::ComponentMismatch(_, _)),
+            ) => {
+                unreachable!("upgrade planner rejected a pre-filtered finding: {unexpected}");
+            }
         }
     }
     Ok(())
@@ -1122,5 +1169,68 @@ mod tests {
             "status": "open"
         }))
         .unwrap()
+    }
+
+    struct UnplannedProvider;
+
+    impl VulnerabilityProvider for UnplannedProvider {
+        fn scan<'a>(&'a self, inventory: &'a Inventory) -> ProviderFuture<'a> {
+            let component = inventory.components.keys().next().cloned();
+            Box::pin(async move {
+                let finding: Finding = serde_json::from_value(json!({
+                    "id": "finding:unplanned",
+                    "kind": "vulnerability",
+                    "rule_id": "osv:TEST-2",
+                    "advisory_id": "TEST-2",
+                    "component_id": component,
+                    "severity": "high",
+                    "confidence": "high",
+                    "status": "open",
+                    "evidence": []
+                }))
+                .unwrap();
+                Ok(BTreeMap::from([(finding.id.clone(), finding)]))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn unplannable_upgrade_is_annotated_instead_of_silently_dropped() {
+        let temp = TempDir::new().unwrap();
+        let sbom = sbom_fixture(&temp);
+        let policy = policy_fixture(&temp, "allow");
+        let config = online_config(&temp);
+        let input = ScanInput::detect(&sbom, &config).unwrap();
+        let mut store = Store::open(&config.database_path).unwrap();
+        let mut engine = Engine::new(&config, &mut store, Some(&UnplannedProvider));
+        let mut request = ScanRequest::new(input, policy);
+        request.run_id = Some(RunId::new("run:unplanned").unwrap());
+        request.as_of = Some("2026-03-04T05:06:07Z".parse().unwrap());
+        let report = engine.scan(request).await.unwrap();
+
+        let finding = report
+            .findings
+            .values()
+            .find(|finding| finding.id.as_str() == "finding:unplanned")
+            .unwrap();
+        let annotation = finding
+            .evidence
+            .iter()
+            .find(|evidence| {
+                evidence
+                    .properties
+                    .contains_key("remediation.upgrade-plan-unavailable")
+            })
+            .expect("planner miss must leave an evidence annotation");
+        assert!(
+            annotation.properties["remediation.upgrade-plan-unavailable"]
+                .contains("has no remediation")
+        );
+        assert!(
+            !finding
+                .evidence
+                .iter()
+                .any(|evidence| evidence.properties.contains_key("remediation.upgrade-plan"))
+        );
     }
 }

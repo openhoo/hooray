@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::model::{
@@ -10,6 +9,7 @@ use crate::model::{
     Location, ModelInvariantError, Scope, Source, SourceKind, stable_component_id,
     stable_location_id,
 };
+use crate::util::sha256_hex;
 
 const MAX_SBOM_BYTES: usize = 100 * 1024 * 1024;
 const MAX_COMPONENTS: usize = 1_000_000;
@@ -74,7 +74,7 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
         return Err(SbomError::NoComponents);
     }
 
-    let digest = hex_digest(input);
+    let digest = sha256_hex(input);
     let asset_id = stable_asset_id(&sbom, &digest)?;
     let asset = Asset {
         id: asset_id.clone(),
@@ -99,14 +99,7 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
             .unwrap_or_else(|| format!("sha256:{digest}")),
         digest: Some(format!("sha256:{digest}")),
     };
-    let mut state = ParseState {
-        asset_id: &asset_id,
-        source: &source,
-        components: BTreeMap::new(),
-        dependencies: BTreeSet::new(),
-        refs: BTreeMap::new(),
-        count: 0,
-    };
+    let mut state = sbom_state(&asset_id, &source);
     collect_components(&sbom.components, None, 0, "components", &mut state)?;
     collect_declared_dependencies(
         &sbom.dependencies,
@@ -137,6 +130,42 @@ struct ParseState<'a> {
     dependencies: BTreeSet<DependencyEdge>,
     refs: BTreeMap<String, ComponentId>,
     count: usize,
+}
+
+impl ParseState<'_> {
+    /// Merges a parsed component into the state: repeated identities extend
+    /// provenance, licenses, and locations, while conflicting name/version
+    /// pairs for the same identity are rejected.
+    fn upsert_component(
+        &mut self,
+        identity: &ComponentId,
+        component: Component,
+        purl: String,
+    ) -> Result<(), SbomError> {
+        if let Some(existing) = self.components.get_mut(identity) {
+            if existing.name != component.name || existing.version != component.version {
+                return Err(SbomError::ConflictingComponent(purl));
+            }
+            existing.provenance.extend(component.provenance);
+            existing.licenses.extend(component.licenses);
+            existing.locations.extend(component.locations);
+        } else {
+            self.components.insert(identity.clone(), component);
+        }
+        Ok(())
+    }
+}
+
+/// Fresh parse state collecting components for one SBOM document.
+fn sbom_state<'a>(asset_id: &'a AssetId, source: &'a Source) -> ParseState<'a> {
+    ParseState {
+        asset_id,
+        source,
+        components: BTreeMap::new(),
+        dependencies: BTreeSet::new(),
+        refs: BTreeMap::new(),
+        count: 0,
+    }
 }
 
 fn collect_components(
@@ -197,16 +226,7 @@ fn collect_components(
                 end: None,
             }]),
         };
-        if let Some(existing) = state.components.get_mut(&identity) {
-            if existing.name != component.name || existing.version != component.version {
-                return Err(SbomError::ConflictingComponent(purl.to_owned()));
-            }
-            existing.provenance.extend(component.provenance);
-            existing.licenses.extend(component.licenses);
-            existing.locations.extend(component.locations);
-        } else {
-            state.components.insert(identity.clone(), component);
-        }
+        state.upsert_component(&identity, component, purl.to_owned())?;
         if let Some(reference) = wire.bom_ref.as_deref() {
             let reference = required_value(reference, "bom-ref", &component_path)?;
             if state
@@ -403,10 +423,6 @@ fn asset_metadata(sbom: &CycloneDxSbom) -> BTreeMap<String, Value> {
     metadata
 }
 
-fn hex_digest(input: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(input))
-}
-
 #[derive(Debug, Deserialize)]
 struct CycloneDxSbom {
     #[serde(rename = "bomFormat")]
@@ -474,7 +490,7 @@ fn parse_spdx(input: &[u8]) -> Result<Inventory, SbomError> {
     if document.packages.is_empty() {
         return Err(SbomError::NoComponents);
     }
-    let digest = hex_digest(input);
+    let digest = sha256_hex(input);
     let asset_id =
         AssetId::new(format!("sbom:sha256:{digest}")).map_err(|_| SbomError::InvalidFormat)?;
     let asset = Asset {
@@ -491,14 +507,7 @@ fn parse_spdx(input: &[u8]) -> Result<Inventory, SbomError> {
         locator: format!("sha256:{digest}"),
         digest: Some(format!("sha256:{digest}")),
     };
-    let mut state = ParseState {
-        asset_id: &asset_id,
-        source: &source,
-        components: BTreeMap::new(),
-        dependencies: BTreeSet::new(),
-        refs: BTreeMap::new(),
-        count: 0,
-    };
+    let mut state = sbom_state(&asset_id, &source);
     collect_spdx_packages(&document.packages, &mut state)?;
     collect_spdx_relationships(
         &document.relationships,
@@ -579,16 +588,7 @@ fn collect_spdx_packages(
                 end: None,
             }]),
         };
-        if let Some(existing) = state.components.get_mut(&identity) {
-            if existing.name != component.name || existing.version != component.version {
-                return Err(SbomError::ConflictingComponent(purl));
-            }
-            existing.provenance.extend(component.provenance);
-            existing.licenses.extend(component.licenses);
-            existing.locations.extend(component.locations);
-        } else {
-            state.components.insert(identity.clone(), component);
-        }
+        state.upsert_component(&identity, component, purl)?;
         if state.refs.insert(spdx_id.to_owned(), identity).is_some() {
             return Err(SbomError::DuplicateSpdxId(spdx_id.to_owned()));
         }

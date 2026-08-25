@@ -29,17 +29,15 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::{
-    analysis::{ApplicabilityAnalyzer, ApplicabilityInput},
     config::Config,
+    engine::{REPORT_SCHEMA_VERSION, contextualize_and_score},
     graph::DependencyGraph,
     model::{
-        ApplicabilityStatus, DependencyKind, Finding, FindingId, FindingKind, Inventory,
-        PolicySummary, RunId, RunMetadata, ScanReport, Severity,
+        Finding, FindingKind, Inventory, PolicySummary, RunId, RunMetadata, ScanReport, Severity,
     },
     osv::{OsvClient, OsvError},
     policy::{Policy, PolicyException},
     report::{sanitize_report, sanitize_value},
-    risk::{RiskInput, RiskScorer},
     store::{FindingFilter, InventoryFilter, MAX_PAGE_SIZE, ReportDiff, Store, StoreError},
 };
 
@@ -48,6 +46,10 @@ const DEFAULT_PAGE_SIZE: u32 = 100;
 const MAX_FILTER_LENGTH: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+
+/// Route whose authoritative store write must complete once started; the
+/// timeout middleware exempts exactly this route via `is_write_completing`.
+const SCAN_SUBMIT_PATH: &str = "/v1/scans";
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -72,7 +74,7 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/v1/scans", post(create_scan))
+        .route(SCAN_SUBMIT_PATH, post(create_scan))
         .route("/v1/runs", get(list_runs))
         .route("/v1/runs/{run_id}", get(get_run))
         .route("/v1/runs/{run_id}/diff/{baseline_run_id}", get(diff_runs))
@@ -199,10 +201,13 @@ async fn scan_with_deadline(
                 ));
             }
         };
-    // Score findings exactly like the CLI engine path (engine.rs
-    // `contextualize_and_score`) before policy evaluation; unscored findings
-    // would silently disable every risk-selector rule on this route.
-    score_findings(&request.inventory, &mut findings, Utc::now())?;
+    // Score findings exactly like the CLI engine pass before policy
+    // evaluation; unscored findings would silently disable every
+    // risk-selector rule on this route.
+    let graph = DependencyGraph::from_inventory(&request.inventory)
+        .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
+    contextualize_and_score(&request.inventory, &graph, &mut findings, Utc::now())
+        .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
     let (policy_decisions, policy_summary) = match request.policy {
         Some(policy) => {
             let evaluation = policy
@@ -213,7 +218,7 @@ async fn scan_with_deadline(
         None => (Default::default(), PolicySummary::default()),
     };
     let report = ScanReport {
-        schema_version: "1".to_owned(),
+        schema_version: REPORT_SCHEMA_VERSION.to_owned(),
         run: RunMetadata {
             id: RunId::new(format!("run:{}", Uuid::new_v4()))
                 .expect("generated UUID run identifier is non-empty"),
@@ -273,62 +278,6 @@ fn vulnerability_service_error(error: &OsvError) -> ApiError {
     )
 }
 
-/// Mirror of the CLI scoring pass (engine.rs `contextualize_and_score`); the
-/// two must stay in lockstep so policy selectors observe identical risk values
-/// on the API route and in `hooray scan`.
-fn score_findings(
-    inventory: &Inventory,
-    findings: &mut BTreeMap<FindingId, Finding>,
-    as_of: DateTime<Utc>,
-) -> Result<(), ApiError> {
-    let graph = DependencyGraph::from_inventory(inventory)
-        .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
-    for finding in findings.values_mut() {
-        let Some(component_id) = finding.component_id.as_ref() else {
-            continue;
-        };
-        let Some(component) = inventory.components.get(component_id) else {
-            continue;
-        };
-        let evidence = finding.evidence.clone();
-        if finding.applicability.is_none() {
-            finding.applicability = Some(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
-                component,
-                inventory: Some(inventory),
-                evidence: &evidence,
-                affected_ranges: &[],
-            }));
-        }
-        let applicability = finding
-            .applicability
-            .as_ref()
-            .map(|value| value.status)
-            .unwrap_or(ApplicabilityStatus::Unknown);
-        let direct = match graph.classify(component_id) {
-            Ok(DependencyKind::Direct) => Some(true),
-            Ok(DependencyKind::Transitive) => Some(false),
-            Ok(DependencyKind::Disconnected) => None,
-            Err(error) => {
-                return Err(ApiError::internal(
-                    "finding_scoring_failed",
-                    error.to_string(),
-                ));
-            }
-        };
-        finding.risk = Some(RiskScorer::score(RiskInput {
-            severity: finding.severity,
-            confidence: finding.confidence,
-            applicability,
-            component,
-            direct,
-            remediation: finding.remediation.as_ref(),
-            evidence: &evidence,
-            as_of: as_of.date_naive(),
-        }));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageQuery {
@@ -343,6 +292,10 @@ const fn default_page_size() -> u32 {
 }
 
 impl PageQuery {
+    const fn new(limit: u32, offset: u64) -> Self {
+        Self { limit, offset }
+    }
+
     fn validate(&self) -> Result<(), ApiError> {
         if self.limit == 0 || self.limit > MAX_PAGE_SIZE {
             return Err(ApiError::bad_request(
@@ -439,26 +392,31 @@ struct FindingQuery {
     rule_id: Option<String>,
 }
 
+impl FindingQuery {
+    /// Filter parsing shared by `/v1/findings` and the per-run findings route
+    /// so validation cannot drift between them.
+    fn parsed(&self) -> Result<(Option<FindingKind>, Option<Severity>), ApiError> {
+        validate_filter("rule_id", self.rule_id.as_deref())?;
+        let kind = self.kind.as_deref().map(parse_finding_kind).transpose()?;
+        let severity = self
+            .severity
+            .as_deref()
+            .map(|value| {
+                Severity::from_str(value)
+                    .map_err(|error| ApiError::bad_request("invalid_filter", error.to_string()))
+            })
+            .transpose()?;
+        Ok((kind, severity))
+    }
+}
+
 async fn query_findings(
     State(state): State<ApiState>,
     query: Result<Query<FindingQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Query(query) = query.map_err(ApiError::from_query_rejection)?;
-    PageQuery {
-        limit: query.limit,
-        offset: query.offset,
-    }
-    .validate()?;
-    validate_filter("rule_id", query.rule_id.as_deref())?;
-    let kind = query.kind.as_deref().map(parse_finding_kind).transpose()?;
-    let severity = query
-        .severity
-        .as_deref()
-        .map(|value| {
-            Severity::from_str(value)
-                .map_err(|error| ApiError::bad_request("invalid_filter", error.to_string()))
-        })
-        .transpose()?;
+    PageQuery::new(query.limit, query.offset).validate()?;
+    let (kind, severity) = query.parsed()?;
     let filter = FindingFilter {
         kind: kind.map(|value| value.as_str().to_owned()),
         severity: severity.map(|value| value.as_str().to_owned()),
@@ -495,11 +453,7 @@ async fn query_inventory(
     query: Result<Query<InventoryQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Query(query) = query.map_err(ApiError::from_query_rejection)?;
-    PageQuery {
-        limit: query.limit,
-        offset: query.offset,
-    }
-    .validate()?;
+    PageQuery::new(query.limit, query.offset).validate()?;
     for (name, value) in [
         ("asset_id", query.asset_id.as_deref()),
         ("component_id", query.component_id.as_deref()),
@@ -534,21 +488,8 @@ async fn get_findings(
     query: Result<Query<FindingQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Query(query) = query.map_err(ApiError::from_query_rejection)?;
-    PageQuery {
-        limit: query.limit,
-        offset: query.offset,
-    }
-    .validate()?;
-    validate_filter("rule_id", query.rule_id.as_deref())?;
-    let kind = query.kind.as_deref().map(parse_finding_kind).transpose()?;
-    let severity = query
-        .severity
-        .as_deref()
-        .map(|value| {
-            Severity::from_str(value)
-                .map_err(|error| ApiError::bad_request("invalid_filter", error.to_string()))
-        })
-        .transpose()?;
+    PageQuery::new(query.limit, query.offset).validate()?;
+    let (kind, severity) = query.parsed()?;
     let report = load_report(&state, run_id).await?;
     let offset = usize::try_from(query.offset).unwrap_or(usize::MAX);
     let findings: Vec<&Finding> = report
@@ -826,6 +767,10 @@ fn is_valid_request_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn is_write_completing(method: &Method, path: &str) -> bool {
+    method == Method::POST && path == SCAN_SUBMIT_PATH
+}
+
 async fn timeout_middleware(request: Request, next: Next) -> Response {
     timeout_middleware_with_duration(request, next, REQUEST_TIMEOUT).await
 }
@@ -840,8 +785,7 @@ async fn timeout_middleware_with_duration(
     // so this route is never aborted here; its upstream vulnerability fetch is
     // bounded inside create_scan instead, so a stalled OSV connection cannot
     // pin scan slots indefinitely.
-    let write_outcome_must_complete =
-        request.method() == Method::POST && request.uri().path() == "/v1/scans";
+    let write_outcome_must_complete = is_write_completing(request.method(), request.uri().path());
     if write_outcome_must_complete {
         return next.run(request).await;
     }

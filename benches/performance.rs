@@ -91,9 +91,14 @@ fn graph_fixture() -> (DependencyGraph, Vec<ComponentId>, ComponentId) {
     (graph, components, target)
 }
 
-fn scanner_fixture() -> String {
-    let mut source = String::with_capacity(512 * 1024);
-    for index in 0..8_000 {
+/// Byte volume of the historical fixed 8,000-iteration scanner corpus. Pinned
+/// so the `scanner_rust_1mb` case keeps scanning exactly the same input.
+const SCANNER_SOURCE_BYTES: usize = 1_598_890;
+
+fn scanner_fixture(bytes: usize) -> String {
+    let mut source = String::with_capacity(bytes);
+    let mut index = 0;
+    while source.len() < bytes {
         source.push_str("fn handler(input: &str) {\n");
         source.push_str("    let query = format!(\"SELECT * FROM users WHERE id = {}\", input);\n");
         source.push_str("    std::process::Command::new(\"sh\").arg(\"-c\").arg(input);\n");
@@ -101,18 +106,19 @@ fn scanner_fixture() -> String {
             "    let safe_{index} = \"ordinary source text\";\n"
         ));
         source.push_str("}\n");
+        index += 1;
     }
+    source.truncate(bytes);
     source
 }
 
 fn scanner_tree_fixture(file_count: usize) -> TempDir {
     let directory = TempDir::new().expect("scanner fixture directory");
-    let source = scanner_fixture();
-    let source = &source[..16 * 1024];
+    let source = scanner_fixture(16 * 1024);
     for index in 0..file_count {
         fs::write(
             directory.path().join(format!("source-{index:04}.rs")),
-            source,
+            &source,
         )
         .expect("scanner fixture file");
     }
@@ -298,7 +304,7 @@ fn main() {
     });
     report("graph_all_paths_dense", iterations, elapsed);
 
-    let source = scanner_fixture();
+    let source = scanner_fixture(SCANNER_SOURCE_BYTES);
     let asset = AssetId::new("asset:benchmark").expect("asset id");
     let scanner_config = ScannerConfig::default();
     let signatures = MalwareSignatures::default();

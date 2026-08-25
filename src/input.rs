@@ -145,8 +145,7 @@ impl ScanInput {
             });
         }
         if lower.ends_with(".tar") {
-            let files = read_tar_file(&canonical, config)?;
-            if is_oci_files(&files) {
+            if tar_is_image(open_regular_nofollow(&canonical)?, config)? {
                 return Ok(Self::OciImageTar(canonical));
             }
             return Ok(Self::Archive {
@@ -221,6 +220,48 @@ fn scan_directory(root: &Path, config: &Config) -> Result<Inventory, InputError>
     scan_virtual_files(root, AssetKind::Repository, files)
 }
 
+/// Resolved lockfile components keyed by (lowercased) name, then resolved
+/// version; version maps are ordered so first-value lookups pick the
+/// lexically smallest version, matching prior flat-map scan semantics.
+type LockComponents = BTreeMap<String, BTreeMap<String, ComponentId>>;
+
+type LockfileParser = fn(&str, &[u8], &mut InventoryBuilder) -> Result<(), InputError>;
+
+/// Single registry of recognized ecosystem lockfiles. Virtual-file dispatch,
+/// directory inventory detection, and project-manifest detection all derive
+/// from this table so the filename set cannot drift between them.
+/// `Cargo.lock` carries `None` because it additionally consumes the sibling
+/// `Cargo.toml` manifest for license inheritance.
+const LOCKFILES: &[(&str, Option<LockfileParser>)] = &[
+    ("Cargo.lock", None),
+    ("package-lock.json", Some(parse_package_lock)),
+    ("requirements.txt", Some(parse_requirements)),
+    ("go.mod", Some(parse_go_mod)),
+    ("packages.lock.json", Some(parse_nuget_lock)),
+    ("yarn.lock", Some(parse_yarn_lock)),
+    ("pnpm-lock.yaml", Some(parse_pnpm_lock)),
+    ("poetry.lock", Some(parse_poetry_lock)),
+    ("Pipfile.lock", Some(parse_pipfile_lock)),
+    ("Gemfile.lock", Some(parse_gemfile_lock)),
+    ("Package.resolved", Some(parse_package_resolved)),
+    ("pubspec.lock", Some(parse_pubspec_lock)),
+    ("Podfile.lock", Some(parse_podfile_lock)),
+    ("composer.json", Some(parse_composer_json)),
+    ("environment.yml", Some(parse_conda_environment)),
+    ("Chart.yaml", Some(parse_chart_yaml)),
+];
+
+/// Repository files collected as inventory inputs that have no dedicated
+/// parser of their own.
+const MANIFEST_SIDECARS: &[&str] = &["Cargo.toml", "go.sum"];
+
+fn lockfile_parser(name: &str) -> Option<Option<LockfileParser>> {
+    LOCKFILES
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, parser)| *parser)
+}
+
 fn scan_virtual_files(
     locator: &Path,
     kind: AssetKind,
@@ -230,77 +271,17 @@ fn scan_virtual_files(
     let mut builder = InventoryBuilder::new(asset_id, locator, kind);
     let mut recognized = false;
     for (path, bytes) in &files {
-        match base_name(path) {
-            "Cargo.lock" => {
-                parse_cargo_lock(
+        if let Some(parser) = lockfile_parser(base_name(path)) {
+            match parser {
+                Some(parse) => parse(path, bytes, &mut builder)?,
+                None => parse_cargo_lock(
                     path,
                     bytes,
                     files.get(&sibling(path, "Cargo.toml")),
                     &mut builder,
-                )?;
-                recognized = true;
+                )?,
             }
-            "package-lock.json" => {
-                parse_package_lock(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "requirements.txt" => {
-                parse_requirements(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "go.mod" => {
-                parse_go_mod(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "packages.lock.json" => {
-                parse_nuget_lock(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "yarn.lock" => {
-                parse_yarn_lock(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "pnpm-lock.yaml" => {
-                parse_pnpm_lock(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "poetry.lock" => {
-                parse_poetry_lock(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "Pipfile.lock" => {
-                parse_pipfile_lock(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "Gemfile.lock" => {
-                parse_gemfile_lock(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "Package.resolved" => {
-                parse_package_resolved(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "pubspec.lock" => {
-                parse_pubspec_lock(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "Podfile.lock" => {
-                parse_podfile_lock(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "composer.json" => {
-                parse_composer_json(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "environment.yml" => {
-                parse_conda_environment(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            "Chart.yaml" => {
-                parse_chart_yaml(path, bytes, &mut builder)?;
-                recognized = true;
-            }
-            _ => {}
+            recognized = true;
         }
     }
     if !recognized {
@@ -420,7 +401,7 @@ fn parse_cargo_lock(
                 .as_str()
                 .map(str::to_owned)
         });
-    let mut ids = BTreeMap::<(String, String), ComponentId>::new();
+    let mut ids = LockComponents::new();
     for package in packages {
         let name = required_toml(package, "name", path)?;
         let version = required_toml(package, "version", path)?;
@@ -436,13 +417,14 @@ fn parse_cargo_lock(
             })
             .unwrap_or_default();
         let id = out.add("cargo", name, version, Scope::Runtime, path, licenses)?;
-        ids.insert((name.to_owned(), version.to_owned()), id);
+        ids.entry(name.to_owned())
+            .or_default()
+            .insert(version.to_owned(), id);
     }
     for package in packages {
-        let from = &ids[&(
-            required_toml(package, "name", path)?.to_owned(),
-            required_toml(package, "version", path)?.to_owned(),
-        )];
+        let name = required_toml(package, "name", path)?;
+        let version = required_toml(package, "version", path)?;
+        let from = &ids[name][version];
         for dependency in package
             .get("dependencies")
             .and_then(toml::Value::as_array)
@@ -455,9 +437,10 @@ fn parse_cargo_lock(
             let mut parts = spec.split_whitespace();
             let Some(name) = parts.next() else { continue };
             let version = parts.next();
-            let target = version
-                .and_then(|v| ids.get(&(name.to_owned(), v.to_owned())))
-                .or_else(|| ids.iter().find(|((n, _), _)| n == name).map(|(_, id)| id));
+            let candidates = ids.get(name);
+            let target = candidates
+                .and_then(|versions| version.and_then(|v| versions.get(v)))
+                .or_else(|| candidates.and_then(|versions| versions.values().next()));
             if let Some(to) = target.cloned() {
                 out.edge(from, &to, Scope::Runtime, false);
             }
@@ -516,102 +499,92 @@ fn parse_package_lock(
     let lock: NpmLock =
         serde_json::from_slice(bytes).map_err(|e| malformed(path, "package-lock.json", e))?;
     if !lock.packages.is_empty() {
-        entry_bound(lock.packages.len(), path, "package-lock.json")?;
-        let mut ids = BTreeMap::new();
-        for (key, package) in &lock.packages {
-            if key.is_empty() {
-                out.asset.version = package.version.clone().or_else(|| lock.version.clone());
-                continue;
-            }
-            let name = package
-                .name
-                .clone()
-                .or_else(|| key.rsplit("node_modules/").next().map(str::to_owned))
-                .ok_or_else(|| malformed_msg(path, "package-lock.json", "package has no name"))?;
-            let version = package.version.as_deref().ok_or_else(|| {
-                malformed_msg(path, "package-lock.json", "package has no version")
-            })?;
-            let scope = if package.dev {
-                Scope::Development
-            } else if package.optional {
-                Scope::Optional
-            } else {
-                Scope::Runtime
-            };
-            let licenses = package
-                .license
-                .as_ref()
-                .map(|v| {
-                    BTreeSet::from([License {
-                        expression: Some(v.clone()),
-                        name: None,
-                        url: None,
-                    }])
-                })
-                .unwrap_or_default();
-            ids.insert(
-                key.clone(),
-                out.add("npm", &name, version, scope, path, licenses)?,
-            );
-        }
-        for (key, package) in &lock.packages {
-            let Some(from) = ids.get(key) else { continue };
-            for (name, optional, scope) in package
-                .dependencies
-                .keys()
-                .map(|n| (n, false, Scope::Runtime))
-                .chain(
-                    package
-                        .dev_dependencies
-                        .keys()
-                        .map(|n| (n, false, Scope::Development)),
-                )
-                .chain(
-                    package
-                        .optional_dependencies
-                        .keys()
-                        .map(|n| (n, true, Scope::Optional)),
-                )
-            {
-                if let Some(to) = resolve_npm_key(key, name, &ids).cloned() {
-                    out.edge(from, &to, scope, optional);
-                }
-            }
-        }
+        parse_npm_packages_v2(&lock, path, out)?;
     } else {
-        fn collect(
-            name: &str,
-            dependency: &NpmDependency,
-            parent: Option<ComponentId>,
-            path: &str,
-            out: &mut InventoryBuilder,
-        ) -> Result<ComponentId, InputError> {
-            let version = dependency.version.as_deref().ok_or_else(|| {
-                malformed_msg(path, "package-lock.json", "dependency has no version")
-            })?;
-            let scope = if dependency.dev {
-                Scope::Development
-            } else if dependency.optional {
-                Scope::Optional
-            } else {
-                Scope::Runtime
-            };
-            entry_bound(out.components.len() + 1, path, "package-lock.json")?;
-            let id = out.add("npm", name, version, scope, path, BTreeSet::new())?;
-            if let Some(parent) = parent {
-                out.edge(&parent, &id, scope, dependency.optional);
-            }
-            for (child, value) in &dependency.dependencies {
-                collect(child, value, Some(id.clone()), path, out)?;
-            }
-            Ok(id)
-        }
-        for (name, dependency) in &lock.dependencies {
-            collect(name, dependency, None, path, out)?;
-        }
+        parse_npm_dependencies_v1(&lock, path, out)?;
     }
     if let Some(name) = lock.name {
         out.asset.name = name;
+    }
+    Ok(())
+}
+
+/// npm v2 `packages`-map ingestion: registers flat components, infers names
+/// from `node_modules` keys, and wires edges across the three chained
+/// dependency maps.
+fn parse_npm_packages_v2(
+    lock: &NpmLock,
+    path: &str,
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    entry_bound(lock.packages.len(), path, "package-lock.json")?;
+    let mut ids = BTreeMap::new();
+    for (key, package) in &lock.packages {
+        if key.is_empty() {
+            out.asset.version = package.version.clone().or_else(|| lock.version.clone());
+            continue;
+        }
+        let name = package
+            .name
+            .clone()
+            .or_else(|| key.rsplit("node_modules/").next().map(str::to_owned))
+            .ok_or_else(|| malformed_msg(path, "package-lock.json", "package has no name"))?;
+        let version = package
+            .version
+            .as_deref()
+            .ok_or_else(|| malformed_msg(path, "package-lock.json", "package has no version"))?;
+        let scope = npm_scope(package.dev, package.optional);
+        let licenses = package
+            .license
+            .as_ref()
+            .map(|v| {
+                BTreeSet::from([License {
+                    expression: Some(v.clone()),
+                    name: None,
+                    url: None,
+                }])
+            })
+            .unwrap_or_default();
+        ids.insert(
+            key.clone(),
+            out.add("npm", &name, version, scope, path, licenses)?,
+        );
+    }
+    for (key, package) in &lock.packages {
+        let Some(from) = ids.get(key) else { continue };
+        for (name, optional, scope) in package
+            .dependencies
+            .keys()
+            .map(|n| (n, false, Scope::Runtime))
+            .chain(
+                package
+                    .dev_dependencies
+                    .keys()
+                    .map(|n| (n, false, Scope::Development)),
+            )
+            .chain(
+                package
+                    .optional_dependencies
+                    .keys()
+                    .map(|n| (n, true, Scope::Optional)),
+            )
+        {
+            if let Some(to) = resolve_npm_key(key, name, &ids).cloned() {
+                out.edge(from, &to, scope, optional);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// npm v1 nested `dependencies`-tree ingestion.
+fn parse_npm_dependencies_v1(
+    lock: &NpmLock,
+    path: &str,
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    for (name, dependency) in &lock.dependencies {
+        collect_npm_dependency(name, dependency, None, path, out)?;
     }
     Ok(())
 }
@@ -627,6 +600,38 @@ fn resolve_npm_key<'a>(
     };
     ids.get(&nested)
         .or_else(|| ids.get(&format!("node_modules/{name}")))
+}
+fn npm_scope(dev: bool, optional: bool) -> Scope {
+    if dev {
+        Scope::Development
+    } else if optional {
+        Scope::Optional
+    } else {
+        Scope::Runtime
+    }
+}
+
+fn collect_npm_dependency(
+    name: &str,
+    dependency: &NpmDependency,
+    parent: Option<ComponentId>,
+    path: &str,
+    out: &mut InventoryBuilder,
+) -> Result<ComponentId, InputError> {
+    let version = dependency
+        .version
+        .as_deref()
+        .ok_or_else(|| malformed_msg(path, "package-lock.json", "dependency has no version"))?;
+    let scope = npm_scope(dependency.dev, dependency.optional);
+    entry_bound(out.components.len() + 1, path, "package-lock.json")?;
+    let id = out.add("npm", name, version, scope, path, BTreeSet::new())?;
+    if let Some(parent) = parent {
+        out.edge(&parent, &id, scope, dependency.optional);
+    }
+    for (child, value) in &dependency.dependencies {
+        collect_npm_dependency(child, value, Some(id.clone()), path, out)?;
+    }
+    Ok(id)
 }
 
 fn parse_requirements(
@@ -741,7 +746,7 @@ fn parse_nuget_lock(
         .get("dependencies")
         .and_then(Value::as_object)
         .ok_or_else(|| malformed_msg(path, "packages.lock.json", "missing dependencies object"))?;
-    let mut ids = BTreeMap::new();
+    let mut ids = LockComponents::new();
     for packages in frameworks.values().filter_map(Value::as_object) {
         for (name, package) in packages {
             let version = package
@@ -759,17 +764,17 @@ fn parse_nuget_lock(
                 Some("Transitive") => Scope::Runtime,
                 _ => Scope::Unknown,
             };
-            ids.insert(
-                (name.to_ascii_lowercase(), version.to_owned()),
-                out.add(
-                    "nuget",
-                    &name.to_ascii_lowercase(),
-                    version,
-                    scope,
-                    path,
-                    BTreeSet::new(),
-                )?,
-            );
+            let id = out.add(
+                "nuget",
+                &name.to_ascii_lowercase(),
+                version,
+                scope,
+                path,
+                BTreeSet::new(),
+            )?;
+            ids.entry(name.to_ascii_lowercase())
+                .or_default()
+                .insert(version.to_owned(), id);
         }
     }
     for packages in frameworks.values().filter_map(Value::as_object) {
@@ -778,7 +783,11 @@ fn parse_nuget_lock(
                 .get("resolved")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let Some(from) = ids.get(&(name.to_ascii_lowercase(), version.to_owned())) else {
+            let name_lower = name.to_ascii_lowercase();
+            let Some(from) = ids
+                .get(&name_lower)
+                .and_then(|versions| versions.get(version))
+            else {
                 continue;
             };
             for (dependency, constraint) in package
@@ -788,13 +797,10 @@ fn parse_nuget_lock(
                 .flatten()
             {
                 let requested = constraint.as_str().unwrap_or_default();
-                let target = ids
-                    .get(&(dependency.to_ascii_lowercase(), requested.to_owned()))
-                    .or_else(|| {
-                        ids.iter()
-                            .find(|((n, _), _)| n == &dependency.to_ascii_lowercase())
-                            .map(|(_, id)| id)
-                    });
+                let candidates = ids.get(&dependency.to_ascii_lowercase());
+                let target = candidates
+                    .and_then(|versions| versions.get(requested))
+                    .or_else(|| candidates.and_then(|versions| versions.values().next()));
                 if let Some(to) = target.cloned() {
                     out.edge(from, &to, Scope::Runtime, false);
                 }
@@ -1818,19 +1824,7 @@ fn read_zip<R: Read + io::Seek>(
             continue;
         }
         let expected = entry.size();
-        expanded = add_archive_size(expanded, expected, config)?;
-        let mut bytes = Vec::new();
-        entry
-            .by_ref()
-            .take(expected.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|source| InputError::Io {
-                path: PathBuf::from(&path),
-                source,
-            })?;
-        if bytes.len() as u64 != expected {
-            return Err(malformed_msg(&path, "ZIP", "entry size mismatch"));
-        }
+        let bytes = read_entry_bounded(&mut entry, expected, &path, "ZIP", config, &mut expanded)?;
         files.insert(path, bytes);
     }
     Ok(files)
@@ -1882,20 +1876,8 @@ fn read_tar_with_expanded<R: Read>(
         if !entry_type.is_file() {
             continue;
         }
-        *expanded = add_archive_size(*expanded, entry.size(), config)?;
         let expected = entry.size();
-        let mut bytes = Vec::new();
-        entry
-            .by_ref()
-            .take(expected.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|source| InputError::Io {
-                path: PathBuf::from(&path),
-                source,
-            })?;
-        if bytes.len() as u64 != expected {
-            return Err(malformed_msg(&path, "TAR", "entry size mismatch"));
-        }
+        let bytes = read_entry_bounded(&mut entry, expected, &path, "TAR", config, expanded)?;
         files.insert(path, bytes);
     }
     Ok(files)
@@ -1913,25 +1895,94 @@ fn add_archive_size(current: u64, entry: u64, config: &Config) -> Result<u64, In
     }
 }
 
+/// Shared bounded-entry pipeline for archive readers: size accounting against
+/// `max_archive_bytes`, a read capped one byte past the declared entry size,
+/// and the truncated/oversized-entry check. ZIP and TAR readers must stay in
+/// lockstep here.
+fn read_entry_bounded(
+    reader: &mut impl Read,
+    expected: u64,
+    path: &str,
+    format: &'static str,
+    config: &Config,
+    expanded: &mut u64,
+) -> Result<Vec<u8>, InputError> {
+    *expanded = add_archive_size(*expanded, expected, config)?;
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(expected.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| InputError::Io {
+            path: PathBuf::from(path),
+            source,
+        })?;
+    if bytes.len() as u64 != expected {
+        return Err(malformed_msg(path, format, "entry size mismatch"));
+    }
+    Ok(bytes)
+}
+
+/// Streams entry names of a plain `.tar` once to decide whether it is an
+/// OCI/docker-save image archive, without buffering entry contents. Enforces
+/// the same entry-count, link, and path rules as `read_tar_with_expanded`;
+/// only `manifest.json` is materialized because its array shape decides
+/// docker-save classification (see `is_oci_markers`).
+fn tar_is_image<R: Read>(reader: R, config: &Config) -> Result<bool, InputError> {
+    let mut archive = tar::Archive::new(reader);
+    let mut count = 0_usize;
+    let mut expanded = 0_u64;
+    let mut has_layout = false;
+    let mut has_index = false;
+    let mut manifest = None;
+    let entries = archive.entries().map_err(|source| InputError::Io {
+        path: PathBuf::from("<tar>"),
+        source,
+    })?;
+    for entry in entries {
+        count += 1;
+        if count > config.max_archive_entries {
+            return Err(InputError::TooManyArchiveEntries {
+                maximum: config.max_archive_entries,
+            });
+        }
+        let mut entry = entry.map_err(|source| InputError::Io {
+            path: PathBuf::from("<tar>"),
+            source,
+        })?;
+        let path = normalize_relative(&entry.path().map_err(|source| InputError::Io {
+            path: PathBuf::from("<tar>"),
+            source,
+        })?)?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(InputError::ArchiveLink(path));
+        }
+        if !entry_type.is_file() {
+            continue;
+        }
+        match path.as_str() {
+            "oci-layout" => has_layout = true,
+            "index.json" => has_index = true,
+            "manifest.json" => {
+                let expected = entry.size();
+                manifest = Some(read_entry_bounded(
+                    &mut entry,
+                    expected,
+                    &path,
+                    "TAR",
+                    config,
+                    &mut expanded,
+                )?);
+            }
+            _ => {}
+        }
+    }
+    Ok(is_oci_markers(has_layout, has_index, manifest.as_deref()))
+}
+
 fn has_project_manifest(root: &Path) -> Result<bool, InputError> {
-    for name in [
-        "Cargo.lock",
-        "package-lock.json",
-        "requirements.txt",
-        "go.mod",
-        "packages.lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "poetry.lock",
-        "Pipfile.lock",
-        "Gemfile.lock",
-        "Package.resolved",
-        "pubspec.lock",
-        "Podfile.lock",
-        "composer.json",
-        "environment.yml",
-        "Chart.yaml",
-    ] {
+    for (name, _) in LOCKFILES {
         let path = root.join(name);
         if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()) {
             return Ok(true);
@@ -1942,38 +1993,17 @@ fn has_project_manifest(root: &Path) -> Result<bool, InputError> {
 
 fn is_inventory_file(path: &Path) -> bool {
     path.file_name().and_then(|v| v.to_str()).is_some_and(|v| {
-        matches!(
-            v,
-            "Cargo.lock"
-                | "Cargo.toml"
-                | "package-lock.json"
-                | "requirements.txt"
-                | "go.mod"
-                | "go.sum"
-                | "packages.lock.json"
-                | "yarn.lock"
-                | "pnpm-lock.yaml"
-                | "poetry.lock"
-                | "Pipfile.lock"
-                | "Gemfile.lock"
-                | "Package.resolved"
-                | "pubspec.lock"
-                | "Podfile.lock"
-                | "composer.json"
-                | "environment.yml"
-                | "Chart.yaml"
-        )
+        MANIFEST_SIDECARS.contains(&v) || LOCKFILES.iter().any(|(name, _)| *name == v)
     })
 }
-fn is_oci_files(files: &BTreeMap<String, Vec<u8>>) -> bool {
-    (files.contains_key("oci-layout") && files.contains_key("index.json"))
-        || files.get("manifest.json").is_some_and(|bytes| {
-            // Only an array-shaped manifest.json marks a docker-save archive.
-            // Object-shaped manifests are web app manifests (PWA); routing
-            // project tarballs that carry one into the image parser rejected
-            // valid archives with Malformed instead of scanning their
-            // lockfiles. The bytes are already fully in memory, so parsing
-            // adds no new cap pressure.
+/// Decides image classification from archive markers. Only an array-shaped
+/// `manifest.json` marks a docker-save archive; object-shaped manifests are
+/// web app manifests (PWA), and routing project tarballs that carry one into
+/// the image parser rejected valid archives with Malformed instead of
+/// scanning their lockfiles.
+fn is_oci_markers(has_layout: bool, has_index: bool, manifest_json: Option<&[u8]>) -> bool {
+    (has_layout && has_index)
+        || manifest_json.is_some_and(|bytes| {
             serde_json::from_slice::<Value>(bytes)
                 .map(|value| value.is_array())
                 .unwrap_or(false)
@@ -2029,7 +2059,7 @@ fn open_regular_nofollow(path: &Path) -> Result<File, InputError> {
         options.custom_flags(O_NOFOLLOW);
     }
     let file = options.open(path).map_err(|source| {
-        if source.raw_os_error() == Some(40) {
+        if is_symlink_open_error(&source) {
             InputError::Symlink(path.to_owned())
         } else {
             InputError::Io {
@@ -2046,6 +2076,32 @@ fn open_regular_nofollow(path: &Path) -> Result<File, InputError> {
         return Err(InputError::UnsupportedPath(path.to_owned()));
     }
     Ok(file)
+}
+
+/// `ELOOP` per target: Linux/Android use 40, Darwin and the BSDs use 62.
+/// Raw errno matching is required because `io::ErrorKind::FilesystemLoop`
+/// is not available on the pinned toolchain; a single hardcoded 40 would
+/// misclassify symlink rejections on every non-Linux unix target.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ELOOP: i32 = 40;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const ELOOP: i32 = 62;
+
+#[cfg(unix)]
+fn is_symlink_open_error(source: &io::Error) -> bool {
+    source.raw_os_error() == Some(ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_symlink_open_error(_: &io::Error) -> bool {
+    false
 }
 fn read_limited(path: &Path, maximum: u64) -> Result<Vec<u8>, InputError> {
     let mut file = open_regular_nofollow(path)?;
@@ -2105,7 +2161,7 @@ fn reject_symlink_ancestors_below(root: &Path, path: &Path) -> Result<(), InputE
     }
     Ok(())
 }
-fn normalize_relative(path: &Path) -> Result<String, InputError> {
+pub(crate) fn normalize_relative(path: &Path) -> Result<String, InputError> {
     let mut parts = Vec::new();
     for component in path.components() {
         match component {
@@ -2212,7 +2268,7 @@ fn stable_asset(locator: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<Ass
         .map_err(|_| InputError::InvalidIdentifier)
 }
 fn sha256(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", crate::util::sha256_hex(bytes))
 }
 fn required_toml<'a>(
     value: &'a toml::Value,

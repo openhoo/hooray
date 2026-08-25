@@ -9,7 +9,6 @@ use std::{
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::WalkDir;
 use zip::ZipArchive;
@@ -19,6 +18,7 @@ use crate::model::{
     FindingStatus, Location, Position, Remediation, Risk, RuleId, Severity, stable_finding_id,
     stable_location_id,
 };
+use crate::util::sha256_hex;
 
 const SECRET_ALLOWLIST_MARKERS: &[&str] = &[
     "hooray:allow-secret",
@@ -126,6 +126,11 @@ pub fn scan_path(
 ) -> Result<ScanOutput, ScanError> {
     validate_config(config)?;
     signatures.validate()?;
+    let ctx = ScanContext {
+        asset_id,
+        config,
+        signatures,
+    };
     let metadata = fs::symlink_metadata(root).map_err(|source| ScanError::Metadata {
         path: root.to_owned(),
         source,
@@ -192,11 +197,11 @@ pub fn scan_path(
         admitted_bytes += bytes.len() as u64;
         admitted.push((display_path, bytes));
         if admitted.len() >= 32 || admitted_bytes >= 16 * 1024 * 1024 {
-            analyze_admitted(&mut admitted, &mut output, asset_id, config, signatures);
+            analyze_admitted(&mut admitted, &mut output, &ctx);
             admitted_bytes = 0;
         }
     }
-    analyze_admitted(&mut admitted, &mut output, asset_id, config, signatures);
+    analyze_admitted(&mut admitted, &mut output, &ctx);
     output
         .findings
         .sort_by(|left, right| left.id.cmp(&right.id));
@@ -206,9 +211,7 @@ pub fn scan_path(
 fn analyze_admitted(
     admitted: &mut Vec<(String, Vec<u8>)>,
     output: &mut ScanOutput,
-    asset_id: &AssetId,
-    config: &ScannerConfig,
-    signatures: &MalwareSignatures,
+    ctx: &ScanContext<'_>,
 ) {
     if admitted.is_empty() {
         return;
@@ -217,12 +220,12 @@ fn analyze_admitted(
     let analyzed: Vec<_> = if batch.len() >= 32 {
         batch
             .par_iter()
-            .map(|(path, bytes)| analyze_bytes(path, bytes, asset_id, config, signatures))
+            .map(|(path, bytes)| analyze_file(path, bytes, ctx))
             .collect()
     } else {
         batch
             .iter()
-            .map(|(path, bytes)| analyze_bytes(path, bytes, asset_id, config, signatures))
+            .map(|(path, bytes)| analyze_file(path, bytes, ctx))
             .collect()
     };
     for mut file_output in analyzed {
@@ -299,10 +302,22 @@ pub fn analyze_bytes(
     config: &ScannerConfig,
     signatures: &MalwareSignatures,
 ) -> ScanOutput {
-    let mut builder = FindingBuilder::new(path, asset_id);
-    scan_malware(bytes, config, signatures, &mut builder);
+    analyze_file(
+        path,
+        bytes,
+        &ScanContext {
+            asset_id,
+            config,
+            signatures,
+        },
+    )
+}
+
+fn analyze_file(path: &str, bytes: &[u8], ctx: &ScanContext<'_>) -> ScanOutput {
+    let mut builder = FindingBuilder::new(path, ctx);
+    scan_malware(bytes, &mut builder);
     if let Some(text) = decode_text(bytes) {
-        scan_secrets(text, config, &mut builder);
+        scan_secrets(text, &mut builder);
         scan_iac(path, text, &mut builder);
         scan_service_config(path, text, &mut builder);
         scan_sast(path, text, &mut builder);
@@ -346,18 +361,27 @@ struct FindingSpec<'a> {
     cwe: Option<&'a str>,
 }
 
+/// Per-scan context threaded through the scanner pipeline; built once per
+/// file (and once per scan run for batches) instead of passing the
+/// asset/config/signature trio as loose positional parameters everywhere.
+struct ScanContext<'a> {
+    asset_id: &'a AssetId,
+    config: &'a ScannerConfig,
+    signatures: &'a MalwareSignatures,
+}
+
 struct FindingBuilder<'a> {
     path: &'a str,
-    asset_id: &'a AssetId,
+    ctx: &'a ScanContext<'a>,
     locations: BTreeSet<Location>,
     findings: Vec<Finding>,
 }
 
 impl<'a> FindingBuilder<'a> {
-    fn new(path: &'a str, asset_id: &'a AssetId) -> Self {
+    fn new(path: &'a str, ctx: &'a ScanContext<'a>) -> Self {
         Self {
             path,
-            asset_id,
+            ctx,
             locations: BTreeSet::new(),
             findings: Vec::new(),
         }
@@ -381,11 +405,11 @@ impl<'a> FindingBuilder<'a> {
             cwe,
         } = spec;
         let start = Position { line, column };
-        let location_id = stable_location_id(self.asset_id, self.path, Some(start))
+        let location_id = stable_location_id(self.ctx.asset_id, self.path, Some(start))
             .expect("scanner paths are non-empty");
         self.locations.insert(Location {
             id: location_id.clone(),
-            asset_id: self.asset_id.clone(),
+            asset_id: self.ctx.asset_id.clone(),
             path: self.path.to_owned(),
             start: Some(start),
             end: None,
@@ -534,7 +558,7 @@ static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     .expect("constant assignment regex")
 });
 
-fn scan_secrets(text: &str, config: &ScannerConfig, builder: &mut FindingBuilder<'_>) {
+fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
     for (line_index, line) in text.lines().enumerate() {
         if line.len() > MAX_TEXT_LINE_BYTES || allowlisted(line) {
             continue;
@@ -556,7 +580,7 @@ fn scan_secrets(text: &str, config: &ScannerConfig, builder: &mut FindingBuilder
             let value = captures.get(2).expect("capture exists");
             if looks_placeholder(value.as_str())
                 || shannon_entropy(value.as_str()) * 1000.0
-                    < f64::from(config.secret_entropy_threshold_milli)
+                    < f64::from(builder.ctx.config.secret_entropy_threshold_milli)
             {
                 continue;
             }
@@ -586,7 +610,7 @@ fn add_secret(
     let mut properties = BTreeMap::new();
     properties.insert(
         "fingerprint_sha256".to_owned(),
-        hex_sha256(value.as_bytes()),
+        sha256_hex(value.as_bytes()),
     );
     properties.insert("pattern".to_owned(), rule.to_owned());
     properties.insert("length_bytes".to_owned(), value.len().to_string());
@@ -681,12 +705,13 @@ static TERRAFORM_UNENCRYPTED_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn scan_terraform(text: &str, builder: &mut FindingBuilder<'_>) {
+    let line_starts = line_starts(text);
     for matched in TERRAFORM_PUBLIC_CIDR_REGEX.find_iter(text) {
-        let (line, column) = line_column(text, matched.start());
+        let (line, column) = indexed_line_column(&line_starts, matched.start());
         builder.add(FindingSpec { kind: FindingKind::Iac, rule: "iac.terraform.public-ingress", line, column, summary: "Unrestricted Terraform network CIDR", details: "A Terraform network rule explicitly permits the entire IPv4 or IPv6 Internet.", severity: Severity::High, confidence: Confidence::High, description: "Concrete cidr_blocks assignment contains 0.0.0.0/0 or ::/0.".to_owned(), references: &["https://developer.hashicorp.com/terraform/language"], properties: BTreeMap::new(), redacted: false, remediation: "Restrict ingress to the smallest required CIDR ranges and ports.", cwe: Some("CWE-284") });
     }
     for matched in TERRAFORM_UNENCRYPTED_REGEX.find_iter(text) {
-        let (line, column) = line_column(text, matched.start());
+        let (line, column) = indexed_line_column(&line_starts, matched.start());
         builder.add(FindingSpec {
             kind: FindingKind::Iac,
             rule: "iac.terraform.encryption-disabled",
@@ -838,23 +863,88 @@ fn docker_logical_lines(text: &str) -> Vec<(u32, String)> {
 }
 
 fn scan_structured_iac(text: &str, extension: &str, builder: &mut FindingBuilder<'_>) {
-    let documents: Vec<serde_json::Value> = if extension == "json" {
-        serde_json::from_str(text).into_iter().collect()
-    } else {
-        serde_yaml::Deserializer::from_str(text)
-            .filter_map(|document| serde_yaml::Value::deserialize(document).ok())
-            .filter_map(|value| serde_json::to_value(value).ok())
-            .collect()
-    };
-    for document in documents {
-        if document.get("apiVersion").is_some() && document.get("kind").is_some() {
-            scan_kubernetes_value(&document, text, builder);
+    let line_starts = line_starts(text);
+    if extension == "json" {
+        match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(document) => scan_structured_document(&document, text, &line_starts, builder),
+            Err(_) => add_unparseable_iac_document(builder),
         }
-        if document.get("AWSTemplateFormatVersion").is_some() || document.get("Resources").is_some()
-        {
-            scan_cloudformation_value(&document, text, builder);
+        return;
+    }
+    let mut dropped_documents = 0_usize;
+    for document_text in split_yaml_documents(text) {
+        let parsed = serde_yaml::from_str::<serde_yaml::Value>(&document_text)
+            .ok()
+            .and_then(|value| serde_json::to_value(value).ok());
+        match parsed {
+            Some(document) => scan_structured_document(&document, text, &line_starts, builder),
+            None => dropped_documents += 1,
         }
     }
+    if dropped_documents > 0 {
+        add_unparseable_iac_document(builder);
+    }
+}
+
+/// Splits a YAML stream into per-document chunks on `---` separators.
+/// Parsing each chunk with a single-document parse avoids libyaml's
+/// stream iterator, which can spin forever on malformed trailing
+/// documents; behavior on well-formed streams is identical.
+fn split_yaml_documents(text: &str) -> Vec<String> {
+    let mut documents = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        if line.trim_end() == "---" {
+            if !current.trim().is_empty() {
+                documents.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        documents.push(current);
+    }
+    documents
+}
+
+/// Scans one parsed YAML/JSON document for Kubernetes and CloudFormation
+/// findings.
+fn scan_structured_document(
+    document: &serde_json::Value,
+    text: &str,
+    line_starts: &[usize],
+    builder: &mut FindingBuilder<'_>,
+) {
+    if document.get("apiVersion").is_some() && document.get("kind").is_some() {
+        scan_kubernetes_value(document, text, line_starts, builder);
+    }
+    if document.get("AWSTemplateFormatVersion").is_some() || document.get("Resources").is_some() {
+        scan_cloudformation_value(document, text, line_starts, builder);
+    }
+}
+
+/// Surfaces documents that failed to parse so operators can distinguish
+/// "no IaC issues" from "could not parse" instead of silently scanning a
+/// subset of the file; mirrors input.rs's malformed-lockfile diagnostics.
+fn add_unparseable_iac_document(builder: &mut FindingBuilder<'_>) {
+    builder.add(FindingSpec {
+        kind: FindingKind::Iac,
+        rule: "iac.unparseable-document",
+        line: 1,
+        column: 1,
+        summary: "Structured IaC file contains unparseable documents",
+        details: "At least one YAML or JSON document in this file failed to parse and was excluded from IaC analysis; a clean result does not mean the whole file was checked.",
+        severity: Severity::Low,
+        confidence: Confidence::High,
+        description: "Documents that failed to parse were skipped; the remaining documents were still scanned.".to_owned(),
+        references: &[],
+        properties: BTreeMap::new(),
+        redacted: false,
+        remediation: "Fix the YAML or JSON syntax errors so every document in the file is parsed and scanned.",
+        cwe: None,
+    });
 }
 
 struct StructuredIacRule<'a> {
@@ -867,7 +957,12 @@ struct StructuredIacRule<'a> {
     cwe: &'a str,
 }
 
-fn scan_kubernetes_value(value: &serde_json::Value, text: &str, builder: &mut FindingBuilder<'_>) {
+fn scan_kubernetes_value(
+    value: &serde_json::Value,
+    text: &str,
+    line_starts: &[usize],
+    builder: &mut FindingBuilder<'_>,
+) {
     let workload = value
         .pointer("/metadata/name")
         .and_then(serde_json::Value::as_str)
@@ -881,6 +976,7 @@ fn scan_kubernetes_value(value: &serde_json::Value, text: &str, builder: &mut Fi
             add_structured_iac(
                 builder,
                 text,
+                line_starts,
                 StructuredIacRule {
                     anchor: workload,
                     needle: "hostNetwork",
@@ -913,6 +1009,7 @@ fn scan_kubernetes_value(value: &serde_json::Value, text: &str, builder: &mut Fi
                 add_structured_iac(
                     builder,
                     text,
+                    line_starts,
                     StructuredIacRule {
                         anchor: name,
                         needle: "privileged",
@@ -932,6 +1029,7 @@ fn scan_kubernetes_value(value: &serde_json::Value, text: &str, builder: &mut Fi
                 add_structured_iac(
                     builder,
                     text,
+                    line_starts,
                     StructuredIacRule {
                         anchor: name,
                         needle: "allowPrivilegeEscalation",
@@ -963,6 +1061,7 @@ fn pod_specs(value: &serde_json::Value) -> Vec<&serde_json::Value> {
 fn scan_cloudformation_value(
     value: &serde_json::Value,
     text: &str,
+    line_starts: &[usize],
     builder: &mut FindingBuilder<'_>,
 ) {
     let Some(resources) = value
@@ -985,6 +1084,7 @@ fn scan_cloudformation_value(
             add_structured_iac(
                 builder,
                 text,
+                line_starts,
                 StructuredIacRule {
                     anchor: logical_id,
                     needle: "AWS::S3::Bucket",
@@ -1005,6 +1105,7 @@ fn scan_cloudformation_value(
             add_structured_iac(
                 builder,
                 text,
+                line_starts,
                 StructuredIacRule {
                     anchor: logical_id,
                     needle: "StorageEncrypted",
@@ -1019,12 +1120,17 @@ fn scan_cloudformation_value(
     }
 }
 
-fn add_structured_iac(builder: &mut FindingBuilder<'_>, text: &str, rule: StructuredIacRule<'_>) {
+fn add_structured_iac(
+    builder: &mut FindingBuilder<'_>,
+    text: &str,
+    line_starts: &[usize],
+    rule: StructuredIacRule<'_>,
+) {
     let anchor = find_structured_scalar(text, rule.anchor).unwrap_or(0);
     let offset = text[anchor..]
         .find(rule.needle)
         .map_or(anchor, |relative| anchor + relative);
-    let (line, column) = line_column(text, offset);
+    let (line, column) = indexed_line_column(line_starts, offset);
     let mut properties = BTreeMap::new();
     if !rule.anchor.is_empty() {
         properties.insert("object".to_owned(), rule.anchor.to_owned());
@@ -1093,7 +1199,7 @@ fn scan_service_config(path: &str, text: &str, builder: &mut FindingBuilder<'_>)
     let nginx_conf =
         name == "nginx.conf" || (name.starts_with("nginx.") && name.ends_with(".conf"));
     if nginx_conf {
-        scan_nginx_config(text, builder);
+        scan_directive_config(text, builder, NGINX_CHECKS);
     }
     if name.ends_with(".conf")
         && !nginx_conf
@@ -1102,13 +1208,13 @@ fn scan_service_config(path: &str, text: &str, builder: &mut FindingBuilder<'_>)
             "pg_hba.conf" | "postgresql.conf" | "redis.conf"
         )
     {
-        scan_apache_config(text, builder);
+        scan_directive_config(text, builder, APACHE_CHECKS);
     }
     match name.as_str() {
-        "pg_hba.conf" => scan_pg_hba_config(text, builder),
-        "postgresql.conf" => scan_postgresql_config(text, builder),
-        "redis.conf" => scan_redis_config(text, builder),
-        "sshd_config" => scan_sshd_config(text, builder),
+        "pg_hba.conf" => scan_directive_config(text, builder, PG_HBA_CHECKS),
+        "postgresql.conf" => scan_key_value_config(text, builder, POSTGRESQL_CHECKS),
+        "redis.conf" => scan_key_value_config(text, builder, REDIS_CHECKS),
+        "sshd_config" => scan_directive_config(text, builder, SSHD_CHECKS),
         _ => {}
     }
 }
@@ -1314,188 +1420,202 @@ const SSHD_EMPTY_PASSWORDS_RULE: ServiceConfigRule<'static> = ServiceConfigRule 
     references: &["https://man.openbsd.org/sshd_config#PermitEmptyPasswords"],
 };
 
-fn scan_nginx_config(text: &str, builder: &mut FindingBuilder<'_>) {
-    for (number, _, line) in config_lines(text) {
-        let content = effective_config_line(line);
-        let Some((directive, arguments)) = split_config_directive(content) else {
-            continue;
-        };
-        if directive.eq_ignore_ascii_case("ssl_protocols")
-            && argument_tokens(arguments).any(is_weak_protocol_token)
-        {
-            add_service_finding(
-                builder,
-                &NGINX_WEAK_TLS_RULE,
-                content.to_owned(),
-                number,
-                directive_column(line),
-            );
-        } else if directive.eq_ignore_ascii_case("server_tokens")
-            && argument_tokens(arguments)
-                .next()
-                .is_some_and(|value| value.eq_ignore_ascii_case("on"))
-        {
-            add_service_finding(
-                builder,
-                &NGINX_SERVER_TOKENS_RULE,
-                content.to_owned(),
-                number,
-                directive_column(line),
-            );
-        }
-    }
+/// One service-config check: the directive keyword (compared
+/// case-insensitively; empty matches any line, used by record-style formats
+/// like pg_hba.conf), a predicate over the directive value, and the finding
+/// metadata to emit when both match. Table order is significant: the first
+/// matching check wins, mirroring the previous per-format if/else chains.
+struct ServiceConfigCheck {
+    directive: &'static str,
+    matches_value: fn(&str) -> bool,
+    rule: &'static ServiceConfigRule<'static>,
 }
 
-fn scan_apache_config(text: &str, builder: &mut FindingBuilder<'_>) {
-    for (number, _, line) in config_lines(text) {
-        let content = effective_config_line(line);
-        let Some((directive, arguments)) = split_config_directive(content) else {
-            continue;
-        };
-        if directive.eq_ignore_ascii_case("SSLProtocol")
-            && argument_tokens(arguments).any(enables_weak_protocol)
-        {
-            add_service_finding(
-                builder,
-                &APACHE_WEAK_TLS_RULE,
-                content.to_owned(),
-                number,
-                directive_column(line),
-            );
-        } else if directive.eq_ignore_ascii_case("ServerTokens")
-            && argument_tokens(arguments).next().is_some_and(|value| {
-                value.eq_ignore_ascii_case("full") || value.eq_ignore_ascii_case("os")
-            })
-        {
-            add_service_finding(
-                builder,
-                &APACHE_SERVER_TOKENS_RULE,
-                content.to_owned(),
-                number,
-                directive_column(line),
-            );
-        }
-    }
+static NGINX_CHECKS: &[ServiceConfigCheck] = &[
+    ServiceConfigCheck {
+        directive: "ssl_protocols",
+        matches_value: arguments_contain_weak_protocol,
+        rule: &NGINX_WEAK_TLS_RULE,
+    },
+    ServiceConfigCheck {
+        directive: "server_tokens",
+        matches_value: first_argument_is_on,
+        rule: &NGINX_SERVER_TOKENS_RULE,
+    },
+];
+
+static APACHE_CHECKS: &[ServiceConfigCheck] = &[
+    ServiceConfigCheck {
+        directive: "SSLProtocol",
+        matches_value: arguments_enable_weak_protocol,
+        rule: &APACHE_WEAK_TLS_RULE,
+    },
+    ServiceConfigCheck {
+        directive: "ServerTokens",
+        matches_value: first_argument_is_full_or_os,
+        rule: &APACHE_SERVER_TOKENS_RULE,
+    },
+];
+
+static PG_HBA_CHECKS: &[ServiceConfigCheck] = &[ServiceConfigCheck {
+    directive: "",
+    matches_value: hba_tail_is_trust,
+    rule: &PG_HBA_TRUST_RULE,
+}];
+
+static POSTGRESQL_CHECKS: &[ServiceConfigCheck] = &[
+    ServiceConfigCheck {
+        directive: "ssl",
+        matches_value: value_is_off,
+        rule: &POSTGRES_SSL_OFF_RULE,
+    },
+    ServiceConfigCheck {
+        directive: "password_encryption",
+        matches_value: value_is_md5_or_plain,
+        rule: &POSTGRES_WEAK_PASSWORD_RULE,
+    },
+];
+
+static REDIS_CHECKS: &[ServiceConfigCheck] = &[
+    ServiceConfigCheck {
+        directive: "protected-mode",
+        matches_value: value_is_no,
+        rule: &REDIS_PROTECTED_MODE_RULE,
+    },
+    ServiceConfigCheck {
+        directive: "requirepass",
+        matches_value: str::is_empty,
+        rule: &REDIS_EMPTY_PASSWORD_RULE,
+    },
+];
+
+static SSHD_CHECKS: &[ServiceConfigCheck] = &[
+    ServiceConfigCheck {
+        directive: "PermitRootLogin",
+        matches_value: first_argument_is_yes,
+        rule: &SSHD_ROOT_LOGIN_RULE,
+    },
+    ServiceConfigCheck {
+        directive: "PasswordAuthentication",
+        matches_value: first_argument_is_yes,
+        rule: &SSHD_PASSWORD_AUTH_RULE,
+    },
+    ServiceConfigCheck {
+        directive: "Protocol",
+        matches_value: first_argument_is_protocol_one,
+        rule: &SSHD_PROTOCOL_ONE_RULE,
+    },
+    ServiceConfigCheck {
+        directive: "PermitEmptyPasswords",
+        matches_value: first_argument_is_yes,
+        rule: &SSHD_EMPTY_PASSWORDS_RULE,
+    },
+];
+
+fn first_argument_is(arguments: &str, expected: &str) -> bool {
+    argument_tokens(arguments)
+        .next()
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
-fn scan_pg_hba_config(text: &str, builder: &mut FindingBuilder<'_>) {
-    for (number, _, line) in config_lines(text) {
-        let entry = effective_config_line(line);
-        let field_count = entry.split_whitespace().count();
-        let trust_method = entry
+fn first_argument_is_on(arguments: &str) -> bool {
+    first_argument_is(arguments, "on")
+}
+
+fn first_argument_is_full_or_os(arguments: &str) -> bool {
+    first_argument_is(arguments, "full") || first_argument_is(arguments, "os")
+}
+
+fn first_argument_is_yes(arguments: &str) -> bool {
+    first_argument_is(arguments, "yes")
+}
+
+fn first_argument_is_protocol_one(arguments: &str) -> bool {
+    first_argument_is(arguments, "1")
+}
+
+fn arguments_contain_weak_protocol(arguments: &str) -> bool {
+    argument_tokens(arguments).any(is_weak_protocol_token)
+}
+
+fn arguments_enable_weak_protocol(arguments: &str) -> bool {
+    argument_tokens(arguments).any(enables_weak_protocol)
+}
+
+fn value_is_off(value: &str) -> bool {
+    value.eq_ignore_ascii_case("off")
+}
+
+fn value_is_md5_or_plain(value: &str) -> bool {
+    value.eq_ignore_ascii_case("md5") || value.eq_ignore_ascii_case("plain")
+}
+
+fn value_is_no(value: &str) -> bool {
+    value.eq_ignore_ascii_case("no")
+}
+
+/// pg_hba.conf records carry no directive keyword: the driver hands this
+/// predicate everything after the first whitespace-separated field, so a
+/// trust record (connection type, database, user, method) has at least
+/// three remaining fields and ends with the trust method.
+fn hba_tail_is_trust(arguments: &str) -> bool {
+    arguments.split_whitespace().count() >= 3
+        && arguments
             .split_whitespace()
-            .last()
-            .is_some_and(|method| method.eq_ignore_ascii_case("trust"));
-        if field_count >= 4 && trust_method {
-            add_service_finding(
-                builder,
-                &PG_HBA_TRUST_RULE,
-                entry.to_owned(),
-                number,
-                directive_column(line),
-            );
-        }
+            .next_back()
+            .is_some_and(|method| method.eq_ignore_ascii_case("trust"))
+}
+
+/// Shared directive-style driver (nginx, Apache, sshd, pg_hba): at most one
+/// finding per line, first matching table entry wins.
+fn scan_directive_config(
+    text: &str,
+    builder: &mut FindingBuilder<'_>,
+    checks: &[ServiceConfigCheck],
+) {
+    for (number, _, line) in config_lines(text) {
+        let content = effective_config_line(line);
+        let Some((directive, arguments)) = split_config_directive(content) else {
+            continue;
+        };
+        let Some(check) = checks.iter().find(|check| {
+            (check.directive.is_empty() || directive.eq_ignore_ascii_case(check.directive))
+                && (check.matches_value)(arguments)
+        }) else {
+            continue;
+        };
+        add_service_finding(
+            builder,
+            check.rule,
+            content.to_owned(),
+            number,
+            directive_column(line),
+        );
     }
 }
 
-fn scan_postgresql_config(text: &str, builder: &mut FindingBuilder<'_>) {
+/// Shared key=value driver (postgresql.conf, redis.conf).
+fn scan_key_value_config(
+    text: &str,
+    builder: &mut FindingBuilder<'_>,
+    checks: &[ServiceConfigCheck],
+) {
     for (number, _, line) in config_lines(text) {
         let Some((key, value)) = config_assignment(line) else {
             continue;
         };
-        if key.eq_ignore_ascii_case("ssl") && value.eq_ignore_ascii_case("off") {
-            add_service_finding(
-                builder,
-                &POSTGRES_SSL_OFF_RULE,
-                effective_config_line(line).to_owned(),
-                number,
-                directive_column(line),
-            );
-        } else if key.eq_ignore_ascii_case("password_encryption")
-            && (value.eq_ignore_ascii_case("md5") || value.eq_ignore_ascii_case("plain"))
-        {
-            add_service_finding(
-                builder,
-                &POSTGRES_WEAK_PASSWORD_RULE,
-                effective_config_line(line).to_owned(),
-                number,
-                directive_column(line),
-            );
-        }
-    }
-}
-
-fn scan_redis_config(text: &str, builder: &mut FindingBuilder<'_>) {
-    for (number, _, line) in config_lines(text) {
-        let Some((key, value)) = config_assignment(line) else {
+        let Some(check) = checks.iter().find(|check| {
+            key.eq_ignore_ascii_case(check.directive) && (check.matches_value)(value)
+        }) else {
             continue;
         };
-        if key.eq_ignore_ascii_case("protected-mode") && value.eq_ignore_ascii_case("no") {
-            add_service_finding(
-                builder,
-                &REDIS_PROTECTED_MODE_RULE,
-                effective_config_line(line).to_owned(),
-                number,
-                directive_column(line),
-            );
-        } else if key.eq_ignore_ascii_case("requirepass") && value.is_empty() {
-            add_service_finding(
-                builder,
-                &REDIS_EMPTY_PASSWORD_RULE,
-                effective_config_line(line).to_owned(),
-                number,
-                directive_column(line),
-            );
-        }
-    }
-}
-
-fn scan_sshd_config(text: &str, builder: &mut FindingBuilder<'_>) {
-    for (number, _, line) in config_lines(text) {
-        let entry = effective_config_line(line);
-        let Some((keyword, arguments)) = split_config_directive(entry) else {
-            continue;
-        };
-        let Some(value) = argument_tokens(arguments).next() else {
-            continue;
-        };
-        if keyword.eq_ignore_ascii_case("PermitRootLogin") && value.eq_ignore_ascii_case("yes") {
-            add_service_finding(
-                builder,
-                &SSHD_ROOT_LOGIN_RULE,
-                entry.to_owned(),
-                number,
-                directive_column(line),
-            );
-        } else if keyword.eq_ignore_ascii_case("PasswordAuthentication")
-            && value.eq_ignore_ascii_case("yes")
-        {
-            add_service_finding(
-                builder,
-                &SSHD_PASSWORD_AUTH_RULE,
-                entry.to_owned(),
-                number,
-                directive_column(line),
-            );
-        } else if keyword.eq_ignore_ascii_case("Protocol") && value == "1" {
-            add_service_finding(
-                builder,
-                &SSHD_PROTOCOL_ONE_RULE,
-                entry.to_owned(),
-                number,
-                directive_column(line),
-            );
-        } else if keyword.eq_ignore_ascii_case("PermitEmptyPasswords")
-            && value.eq_ignore_ascii_case("yes")
-        {
-            add_service_finding(
-                builder,
-                &SSHD_EMPTY_PASSWORDS_RULE,
-                entry.to_owned(),
-                number,
-                directive_column(line),
-            );
-        }
+        add_service_finding(
+            builder,
+            check.rule,
+            effective_config_line(line).to_owned(),
+            number,
+            directive_column(line),
+        );
     }
 }
 
@@ -1790,9 +1910,10 @@ fn scan_sast(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
         return;
     };
     let line_starts = line_starts(text);
+    let non_code = non_code_spans(text, &extension);
     for rule in rules {
         for matched in rule.regex.find_iter(text) {
-            if offset_in_comment_or_string(text, matched.start(), &extension) {
+            if offset_in_non_code_span(&non_code, matched.start()) {
                 continue;
             }
             if matches!(
@@ -1890,14 +2011,19 @@ fn yaml_call_specifies_loader(after_open_paren: &str) -> bool {
     YAML_RESTRICTED_LOADER_REGEX.is_match(&after_open_paren[..end])
 }
 
-fn offset_in_comment_or_string(text: &str, offset: usize, extension: &str) -> bool {
-    // Lexical scan of everything before the match: reports whether the match
-    // offset sits inside a comment or string literal. Line comments and
-    // single-line strings reset at '\n'; block comments, JavaScript template
-    // literals, Go raw strings, and Python triple-quoted strings span lines.
-    // JavaScript division-vs-regex-literal ambiguity is resolved as code, so
-    // a regex literal containing a quote may leave tracking unopened and the
-    // match reported — suppression errs toward reporting, never hiding state.
+/// Byte spans of `text` where the lexer sits inside a comment or string
+/// literal for the given source extension, sorted and disjoint. An offset
+/// lies inside a span exactly when it is strictly after an opener's first
+/// byte and at or before the matching closer's first byte; unterminated
+/// regions extend through the end of the text.
+///
+/// Line comments and single-line strings reset at '\n'; block comments,
+/// JavaScript template literals, Go raw strings, and Python triple-quoted
+/// strings span lines. JavaScript division-vs-regex-literal ambiguity is
+/// resolved as code, so a regex literal containing a quote may leave
+/// tracking unopened and the match reported — suppression errs toward
+/// reporting, never hiding state.
+fn non_code_spans(text: &str, extension: &str) -> Vec<(usize, usize)> {
     enum State {
         Code,
         LineComment,
@@ -1908,11 +2034,13 @@ fn offset_in_comment_or_string(text: &str, offset: usize, extension: &str) -> bo
             triple: bool,
         },
     }
-    let bytes = &text.as_bytes()[..offset];
+    let bytes = text.as_bytes();
     let python = extension == "py";
     let backtick_spans_lines = matches!(extension, "js" | "jsx" | "ts" | "tsx" | "go");
     let mut state = State::Code;
     let mut index = 0_usize;
+    let mut open: Option<usize> = None;
+    let mut spans = Vec::new();
     while index < bytes.len() {
         let byte = bytes[index];
         match state {
@@ -1920,12 +2048,15 @@ fn offset_in_comment_or_string(text: &str, offset: usize, extension: &str) -> bo
                 let rest = &bytes[index..];
                 if python && byte == b'#' {
                     state = State::LineComment;
+                    open = Some(index);
                     index += 1;
                 } else if !python && byte == b'/' && rest.get(1) == Some(&b'/') {
                     state = State::LineComment;
+                    open = Some(index);
                     index += 2;
                 } else if !python && byte == b'/' && rest.get(1) == Some(&b'*') {
                     state = State::BlockComment;
+                    open = Some(index);
                     index += 2;
                 } else if matches!(byte, b'\'' | b'"' | b'`') {
                     let triple = python && rest.starts_with(&[byte, byte, byte]);
@@ -1935,6 +2066,7 @@ fn offset_in_comment_or_string(text: &str, offset: usize, extension: &str) -> bo
                         spans_lines,
                         triple,
                     };
+                    open = Some(index);
                     index += if triple { 3 } else { 1 };
                 } else {
                     index += 1;
@@ -1942,12 +2074,20 @@ fn offset_in_comment_or_string(text: &str, offset: usize, extension: &str) -> bo
             }
             State::LineComment => {
                 if byte == b'\n' {
+                    spans.push((
+                        open.take().expect("line comment opener recorded") + 1,
+                        index + 1,
+                    ));
                     state = State::Code;
                 }
                 index += 1;
             }
             State::BlockComment => {
                 if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    spans.push((
+                        open.take().expect("block comment opener recorded") + 1,
+                        index + 1,
+                    ));
                     state = State::Code;
                     index += 2;
                 } else {
@@ -1960,16 +2100,21 @@ fn offset_in_comment_or_string(text: &str, offset: usize, extension: &str) -> bo
                 triple,
             } => {
                 if !spans_lines && byte == b'\n' {
+                    spans.push((open.take().expect("string opener recorded") + 1, index + 1));
                     state = State::Code;
                     index += 1;
                     continue;
                 }
                 if quote != b'`' && byte == b'\\' {
-                    // Skip the escaped byte; overshooting `offset` is fine.
+                    // Skip the escaped byte; overshooting the text end is fine.
                     index += 2;
                     continue;
                 }
                 if triple && bytes[index..].starts_with(&[quote, quote, quote]) {
+                    spans.push((
+                        open.take().expect("triple-quote opener recorded") + 1,
+                        index + 1,
+                    ));
                     state = State::Code;
                     index += 3;
                     continue;
@@ -1977,23 +2122,28 @@ fn offset_in_comment_or_string(text: &str, offset: usize, extension: &str) -> bo
                 // Triple-quoted strings close only on their full
                 // terminator; a lone quote inside must not flip state.
                 if !triple && byte == quote {
+                    spans.push((open.take().expect("string opener recorded") + 1, index + 1));
                     state = State::Code;
                 }
                 index += 1;
             }
         }
     }
-    !matches!(state, State::Code)
+    if let Some(open) = open {
+        // Unterminated comment or string: non-code through end of text.
+        spans.push((open + 1, text.len() + 1));
+    }
+    spans
 }
 
-fn scan_malware(
-    bytes: &[u8],
-    config: &ScannerConfig,
-    signatures: &MalwareSignatures,
-    builder: &mut FindingBuilder<'_>,
-) {
-    let digest = hex_sha256(bytes);
-    if let Some(signature) = signatures.sha256.get(&digest) {
+fn offset_in_non_code_span(spans: &[(usize, usize)], offset: usize) -> bool {
+    let position = spans.partition_point(|&(start, _)| start <= offset);
+    position > 0 && offset < spans[position - 1].1
+}
+
+fn scan_malware(bytes: &[u8], builder: &mut FindingBuilder<'_>) {
+    let digest = sha256_hex(bytes);
+    if let Some(signature) = builder.ctx.signatures.sha256.get(&digest) {
         let mut properties = BTreeMap::new();
         properties.insert("sha256".to_owned(), digest);
         properties.insert("signature".to_owned(), signature.clone());
@@ -2006,54 +2156,48 @@ fn scan_malware(
         builder.add(FindingSpec { kind: FindingKind::Malware, rule: "malware.executable-script-polyglot", line: 1, column: 1, summary: "Executable/script polyglot indicator", details: "Multiple independently meaningful executable or script format signatures occur in the same file.", severity: Severity::Medium, confidence: Confidence::Low, description: "Heuristic polyglot indicator; manual validation is required.".to_owned(), references: &["https://attack.mitre.org/techniques/T1027/"], properties, redacted: false, remediation: "Quarantine for manual analysis and verify the artifact against its trusted publisher.", cwe: None });
     }
     if bytes.starts_with(b"PK\x03\x04") {
-        scan_zip_bomb(bytes, config, builder);
+        scan_zip_bomb(bytes, builder);
     }
 }
 
+/// Magic-byte format table: `(magic, format name, optional embedded-scan
+/// name)`. Formats with an embedded name are additionally scanned for a
+/// second magic occurrence beyond the file header (polyglot indicator).
+const MAGIC_FORMATS: &[(&[u8], &str, Option<&str>)] = &[
+    (b"MZ", "pe", Some("embedded-pe")),
+    (b"\x7fELF", "elf", Some("embedded-elf")),
+    (b"#!", "script", None),
+    (b"PK\x03\x04", "zip", None),
+    (b"%PDF-", "pdf", None),
+];
+
 fn detected_formats(bytes: &[u8]) -> Vec<&'static str> {
-    let mut formats = Vec::new();
-    if bytes.starts_with(b"MZ") {
-        formats.push("pe");
-    }
-    if bytes.starts_with(b"\x7fELF") {
-        formats.push("elf");
-    }
-    if bytes.starts_with(b"#!") {
-        formats.push("script");
-    }
-    if bytes.starts_with(b"PK\x03\x04") {
-        formats.push("zip");
-    }
-    if bytes.starts_with(b"%PDF-") {
-        formats.push("pdf");
-    }
-    // An embedded signature identical to the container's own format is the
-    // same format twice, not an independently meaningful second signature;
-    // counting it would flag ordinary single-format executables as polyglots.
-    if bytes
-        .windows(2)
-        .skip(2)
-        .take(4096)
-        .any(|window| window == b"MZ")
-        && !formats.contains(&"pe")
-    {
-        formats.push("embedded-pe");
-    }
-    if bytes
-        .windows(4)
-        .skip(4)
-        .take(4096)
-        .any(|window| window == b"\x7fELF")
-        && !formats.contains(&"elf")
-    {
-        formats.push("embedded-elf");
+    let mut formats: Vec<&'static str> = Vec::new();
+    for (magic, format, embedded) in MAGIC_FORMATS {
+        if bytes.starts_with(magic) {
+            formats.push(format);
+        }
+        // An embedded signature identical to the container's own format is
+        // the same format twice, not an independently meaningful second
+        // signature; counting it would flag ordinary single-format
+        // executables as polyglots.
+        if let Some(embedded_format) = embedded {
+            let embedded_found = bytes
+                .windows(magic.len())
+                .skip(magic.len())
+                .take(4096)
+                .any(|window| window == *magic);
+            if embedded_found && !formats.contains(format) {
+                formats.push(embedded_format);
+            }
+        }
     }
     formats.sort_unstable();
     formats.dedup();
     formats
 }
 
-fn scan_zip_bomb(bytes: &[u8], config: &ScannerConfig, builder: &mut FindingBuilder<'_>) {
+fn scan_zip_bomb(bytes: &[u8], builder: &mut FindingBuilder<'_>) {
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
         return;
     };
@@ -2062,7 +2206,7 @@ fn scan_zip_bomb(bytes: &[u8], config: &ScannerConfig, builder: &mut FindingBuil
     let mut suspicious_entry = false;
     let inspected = archive
         .len()
-        .min(config.max_archive_entries.saturating_add(1));
+        .min(builder.ctx.config.max_archive_entries.saturating_add(1));
     for index in 0..inspected {
         let Ok(file) = archive.by_index(index) else {
             continue;
@@ -2073,8 +2217,8 @@ fn scan_zip_bomb(bytes: &[u8], config: &ScannerConfig, builder: &mut FindingBuil
             || (file.compressed_size() > 0
                 && file.size() / file.compressed_size() > ARCHIVE_RATIO_LIMIT);
     }
-    let too_many = archive.len() > config.max_archive_entries;
-    let too_large = total_uncompressed > config.max_archive_uncompressed_bytes;
+    let too_many = archive.len() > builder.ctx.config.max_archive_entries;
+    let too_large = total_uncompressed > builder.ctx.config.max_archive_uncompressed_bytes;
     let excessive_ratio =
         total_compressed > 0 && total_uncompressed / total_compressed > ARCHIVE_RATIO_LIMIT;
     if too_many || too_large || excessive_ratio || suspicious_entry {
@@ -2108,26 +2252,6 @@ fn indexed_line_column(starts: &[usize], offset: usize) -> (u32, u32) {
         u32::try_from(line_index + 1).unwrap_or(u32::MAX),
         u32::try_from(offset.saturating_sub(starts[line_index]) + 1).unwrap_or(u32::MAX),
     )
-}
-
-fn line_column(text: &str, offset: usize) -> (u32, u32) {
-    let prefix = &text[..offset.min(text.len())];
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
-    let column = prefix
-        .rsplit_once('\n')
-        .map_or(prefix.len(), |(_, tail)| tail.len()) as u32
-        + 1;
-    (line, column)
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
 }
 
 #[cfg(test)]
@@ -2171,7 +2295,7 @@ mod tests {
         assert!(evidence.redacted);
         assert_eq!(
             evidence.properties["fingerprint_sha256"],
-            hex_sha256(secret.as_bytes())
+            sha256_hex(secret.as_bytes())
         );
     }
 
@@ -2569,7 +2693,7 @@ mod tests {
     #[test]
     fn exact_malware_digest_match_is_high_confidence() {
         let bytes = b"known malicious fixture";
-        let digest = hex_sha256(bytes);
+        let digest = sha256_hex(bytes);
         let signatures = MalwareSignatures {
             sha256: BTreeMap::from([(digest.clone(), "fixture-family".to_owned())]),
         };
@@ -2663,7 +2787,7 @@ mod tests {
     #[test]
     fn binary_files_skip_text_analyzers_but_keep_hash_scanning() {
         let bytes = b"\0ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ";
-        let digest = hex_sha256(bytes);
+        let digest = sha256_hex(bytes);
         let signatures = MalwareSignatures {
             sha256: BTreeMap::from([(digest, "binary-fixture".to_owned())]),
         };
@@ -3157,5 +3281,26 @@ mod tests {
             signatures.validate(),
             Err(ScanError::InvalidSignatureDigest(_))
         ));
+    }
+
+    #[test]
+    fn unparseable_structured_iac_documents_are_surfaced() {
+        let partial = "apiVersion: v1\nkind: Pod\n---\n[1, 2\n";
+        let output = analyze("pod.yaml", partial);
+        assert!(has(&output, "iac.unparseable-document"));
+        assert!(has(
+            &analyze("broken.yaml", "{{{"),
+            "iac.unparseable-document"
+        ));
+        assert!(has(
+            &analyze("template.json", "{not json"),
+            "iac.unparseable-document"
+        ));
+        // Fully parseable files stay clean, including an empty document stream.
+        assert!(!has(
+            &analyze("ok.yaml", "apiVersion: v1\nkind: Pod\n"),
+            "iac.unparseable-document"
+        ));
+        assert!(!has(&analyze("empty.yaml", ""), "iac.unparseable-document"));
     }
 }

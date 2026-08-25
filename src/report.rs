@@ -12,13 +12,13 @@ use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::model::{
     ApplicabilityStatus, AssetKind, Component, ComponentId, Finding, FindingId, FindingStatus,
     Location, LocationId, PolicyDecision, PolicyOutcome, ScanReport, Scope, Severity, SourceKind,
 };
+use crate::util::sha256_hex;
 
 pub const CANONICAL_REPORT_VERSION: &str = "1.0.0";
 pub const MAX_REPORT_BYTES: usize = 64 * 1024 * 1024;
@@ -220,30 +220,21 @@ fn render_with_limit(
     report.validate()?;
     validate_limits(report)?;
     let sanitized = sanitize_report(report)?;
+    let index = ReportIndex::new(&sanitized);
     match format {
         ReportFormat::Json => render_json(&sanitized, limit),
         ReportFormat::Yaml => render_yaml(&sanitized, limit),
-        ReportFormat::Table => render_table(&sanitized, limit, &ReportIndex::new(&sanitized)),
-        ReportFormat::Sarif => render_sarif(&sanitized, limit, &ReportIndex::new(&sanitized)),
-        ReportFormat::GitLabSarif => {
-            render_gitlab_sarif(&sanitized, limit, &ReportIndex::new(&sanitized))
-        }
-        ReportFormat::Junit => render_junit(&sanitized, limit, &ReportIndex::new(&sanitized)),
-        ReportFormat::Html => render_html(&sanitized, limit, &ReportIndex::new(&sanitized)),
-        ReportFormat::CycloneDxVex => {
-            render_cyclonedx_vex(&sanitized, limit, &ReportIndex::new(&sanitized))
-        }
-        ReportFormat::GitLabCycloneDx => {
-            render_gitlab_cyclonedx(&sanitized, limit, &ReportIndex::new(&sanitized))
-        }
-        ReportFormat::Spdx => render_spdx(&sanitized, limit, &ReportIndex::new(&sanitized)),
-        ReportFormat::GitLabCodeQuality => {
-            render_gitlab(&sanitized, limit, &ReportIndex::new(&sanitized))
-        }
-        ReportFormat::JsonLines => {
-            render_json_lines(&sanitized, limit, &ReportIndex::new(&sanitized))
-        }
-        ReportFormat::Csv => render_csv(&sanitized, limit, &ReportIndex::new(&sanitized)),
+        ReportFormat::Table => render_table(&sanitized, limit, &index),
+        ReportFormat::Sarif => render_sarif(&sanitized, limit, &index),
+        ReportFormat::GitLabSarif => render_gitlab_sarif(&sanitized, limit, &index),
+        ReportFormat::Junit => render_junit(&sanitized, limit, &index),
+        ReportFormat::Html => render_html(&sanitized, limit, &index),
+        ReportFormat::CycloneDxVex => render_cyclonedx_vex(&sanitized, limit, &index),
+        ReportFormat::GitLabCycloneDx => render_gitlab_cyclonedx(&sanitized, limit),
+        ReportFormat::Spdx => render_spdx(&sanitized, limit, &index),
+        ReportFormat::GitLabCodeQuality => render_gitlab(&sanitized, limit, &index),
+        ReportFormat::JsonLines => render_json_lines(&sanitized, limit, &index),
+        ReportFormat::Csv => render_csv(&sanitized, limit, &index),
     }
 }
 
@@ -357,79 +348,6 @@ pub fn render_to_string(report: &ScanReport, format: ReportFormat) -> Result<Str
         .map_err(|error| ReportError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
 }
 
-pub fn write_atomic(
-    path: impl AsRef<Path>,
-    report: &ScanReport,
-    format: ReportFormat,
-) -> Result<(), ReportError> {
-    let bytes = render(report, format)?;
-    write_bytes_atomic(path.as_ref(), &bytes)
-}
-
-fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), ReportError> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "report path has no file name")
-    })?;
-    let mut temporary = PathBuf::from(parent);
-    temporary.push(format!(
-        ".{}.{}.tmp",
-        file_name.to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ));
-
-    let result = (|| -> Result<(), io::Error> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        replace_file(&temporary, path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        }
-        if let Ok(directory) = fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result.map_err(ReportError::Io)
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if error.kind() == io::ErrorKind::AlreadyExists
-                || error.kind() == io::ErrorKind::PermissionDenied =>
-        {
-            fs::remove_file(destination)?;
-            fs::rename(source, destination)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn write_gitlab_artifacts(
@@ -475,7 +393,7 @@ pub fn write_gitlab_artifacts(
         ),
         (
             "gl-sbom-hooray.cdx.json",
-            render_gitlab_cyclonedx(&report, MAX_REPORT_BYTES, &index)?,
+            render_gitlab_cyclonedx(&report, MAX_REPORT_BYTES)?,
         ),
         (
             "gl-junit-report.xml",
@@ -691,7 +609,7 @@ fn render_table(
                     &remediation
                         .fixed_versions
                         .iter()
-                        .cloned()
+                        .map(String::as_str)
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -1151,8 +1069,8 @@ fn canonical_sarif_rule_ids<'a>(
             let base = normalized_cve(finding.advisory_id.as_deref().unwrap_or(""))
                 .unwrap_or_else(|| finding.rule_id.as_str().to_owned());
             let id = if bases[&base].len() > 1 {
-                let digest = Sha256::digest(finding.rule_id.as_str().as_bytes());
-                format!("{base}-{}", hex_prefix(&digest, 8))
+                let digest = sha256_hex(finding.rule_id.as_str().as_bytes());
+                format!("{base}-{}", &digest[..16])
             } else {
                 base
             };
@@ -1211,23 +1129,10 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect()
 }
 
-fn hex_prefix(bytes: &[u8], count: usize) -> String {
-    bytes[..count]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-fn render_gitlab_cyclonedx(
-    report: &ScanReport,
-    limit: usize,
-    _index: &ReportIndex<'_>,
-) -> Result<Vec<u8>, ReportError> {
+fn render_gitlab_cyclonedx(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
     let asset_ref = format!(
         "asset:{}",
-        Sha256::digest(report.inventory.asset.id.as_str().as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+        sha256_hex(report.inventory.asset.id.as_str().as_bytes())
     );
     let mut metadata_component = json!({
         "type": cyclonedx_asset_type(report.inventory.asset.kind),
@@ -1257,7 +1162,38 @@ fn render_gitlab_cyclonedx(
         if let Some(licenses) = cyclonedx_licenses(component) { value["licenses"] = licenses; }
         value
     }).collect();
-    let dependencies: Vec<Value> = report
+    let mut document = cdx_envelope(report, metadata_component);
+    document["components"] = Value::Array(components);
+    document["metadata"]["properties"] =
+        json!([{"name": "gitlab:meta:schema_version", "value": "1"}]);
+    pretty_json(&document, limit)
+}
+
+fn cyclonedx_asset_type(kind: AssetKind) -> &'static str {
+    match kind {
+        AssetKind::Repository | AssetKind::Other => "application",
+        AssetKind::Filesystem => "file",
+        AssetKind::ContainerImage => "container",
+        AssetKind::Sbom => "data",
+        AssetKind::Package => "library",
+    }
+}
+
+fn cdx_envelope(report: &ScanReport, component: Value) -> Value {
+    json!({
+        "$schema": "https://cyclonedx.org/schema/bom-1.6.schema.json", "bomFormat": "CycloneDX", "specVersion": "1.6",
+        "serialNumber": format!("urn:uuid:{}", deterministic_uuid(report.run.id.as_str())), "version": 1,
+        "metadata": {
+            "timestamp": report.run.started_at,
+            "tools": {"components": [{"type": "application", "name": "hooray", "version": report.run.scanner_version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))}]},
+            "component": component
+        },
+        "components": [], "dependencies": cdx_dependencies(report)
+    })
+}
+
+fn cdx_dependencies(report: &ScanReport) -> Vec<Value> {
+    report
         .inventory
         .components
         .keys()
@@ -1271,31 +1207,7 @@ fn render_gitlab_cyclonedx(
                 .collect();
             json!({"ref": id.as_str(), "dependsOn": depends_on})
         })
-        .collect();
-    pretty_json(
-        &json!({
-            "$schema": "https://cyclonedx.org/schema/bom-1.6.schema.json", "bomFormat": "CycloneDX", "specVersion": "1.6",
-            "serialNumber": format!("urn:uuid:{}", deterministic_uuid(report.run.id.as_str())), "version": 1,
-            "metadata": {
-                "timestamp": report.run.started_at,
-                "tools": {"components": [{"type": "application", "name": "hooray", "version": report.run.scanner_version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))}]},
-                "component": metadata_component,
-                "properties": [{"name": "gitlab:meta:schema_version", "value": "1"}]
-            },
-            "components": components, "dependencies": dependencies
-        }),
-        limit,
-    )
-}
-
-fn cyclonedx_asset_type(kind: AssetKind) -> &'static str {
-    match kind {
-        AssetKind::Repository | AssetKind::Other => "application",
-        AssetKind::Filesystem => "file",
-        AssetKind::ContainerImage => "container",
-        AssetKind::Sbom => "data",
-        AssetKind::Package => "library",
-    }
+        .collect()
 }
 
 fn gitlab_package_metadata(purl: &str) -> Option<(&'static str, &'static str)> {
@@ -1509,31 +1421,15 @@ fn render_cyclonedx_vex(
             "advisories": advisories, "analysis": analysis, "affects": affects, "properties": properties
         })
     }).collect();
-    let dependencies: Vec<Value> = report
-        .inventory
-        .components
-        .keys()
-        .map(|id| {
-            let depends_on: Vec<&str> = report
-                .inventory
-                .dependencies
-                .iter()
-                .filter(|edge| &edge.from == id)
-                .map(|edge| edge.to.as_str())
-                .collect();
-            json!({"ref": id.as_str(), "dependsOn": depends_on})
-        })
-        .collect();
-    pretty_json(
-        &json!({
-            "$schema": "https://cyclonedx.org/schema/bom-1.6.schema.json", "bomFormat": "CycloneDX", "specVersion": "1.6",
-            "serialNumber": format!("urn:uuid:{}", deterministic_uuid(report.run.id.as_str())), "version": 1,
-            "metadata": {"timestamp": report.run.started_at, "tools": {"components": [{"type": "application", "name": "hooray", "version": report.run.scanner_version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))}]},
-                "component": {"type": "application", "bom-ref": report.inventory.asset.id.as_str(), "name": report.inventory.asset.name, "version": report.inventory.asset.version.as_deref().unwrap_or("unknown")}},
-            "components": components, "dependencies": dependencies, "vulnerabilities": vulnerabilities
+    let mut document = cdx_envelope(
+        report,
+        json!({
+            "type": "application", "bom-ref": report.inventory.asset.id.as_str(), "name": report.inventory.asset.name, "version": report.inventory.asset.version.as_deref().unwrap_or("unknown")
         }),
-        limit,
-    )
+    );
+    document["components"] = Value::Array(components);
+    document["vulnerabilities"] = Value::Array(vulnerabilities);
+    pretty_json(&document, limit)
 }
 
 fn render_spdx(
@@ -1994,7 +1890,7 @@ fn finding_detail_text(index: &ReportIndex<'_>, finding: &Finding) -> String {
                 remediation
                     .fixed_versions
                     .iter()
-                    .cloned()
+                    .map(String::as_str)
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -2020,7 +1916,7 @@ fn finding_detail_text(index: &ReportIndex<'_>, finding: &Finding) -> String {
     lines.join("\n")
 }
 
-fn sarif_level(severity: Severity) -> &'static str {
+pub(crate) fn sarif_level(severity: Severity) -> &'static str {
     match severity {
         Severity::Critical | Severity::High => "error",
         Severity::Medium => "warning",
@@ -2090,25 +1986,31 @@ fn is_valid_xml_char(character: char) -> bool {
         || matches!(character as u32, 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)
 }
 
+fn percent_encode(value: &str, keep: fn(u8) -> bool) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if keep(byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn is_path_uri_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~')
+}
+
 fn path_uri(path: &str) -> String {
-    path.bytes()
-        .flat_map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~') {
-                vec![char::from(byte)]
-            } else {
-                format!("%{byte:02X}").chars().collect()
-            }
-        })
-        .collect()
+    percent_encode(path, is_path_uri_byte)
 }
 
 fn url_segment(value: &str) -> String {
-    path_uri(value).replace('/', "%2F")
+    percent_encode(value, |byte| is_path_uri_byte(byte) && byte != b'/')
 }
 
 fn spdx_id(value: &str) -> String {
-    use sha2::{Digest, Sha256};
-
     let body: String = value
         .chars()
         .map(|character| {
@@ -2119,11 +2021,7 @@ fn spdx_id(value: &str) -> String {
             }
         })
         .collect();
-    let digest = Sha256::digest(value.as_bytes());
-    let suffix: String = digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let suffix = &sha256_hex(value.as_bytes())[..32];
     format!("SPDXRef-{body}-{suffix}")
 }
 
@@ -2949,30 +2847,6 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".hooray-gitlab-")
-        }));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_writer_replaces_target_with_private_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("report.json");
-        fs::write(&path, b"old").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        write_atomic(&path, &fixture(), ReportFormat::Json).unwrap();
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(value["format_version"], CANONICAL_REPORT_VERSION);
-        assert!(directory.path().read_dir().unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp")
         }));
     }
 }

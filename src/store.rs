@@ -1,7 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::Path,
     time::Duration,
 };
 
@@ -62,6 +61,8 @@ pub enum StoreError {
     },
     #[error("stored version is outside the supported range")]
     VersionOverflow,
+    #[error("expected a string scalar, found {0}")]
+    UnexpectedScalar(JsonValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,20 +184,40 @@ pub struct MonitorEventFilter {
     pub include_dead_lettered: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct StoreFactory {
-    path: Arc<PathBuf>,
+/// Write-side metadata shared by every versioned document put.
+struct DocumentWrite<'a> {
+    expires_at: Option<&'a str>,
+    expected_version: u64,
+    updated_at: &'a str,
+    updated_by: &'a str,
 }
 
-impl StoreFactory {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: Arc::new(path.into()),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentKind {
+    Policy,
+    Exception,
+}
+
+impl DocumentKind {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Policy => "policy_documents",
+            Self::Exception => "policy_exceptions",
         }
     }
 
-    pub fn open(&self) -> Result<Store, StoreError> {
-        Store::open(self.path.as_ref())
+    fn id_column(self) -> &'static str {
+        match self {
+            Self::Policy => "document_id",
+            Self::Exception => "exception_id",
+        }
+    }
+
+    fn resource_type(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::Exception => "exception",
+        }
     }
 }
 
@@ -492,10 +513,10 @@ impl Store {
     }
 
     pub fn get_policy(&self, id: &str) -> Result<Option<VersionedDocument>, StoreError> {
-        self.get_document("policy_documents", "document_id", id)
+        self.get_document(DocumentKind::Policy, id)
     }
     pub fn get_exception(&self, id: &str) -> Result<Option<VersionedDocument>, StoreError> {
-        self.get_document("policy_exceptions", "exception_id", id)
+        self.get_document(DocumentKind::Exception, id)
     }
 
     pub fn put_policy(
@@ -507,15 +528,15 @@ impl Store {
         updated_by: &str,
     ) -> Result<VersionedDocument, StoreError> {
         self.put_document(
-            "policy_documents",
-            "document_id",
-            "policy",
+            DocumentKind::Policy,
             id,
             document,
-            None,
-            expected_version,
-            updated_at,
-            updated_by,
+            DocumentWrite {
+                expires_at: None,
+                expected_version,
+                updated_at,
+                updated_by,
+            },
         )
     }
 
@@ -529,26 +550,27 @@ impl Store {
         updated_by: &str,
     ) -> Result<VersionedDocument, StoreError> {
         self.put_document(
-            "policy_exceptions",
-            "exception_id",
-            "exception",
+            DocumentKind::Exception,
             id,
             document,
-            expires_at,
-            expected_version,
-            updated_at,
-            updated_by,
+            DocumentWrite {
+                expires_at,
+                expected_version,
+                updated_at,
+                updated_by,
+            },
         )
     }
 
     fn get_document(
         &self,
-        table: &'static str,
-        id_column: &'static str,
+        kind: DocumentKind,
         id: &str,
     ) -> Result<Option<VersionedDocument>, StoreError> {
         let sql = format!(
-            "SELECT version,document_json,updated_at,updated_by FROM {table} WHERE {id_column}=?1"
+            "SELECT version,document_json,updated_at,updated_by FROM {} WHERE {}=?1",
+            kind.table(),
+            kind.id_column()
         );
         let row = self
             .connection
@@ -573,26 +595,31 @@ impl Store {
         .transpose()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn put_document(
         &mut self,
-        table: &'static str,
-        id_column: &'static str,
-        resource_type: &'static str,
+        kind: DocumentKind,
         id: &str,
         document: &JsonValue,
-        expires_at: Option<&str>,
-        expected_version: u64,
-        updated_at: &str,
-        updated_by: &str,
+        write: DocumentWrite<'_>,
     ) -> Result<VersionedDocument, StoreError> {
+        let DocumentWrite {
+            expires_at,
+            expected_version,
+            updated_at,
+            updated_by,
+        } = write;
+        let resource_type = kind.resource_type();
         let json = serde_json::to_string(document)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current: Option<i64> = transaction
             .query_row(
-                &format!("SELECT version FROM {table} WHERE {id_column}=?1"),
+                &format!(
+                    "SELECT version FROM {} WHERE {}=?1",
+                    kind.table(),
+                    kind.id_column()
+                ),
                 [id],
                 |row| row.get(0),
             )
@@ -612,10 +639,13 @@ impl Store {
             .checked_add(1)
             .ok_or(StoreError::VersionOverflow)?;
         let version_i64 = i64::try_from(version).map_err(|_| StoreError::VersionOverflow)?;
-        if table == "policy_exceptions" {
-            transaction.execute("INSERT INTO policy_exceptions(exception_id,version,document_json,expires_at,updated_at,updated_by) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(exception_id) DO UPDATE SET version=excluded.version,document_json=excluded.document_json,expires_at=excluded.expires_at,updated_at=excluded.updated_at,updated_by=excluded.updated_by",params![id,version_i64,json,expires_at,updated_at,updated_by])?;
-        } else {
-            transaction.execute("INSERT INTO policy_documents(document_id,version,document_json,updated_at,updated_by) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(document_id) DO UPDATE SET version=excluded.version,document_json=excluded.document_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by",params![id,version_i64,json,updated_at,updated_by])?;
+        match kind {
+            DocumentKind::Exception => {
+                transaction.execute("INSERT INTO policy_exceptions(exception_id,version,document_json,expires_at,updated_at,updated_by) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(exception_id) DO UPDATE SET version=excluded.version,document_json=excluded.document_json,expires_at=excluded.expires_at,updated_at=excluded.updated_at,updated_by=excluded.updated_by",params![id,version_i64,json,expires_at,updated_at,updated_by])?;
+            }
+            DocumentKind::Policy => {
+                transaction.execute("INSERT INTO policy_documents(document_id,version,document_json,updated_at,updated_by) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(document_id) DO UPDATE SET version=excluded.version,document_json=excluded.document_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by",params![id,version_i64,json,updated_at,updated_by])?;
+            }
         }
         transaction.execute("INSERT INTO audit_events(event_id,occurred_at,actor,action,resource_type,resource_id,details_json) VALUES (?1,?2,?3,'document.put',?4,?5,json_object('version',?6))",params![format!("{resource_type}:{id}:{version}"),updated_at,updated_by,resource_type,id,version_i64])?;
         transaction.commit()?;
@@ -666,19 +696,19 @@ impl Store {
     }
 
     pub fn upsert_monitor_target(&mut self, target: &MonitorTarget) -> Result<(), StoreError> {
-        let findings = serde_json::to_string(&target.finding_ids)?;
-        let inventory = target
-            .inventory
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let interval =
-            i64::try_from(target.interval_seconds).map_err(|_| StoreError::VersionOverflow)?;
-        self.connection.execute("INSERT INTO monitor_targets(target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(target_id) DO UPDATE SET source=excluded.source,interval_seconds=excluded.interval_seconds,next_due_at=excluded.next_due_at,source_fingerprint=excluded.source_fingerprint,inventory_json=excluded.inventory_json,advisory_digest=excluded.advisory_digest,policy_digest=excluded.policy_digest,finding_ids_json=excluded.finding_ids_json,updated_at=excluded.updated_at",params![target.target_id,target.source,interval,target.next_due_at,target.source_fingerprint,inventory,target.advisory_digest,target.policy_digest,findings,target.updated_at])?;
+        let enc = encode_monitor_target(target)?;
+        self.connection.execute("INSERT INTO monitor_targets(target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(target_id) DO UPDATE SET source=excluded.source,interval_seconds=excluded.interval_seconds,next_due_at=excluded.next_due_at,source_fingerprint=excluded.source_fingerprint,inventory_json=excluded.inventory_json,advisory_digest=excluded.advisory_digest,policy_digest=excluded.policy_digest,finding_ids_json=excluded.finding_ids_json,updated_at=excluded.updated_at",params![target.target_id,target.source,enc.interval_seconds,target.next_due_at,target.source_fingerprint,enc.inventory_json,target.advisory_digest,target.policy_digest,enc.findings_json,target.updated_at])?;
         Ok(())
     }
     pub fn get_monitor_target(&self, id: &str) -> Result<Option<MonitorTarget>, StoreError> {
-        self.connection.query_row("SELECT target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at FROM monitor_targets WHERE target_id=?1",[id],read_monitor_target).optional().map_err(Into::into)
+        self.connection
+            .query_row(
+                &format!("SELECT {MONITOR_TARGET_COLUMNS} FROM monitor_targets WHERE target_id=?1"),
+                [id],
+                read_monitor_target,
+            )
+            .optional()
+            .map_err(Into::into)
     }
     pub fn list_due_monitor_targets(
         &self,
@@ -687,20 +717,13 @@ impl Store {
         offset: u64,
     ) -> Result<Vec<MonitorTarget>, StoreError> {
         let (limit, offset) = pagination(limit, offset)?;
-        let mut s=self.connection.prepare("SELECT target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at FROM monitor_targets WHERE next_due_at<=?1 ORDER BY next_due_at,target_id LIMIT ?2 OFFSET ?3")?;
+        let mut s=self.connection.prepare(&format!("SELECT {MONITOR_TARGET_COLUMNS} FROM monitor_targets WHERE next_due_at<=?1 ORDER BY next_due_at,target_id LIMIT ?2 OFFSET ?3"))?;
         let rows = s.query_map(params![through, limit, offset], read_monitor_target)?;
         collect_sql_rows(rows)
     }
     pub fn update_monitor_target(&mut self, target: &MonitorTarget) -> Result<bool, StoreError> {
-        let findings = serde_json::to_string(&target.finding_ids)?;
-        let inventory = target
-            .inventory
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let interval =
-            i64::try_from(target.interval_seconds).map_err(|_| StoreError::VersionOverflow)?;
-        Ok(self.connection.execute("UPDATE monitor_targets SET source=?2,interval_seconds=?3,next_due_at=?4,source_fingerprint=?5,inventory_json=?6,advisory_digest=?7,policy_digest=?8,finding_ids_json=?9,updated_at=?10 WHERE target_id=?1",params![target.target_id,target.source,interval,target.next_due_at,target.source_fingerprint,inventory,target.advisory_digest,target.policy_digest,findings,target.updated_at])?==1)
+        let enc = encode_monitor_target(target)?;
+        Ok(self.connection.execute("UPDATE monitor_targets SET source=?2,interval_seconds=?3,next_due_at=?4,source_fingerprint=?5,inventory_json=?6,advisory_digest=?7,policy_digest=?8,finding_ids_json=?9,updated_at=?10 WHERE target_id=?1",params![target.target_id,target.source,enc.interval_seconds,target.next_due_at,target.source_fingerprint,enc.inventory_json,target.advisory_digest,target.policy_digest,enc.findings_json,target.updated_at])?==1)
     }
     pub fn add_monitor_target(&mut self, target: &MonitorTarget) -> Result<(), StoreError> {
         if target.target_id.trim().is_empty() {
@@ -728,15 +751,8 @@ impl Store {
                 target_id: target.target_id.clone(),
             });
         }
-        let findings = serde_json::to_string(&target.finding_ids)?;
-        let inventory = target
-            .inventory
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let interval =
-            i64::try_from(target.interval_seconds).map_err(|_| StoreError::VersionOverflow)?;
-        if let Err(error) = self.connection.execute("INSERT INTO monitor_targets(target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![target.target_id,target.source,interval,target.next_due_at,target.source_fingerprint,inventory,target.advisory_digest,target.policy_digest,findings,target.updated_at]) {
+        let enc = encode_monitor_target(target)?;
+        if let Err(error) = self.connection.execute("INSERT INTO monitor_targets(target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![target.target_id,target.source,enc.interval_seconds,target.next_due_at,target.source_fingerprint,enc.inventory_json,target.advisory_digest,target.policy_digest,enc.findings_json,target.updated_at]) {
             // All CHECK constraints are pre-validated above and existence was
             // rejected before the insert, so a constraint violation here can
             // only be the primary key (for example a concurrent registration).
@@ -755,7 +771,7 @@ impl Store {
         offset: u64,
     ) -> Result<Vec<MonitorTarget>, StoreError> {
         let (limit, offset) = pagination(limit, offset)?;
-        let mut s=self.connection.prepare("SELECT target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at FROM monitor_targets ORDER BY target_id LIMIT ?1 OFFSET ?2")?;
+        let mut s=self.connection.prepare(&format!("SELECT {MONITOR_TARGET_COLUMNS} FROM monitor_targets ORDER BY target_id LIMIT ?1 OFFSET ?2"))?;
         let rows = s.query_map(params![limit, offset], read_monitor_target)?;
         collect_sql_rows(rows)
     }
@@ -795,17 +811,48 @@ impl Store {
                 .query_map(params![due_through, limit], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        for event_id in &event_ids {
-            transaction.execute(
-                "UPDATE monitor_events SET next_attempt_at=?2 WHERE event_id=?1 AND coalesce(next_attempt_at,created_at)<=?3 AND delivered_at IS NULL AND dead_lettered_at IS NULL",
-                params![event_id, lease_until, due_through],
-            )?;
+        if event_ids.is_empty() {
+            transaction.commit()?;
+            return Ok(Vec::new());
         }
+        // Set-based claim: one UPDATE and one SELECT regardless of batch size.
+        // Lease predicates mirror the due SELECT so rows claimed concurrently
+        // in between are skipped.
+        let placeholders = vec!["?"; event_ids.len()].join(",");
+        transaction.execute(
+            &format!(
+                "UPDATE monitor_events SET next_attempt_at=?1 WHERE event_id IN ({placeholders}) AND coalesce(next_attempt_at,created_at)<=?{due} AND delivered_at IS NULL AND dead_lettered_at IS NULL",
+                due = event_ids.len() + 2,
+            ),
+            params_from_iter(
+                std::iter::once(lease_until)
+                    .chain(event_ids.iter().map(String::as_str))
+                    .chain(std::iter::once(due_through)),
+            ),
+        )?;
         let mut events = Vec::with_capacity(event_ids.len());
         {
-            let mut statement = transaction.prepare("SELECT event_id,target_id,dedupe_key,kind,payload_json,created_at,attempts,next_attempt_at,delivered_at,dead_lettered_at,last_error FROM monitor_events WHERE event_id=?1")?;
-            for event_id in event_ids {
-                events.push(statement.query_row([event_id], read_monitor_event)?);
+            let mut statement = transaction.prepare(&format!(
+                "SELECT event_id,target_id,dedupe_key,kind,payload_json,created_at,attempts,next_attempt_at,delivered_at,dead_lettered_at,last_error FROM monitor_events WHERE event_id IN ({placeholders})"
+            ))?;
+            let rows = statement.query_map(
+                params_from_iter(event_ids.iter().map(String::as_str)),
+                read_monitor_event,
+            )?;
+            let mut claimed: HashMap<String, MonitorEvent> =
+                HashMap::with_capacity(event_ids.len());
+            for row in rows {
+                let event = row?;
+                claimed.insert(event.event_id.clone(), event);
+            }
+            for id in &event_ids {
+                // Rows cannot disappear here: ids were selected, updated, and
+                // re-read inside this same Immediate transaction.
+                events.push(
+                    claimed
+                        .remove(id)
+                        .expect("claimed monitor event vanished inside its own transaction"),
+                );
             }
         }
         transaction.commit()?;
@@ -1009,9 +1056,11 @@ fn insert_report(
     }
     Ok(())
 }
-fn json_scalar<T: Serialize>(v: &T) -> Result<String, serde_json::Error> {
-    let value = serde_json::to_value(v)?;
-    Ok(value.as_str().unwrap_or_default().to_owned())
+fn json_scalar<T: Serialize>(v: &T) -> Result<String, StoreError> {
+    match serde_json::to_value(v)? {
+        JsonValue::String(value) => Ok(value),
+        other => Err(StoreError::UnexpectedScalar(other)),
+    }
 }
 fn pagination(limit: u32, offset: u64) -> Result<(i64, i64), StoreError> {
     if limit == 0 || limit > MAX_PAGE_SIZE {
@@ -1092,6 +1141,28 @@ fn monitor_data_error(index: usize, error: impl std::fmt::Display) -> rusqlite::
         rusqlite::types::Type::Text,
         Box::new(StoreError::InvalidMonitorData(error.to_string())),
     )
+}
+const MONITOR_TARGET_COLUMNS: &str = "target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at";
+
+/// Precomputed column values for a [`MonitorTarget`] write: everything that
+/// needs serialization or range conversion before it can be bound.
+struct MonitorTargetEnc {
+    interval_seconds: i64,
+    inventory_json: Option<String>,
+    findings_json: String,
+}
+
+fn encode_monitor_target(t: &MonitorTarget) -> Result<MonitorTargetEnc, StoreError> {
+    Ok(MonitorTargetEnc {
+        interval_seconds: i64::try_from(t.interval_seconds)
+            .map_err(|_| StoreError::VersionOverflow)?,
+        inventory_json: t
+            .inventory
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+        findings_json: serde_json::to_string(&t.finding_ids)?,
+    })
 }
 fn read_monitor_target(r: &rusqlite::Row<'_>) -> Result<MonitorTarget, rusqlite::Error> {
     let interval: i64 = r.get(2)?;
@@ -1537,19 +1608,20 @@ mod tests {
     fn factory_connections_handle_busy_without_corruption() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("db");
-        let factory = StoreFactory::new(path);
-        let mut first = factory.open().unwrap();
-        let second = factory.clone();
+        let mut first = Store::open(&path).unwrap();
         let tx = first.connection.transaction().unwrap();
         tx.execute("INSERT INTO audit_events(event_id,occurred_at,actor,action,resource_type,resource_id,details_json) VALUES ('held','t','a','x','r','1','{}')",[]).unwrap();
-        let handle = thread::spawn(move || {
-            let mut s = second.open().unwrap();
-            s.put_policy("p", &serde_json::json!({}), 0, "t2", "a")
-        });
+        let handle = {
+            let path = path.clone();
+            thread::spawn(move || {
+                let mut s = Store::open(&path).unwrap();
+                s.put_policy("p", &serde_json::json!({}), 0, "t2", "a")
+            })
+        };
         thread::sleep(Duration::from_millis(50));
         tx.commit().unwrap();
         assert!(handle.join().unwrap().is_ok());
-        let s = factory.open().unwrap();
+        let s = Store::open(&path).unwrap();
         assert_eq!(s.get_policy("p").unwrap().unwrap().version, 1);
         assert_eq!(
             s.connection
@@ -1566,8 +1638,7 @@ mod tests {
             Store::open(dir.path()),
             Err(StoreError::Sqlite(_))
         ));
-        let factory = StoreFactory::new(&path);
-        let mut first = factory.open().unwrap();
+        let mut first = Store::open(&path).unwrap();
         assert_eq!(first.latest_run().unwrap(), None);
         let original = rich_report("run:file", "2026-01-01Z", "asset:file");
         first.save_report(&original).unwrap();
@@ -1598,7 +1669,10 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(factory.open().unwrap().list_runs(10, 0).unwrap().len(), 1);
+        assert_eq!(
+            Store::open(&path).unwrap().list_runs(10, 0).unwrap().len(),
+            1
+        );
     }
 
     #[test]

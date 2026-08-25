@@ -1,7 +1,6 @@
 use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::model::{FindingId, Inventory};
@@ -219,6 +218,13 @@ impl MonitorConfig {
     }
 }
 
+/// One target whose cycle failed and was rescheduled, carrying its redacted error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetFailure {
+    pub target_id: String,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunSummary {
     pub targets_considered: usize,
@@ -229,6 +235,8 @@ pub struct RunSummary {
     pub events_retried: usize,
     pub events_dead_lettered: usize,
     pub records_pruned: usize,
+    /// Targets rescheduled after a failed cycle, most recent cycle first.
+    pub target_failures: Vec<TargetFailure>,
 }
 
 #[derive(Debug, Error)]
@@ -496,7 +504,7 @@ fn event_from_store(event: crate::store::MonitorEvent) -> Result<AlertEvent, Mon
     })
 }
 
-fn encode_time(timestamp: i64) -> String {
+pub fn encode_time(timestamp: i64) -> String {
     format!("{:020}", (timestamp as u64) ^ (1_u64 << 63))
 }
 
@@ -547,12 +555,9 @@ where
         })
     }
 
+    #[cfg(test)]
     pub fn repository(&self) -> &R {
         &self.repository
-    }
-
-    pub fn repository_mut(&mut self) -> &mut R {
-        &mut self.repository
     }
 
     pub async fn run_once(&mut self) -> Result<RunSummary, MonitorError> {
@@ -575,12 +580,16 @@ where
             (left.next_due_at, &left.id).cmp(&(right.next_due_at, &right.id))
         });
         for mut target in targets {
-            if target.validate().is_err() {
+            if let Err(error) = target.validate() {
                 // A stored target that no longer validates (for example an
                 // out-of-range interval registered before ingress validation
                 // existed) must not abort the whole cycle: reschedule it like
                 // other per-target failures so remaining targets, delivery,
                 // and pruning still proceed instead of starving forever.
+                summary.target_failures.push(TargetFailure {
+                    target_id: target.id.clone(),
+                    error: redact_error(&error.to_string()),
+                });
                 target.next_due_at = now.saturating_add(self.config.retry.initial_backoff_seconds);
                 target.updated_at = now;
                 self.repository.save_target(&target)?;
@@ -589,7 +598,11 @@ where
             summary.targets_considered += 1;
             let fingerprint = match self.runner.source_fingerprint(&target).await {
                 Ok(fingerprint) => fingerprint,
-                Err(_) => {
+                Err(error) => {
+                    summary.target_failures.push(TargetFailure {
+                        target_id: target.id.clone(),
+                        error: redact_error(&error.to_string()),
+                    });
                     target.next_due_at =
                         now.saturating_add(self.config.retry.initial_backoff_seconds);
                     target.updated_at = now;
@@ -651,7 +664,11 @@ where
                         target.finding_ids = evaluation.finding_ids;
                         evaluation.inventory
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        summary.target_failures.push(TargetFailure {
+                            target_id: target.id.clone(),
+                            error: redact_error(&error.to_string()),
+                        });
                         target.next_due_at =
                             now.saturating_add(self.config.retry.initial_backoff_seconds);
                         target.updated_at = now;
@@ -764,7 +781,7 @@ fn advance_due(previous_due: i64, interval: i64, now: i64) -> i64 {
 fn digest_json(value: &impl Serialize) -> Result<String, MonitorError> {
     let bytes =
         serde_json::to_vec(value).map_err(|error| MonitorError::Persistence(error.to_string()))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(crate::util::sha256_hex(&bytes))
 }
 
 fn validate_text(field: &'static str, value: &str, maximum: usize) -> Result<(), MonitorError> {
@@ -793,7 +810,7 @@ fn redact_error(error: &str) -> String {
         .chars()
         .take(MAX_ERROR_BYTES)
         .map(|character| {
-            if character.is_control() && character != ' ' {
+            if character.is_control() {
                 ' '
             } else {
                 character
@@ -1000,6 +1017,8 @@ mod tests {
         refreshes: Mutex<VecDeque<AdvisoryRefresh>>,
         policy: Mutex<String>,
         fingerprint: Mutex<String>,
+        fingerprint_error: Mutex<Option<String>>,
+        evaluation_error: Mutex<Option<String>>,
         findings: Mutex<BTreeSet<FindingId>>,
         scans: AtomicUsize,
         evaluations: AtomicUsize,
@@ -1012,6 +1031,8 @@ mod tests {
                 refreshes: Mutex::new(VecDeque::from([refresh("cursor-1", "adv-1", true)])),
                 policy: Mutex::new("policy-1".into()),
                 fingerprint: Mutex::new("source-1".into()),
+                fingerprint_error: Mutex::new(None),
+                evaluation_error: Mutex::new(None),
                 findings: Mutex::new(ids(&["finding-a"])),
                 scans: AtomicUsize::new(0),
                 evaluations: AtomicUsize::new(0),
@@ -1045,7 +1066,12 @@ mod tests {
             &'a self,
             _target: &'a MonitorTarget,
         ) -> MonitorFuture<'a, Result<String, MonitorError>> {
-            Box::pin(async move { Ok(self.fingerprint.lock().unwrap().clone()) })
+            Box::pin(async move {
+                if let Some(error) = self.fingerprint_error.lock().unwrap().clone() {
+                    return Err(MonitorError::Runner(error));
+                }
+                Ok(self.fingerprint.lock().unwrap().clone())
+            })
         }
         fn evaluate<'a>(
             &'a self,
@@ -1054,6 +1080,9 @@ mod tests {
             Box::pin(async move {
                 self.scans.fetch_add(1, Ordering::SeqCst);
                 self.evaluations.fetch_add(1, Ordering::SeqCst);
+                if let Some(error) = self.evaluation_error.lock().unwrap().clone() {
+                    return Err(MonitorError::Runner(error));
+                }
                 Ok(Evaluation {
                     inventory: inventory(),
                     finding_ids: self.findings.lock().unwrap().clone(),
@@ -1215,9 +1244,57 @@ mod tests {
         let summary = service.run_once().await.unwrap();
         assert_eq!(summary.targets_considered, 1);
         assert_eq!(runner.evaluations.load(Ordering::SeqCst), 1);
+        assert_eq!(summary.target_failures.len(), 1);
+        assert_eq!(summary.target_failures[0].target_id, "poisoned");
+        assert_eq!(
+            summary.target_failures[0].error,
+            "monitor interval must be between 1 and 86400 seconds, got 86401"
+        );
         let targets = &service.repository().targets;
         assert_eq!(targets["healthy"].next_due_at, 110);
         assert!(targets["poisoned"].next_due_at > 100);
+    }
+
+    #[tokio::test]
+    async fn failed_scan_cycles_record_redacted_target_errors() {
+        let mut repository = MemoryRepository::default();
+        repository.targets.insert("target".into(), target(100));
+        let clock = Arc::new(FakeClock::new(100));
+        let runner = Arc::new(FakeRunner::new());
+        let notifier = Arc::new(FakeNotifier::succeeding());
+        let mut service = service(
+            repository,
+            clock.clone(),
+            runner.clone(),
+            notifier,
+            RetryPolicy::default(),
+        );
+        *runner.fingerprint_error.lock().unwrap() = Some("source unreachable token=abc123".into());
+        let summary = service.run_once().await.unwrap();
+        assert_eq!(summary.targets_considered, 1);
+        assert_eq!(summary.events_created, 0);
+        assert_eq!(summary.target_failures.len(), 1);
+        assert_eq!(
+            summary.target_failures[0],
+            TargetFailure {
+                target_id: "target".into(),
+                error: "monitor runner failed: source unreachable token=[REDACTED]".into(),
+            }
+        );
+        assert_eq!(service.repository().targets["target"].next_due_at, 105);
+
+        *runner.fingerprint_error.lock().unwrap() = None;
+        *runner.evaluation_error.lock().unwrap() =
+            Some("evaluation exploded password=hunter2".into());
+        clock.set(110);
+        let second = service.run_once().await.unwrap();
+        assert_eq!(second.targets_considered, 1);
+        assert_eq!(second.target_failures.len(), 1);
+        assert_eq!(
+            second.target_failures[0].error,
+            "monitor runner failed: evaluation exploded password=[REDACTED]"
+        );
+        assert_eq!(service.repository().targets["target"].next_due_at, 115);
     }
     #[tokio::test]
     async fn daemon_survives_transient_cycle_failures_and_retries() {

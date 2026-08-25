@@ -321,15 +321,7 @@ fn parse_pep440(value: &str) -> Option<VersionKey> {
     } else {
         (0, value)
     };
-    let release_end = value
-        .char_indices()
-        .find_map(|(index, character)| {
-            (!character.is_ascii_digit() && character != '.').then_some(index)
-        })
-        .unwrap_or(value.len());
-    let release = parse_numeric_release(value[..release_end].trim_end_matches('.'))?;
-    let suffix_text = value[release_end..].trim_matches(['.', '-', '_']);
-    let parts = tokenize(suffix_text)?;
+    let (release, parts) = split_release_and_suffix(value)?;
     let mut pre = None;
     let mut post = None;
     let mut dev = None;
@@ -367,14 +359,7 @@ fn parse_pep440(value: &str) -> Option<VersionKey> {
 
 fn parse_maven(value: &str) -> Option<VersionKey> {
     let value = value.trim().split('+').next()?.to_ascii_lowercase();
-    let release_end = value
-        .char_indices()
-        .find_map(|(index, character)| {
-            (!character.is_ascii_digit() && character != '.').then_some(index)
-        })
-        .unwrap_or(value.len());
-    let release = parse_numeric_release(value[..release_end].trim_end_matches('.'))?;
-    let mut suffix = tokenize(value[release_end..].trim_matches(['.', '-', '_']))?;
+    let (release, mut suffix) = split_release_and_suffix(&value)?;
     suffix.retain(|part| {
         !matches!(part, VersionPart::Text(value) if matches!(value.as_str(), "final" | "ga" | "release"))
     });
@@ -383,6 +368,21 @@ fn parse_maven(value: &str) -> Option<VersionKey> {
         release,
         suffix: VersionSuffix::Maven(suffix),
     })
+}
+
+/// Splits a version into its numeric release and tokenized suffix: the
+/// shared front half of the PEP 440 and Maven parsers, which differ only in
+/// how they classify the returned parts.
+fn split_release_and_suffix(value: &str) -> Option<(Vec<u64>, Vec<VersionPart>)> {
+    let release_end = value
+        .char_indices()
+        .find_map(|(index, character)| {
+            (!character.is_ascii_digit() && character != '.').then_some(index)
+        })
+        .unwrap_or(value.len());
+    let release = parse_numeric_release(value[..release_end].trim_end_matches('.'))?;
+    let suffix = tokenize(value[release_end..].trim_matches(['.', '-', '_']))?;
+    Some((release, suffix))
 }
 
 fn parse_numeric_release(value: &str) -> Option<Vec<u64>> {

@@ -11,8 +11,8 @@ use crate::{
         ApplicabilityAnalyzer, ApplicabilityInput, OsvAffectedRange, OsvEvent, OsvRangeType,
     },
     model::{
-        Component, ComponentId, Confidence, Evidence, Finding, FindingId, FindingKind,
-        FindingStatus, Inventory, Remediation, RuleId, Severity, stable_finding_id,
+        Component, Confidence, Evidence, Finding, FindingId, FindingKind, FindingStatus, Inventory,
+        Remediation, RuleId, Severity, stable_finding_id,
     },
 };
 
@@ -27,6 +27,12 @@ const MAX_PAGES_PER_PURL: usize = 100;
 /// limitation), so these in-process bounds fail closed against misbehaving
 /// endpoints instead.
 const MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+
+/// Upper bound for the response body retained inside `OsvError::Http`. The
+/// streamed body is already capped at `MAX_RESPONSE_BYTES`; keeping only a
+/// bounded prefix in the error stops a hostile 100 MiB failure page from
+/// being cloned through error paths and rendered into logs and CLI output.
+const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
 pub enum OsvError {
@@ -74,6 +80,14 @@ impl OsvClient {
     pub fn new(base_url: &str, concurrency: usize) -> Result<Self, OsvError> {
         let mut base_url =
             Url::parse(base_url).map_err(|error| OsvError::InvalidBaseUrl(error.to_string()))?;
+
+        // Joining relative endpoints and pushing path segments below both
+        // fail for cannot-be-a-base URLs (`data:`, `mailto:`, `urn:`), so the
+        // constructor rejects them here instead of relying on configuration
+        // validation elsewhere to have enforced an HTTP(S) base URL.
+        if base_url.cannot_be_a_base() || !matches!(base_url.scheme(), "http" | "https") {
+            return Err(OsvError::InvalidBaseUrl(base_url.to_string()));
+        }
         if !base_url.path().ends_with('/') {
             let path = format!("{}/", base_url.path());
             base_url.set_path(&path);
@@ -90,24 +104,8 @@ impl OsvClient {
         &self,
         inventory: &Inventory,
     ) -> Result<BTreeMap<FindingId, Finding>, OsvError> {
-        self.scan_component_map(&inventory.components, Some(inventory))
-            .await
-    }
-
-    pub async fn scan_components(
-        &self,
-        components: &BTreeMap<ComponentId, Component>,
-    ) -> Result<BTreeMap<FindingId, Finding>, OsvError> {
-        self.scan_component_map(components, None).await
-    }
-
-    async fn scan_component_map(
-        &self,
-        components: &BTreeMap<ComponentId, Component>,
-        inventory: Option<&Inventory>,
-    ) -> Result<BTreeMap<FindingId, Finding>, OsvError> {
         let mut components_by_purl: BTreeMap<&str, Vec<&Component>> = BTreeMap::new();
-        for component in components.values() {
+        for component in inventory.components.values() {
             components_by_purl
                 .entry(&component.purl)
                 .or_default()
@@ -169,14 +167,19 @@ impl OsvClient {
         .into_iter()
         .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-        map_findings(&components_by_purl, &vulnerability_ids, &details, inventory)
+        map_findings(
+            &components_by_purl,
+            &vulnerability_ids,
+            &details,
+            Some(inventory),
+        )
     }
 
     async fn query_batch(&self, queries: &[Query<'_>]) -> Result<Vec<QueryResult>, OsvError> {
         let endpoint = self
             .base_url
             .join("v1/querybatch")
-            .expect("static relative URL");
+            .map_err(|_| OsvError::InvalidBaseUrl(self.base_url.to_string()))?;
         let response = self
             .http
             .post(endpoint.clone())
@@ -198,10 +201,13 @@ impl OsvClient {
     }
 
     async fn fetch_vulnerability(&self, id: &str) -> Result<Vulnerability, OsvError> {
-        let mut endpoint = self.base_url.join("v1/vulns").expect("static relative URL");
+        let mut endpoint = self
+            .base_url
+            .join("v1/vulns")
+            .map_err(|_| OsvError::InvalidBaseUrl(self.base_url.to_string()))?;
         endpoint
             .path_segments_mut()
-            .expect("HTTP URL supports path segments")
+            .map_err(|_| OsvError::InvalidBaseUrl(self.base_url.to_string()))?
             .push(id);
         let response = self
             .http
@@ -250,13 +256,20 @@ async fn decode_response<T: for<'de> Deserialize<'de>>(
         return Err(OsvError::Http {
             endpoint: endpoint.to_string(),
             status,
-            body: String::from_utf8_lossy(&bytes).into_owned(),
+            body: truncated_error_body(&bytes),
         });
     }
     serde_json::from_slice(&bytes).map_err(|source| OsvError::Decode {
         endpoint: endpoint.to_string(),
         source,
     })
+}
+
+/// Retains at most `MAX_ERROR_BODY_BYTES` of a failed response body. Byte
+/// slicing may split a UTF-8 sequence; `from_utf8_lossy` replaces the partial
+/// suffix instead of panicking, so truncation at an arbitrary byte is safe.
+fn truncated_error_body(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_BODY_BYTES)]).into_owned()
 }
 
 #[derive(Serialize)]
@@ -390,78 +403,94 @@ fn map_findings(
                     (!url.is_empty()).then(|| url.to_owned())
                 })
                 .collect();
+            let rule_id = RuleId::new(format!("osv:{}", vulnerability.id))
+                .map_err(|_| OsvError::InvalidVulnerabilityId)?;
             for component in components {
-                let rule_id = RuleId::new(format!("osv:{}", vulnerability.id))
-                    .map_err(|_| OsvError::InvalidVulnerabilityId)?;
-                let finding_id = stable_finding_id(
-                    FindingKind::Vulnerability,
+                let finding = vulnerability_finding(
+                    vulnerability,
+                    component,
                     &rule_id,
-                    Some(&component.identity),
-                    None,
+                    &references,
+                    inventory,
                 );
-                let affected_ranges = affected_ranges(vulnerability, &component.purl);
-                let fixed_versions = fixed_versions(&affected_ranges);
-                let remediation =
-                    (!fixed_versions.is_empty() || !references.is_empty()).then(|| Remediation {
-                        description: if fixed_versions.is_empty() {
-                            "Review the advisory references for remediation guidance".to_owned()
-                        } else {
-                            "Upgrade to a fixed version".to_owned()
-                        },
-                        fixed_versions,
-                        references: references.clone(),
-                    });
-                let evidence = Evidence {
-                    description: format!(
-                        "OSV reports a vulnerability match for {} {} ({})",
-                        component.name, component.version, vulnerability.id
-                    ),
-                    locations: component
-                        .locations
-                        .iter()
-                        .map(|location| location.id.clone())
-                        .collect(),
-                    references: references.clone(),
-                    properties: BTreeMap::from([
-                        ("package.name".to_owned(), component.name.clone()),
-                        ("package.version".to_owned(), component.version.clone()),
-                        ("package.purl".to_owned(), component.purl.clone()),
-                    ]),
-                    redacted: false,
-                };
-                findings.insert(
-                    finding_id.clone(),
-                    Finding {
-                        id: finding_id,
-                        kind: FindingKind::Vulnerability,
-                        rule_id,
-                        advisory_id: Some(vulnerability.id.clone()),
-                        component_id: Some(component.identity.clone()),
-                        location_id: None,
-                        aliases: vulnerability.aliases.iter().cloned().collect(),
-                        summary: vulnerability.summary.clone(),
-                        details: vulnerability.details.clone(),
-                        severity: vulnerability_severity(vulnerability, &component.purl),
-                        confidence: Confidence::High,
-                        evidence: BTreeSet::from([evidence.clone()]),
-                        applicability: Some(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
-                            component,
-                            inventory,
-                            evidence: &BTreeSet::from([evidence]),
-                            affected_ranges: &affected_ranges,
-                        })),
-                        remediation,
-                        risk: None,
-                        first_seen: None,
-                        last_seen: None,
-                        modified: vulnerability.modified.clone(),
-                        status: FindingStatus::Open,
-                    },
-                );
+                findings.insert(finding.id.clone(), finding);
             }
         }
     }
     Ok(findings)
+}
+
+/// Builds the vulnerability finding for one (advisory, component) pair. The
+/// advisory-level invariants (`rule_id`, `references`) are resolved by the
+/// caller once per advisory instead of once per component.
+fn vulnerability_finding(
+    vulnerability: &Vulnerability,
+    component: &Component,
+    rule_id: &RuleId,
+    references: &BTreeSet<String>,
+    inventory: Option<&Inventory>,
+) -> Finding {
+    let finding_id = stable_finding_id(
+        FindingKind::Vulnerability,
+        rule_id,
+        Some(&component.identity),
+        None,
+    );
+    let affected_ranges = affected_ranges(vulnerability, &component.purl);
+    let fixed_versions = fixed_versions(&affected_ranges);
+    let remediation = (!fixed_versions.is_empty() || !references.is_empty()).then(|| Remediation {
+        description: if fixed_versions.is_empty() {
+            "Review the advisory references for remediation guidance".to_owned()
+        } else {
+            "Upgrade to a fixed version".to_owned()
+        },
+        fixed_versions,
+        references: references.clone(),
+    });
+    let evidence = Evidence {
+        description: format!(
+            "OSV reports a vulnerability match for {} {} ({})",
+            component.name, component.version, vulnerability.id
+        ),
+        locations: component
+            .locations
+            .iter()
+            .map(|location| location.id.clone())
+            .collect(),
+        references: references.clone(),
+        properties: BTreeMap::from([
+            ("package.name".to_owned(), component.name.clone()),
+            ("package.version".to_owned(), component.version.clone()),
+            ("package.purl".to_owned(), component.purl.clone()),
+        ]),
+        redacted: false,
+    };
+    Finding {
+        id: finding_id,
+        kind: FindingKind::Vulnerability,
+        rule_id: rule_id.clone(),
+        advisory_id: Some(vulnerability.id.clone()),
+        component_id: Some(component.identity.clone()),
+        location_id: None,
+        aliases: vulnerability.aliases.iter().cloned().collect(),
+        summary: vulnerability.summary.clone(),
+        details: vulnerability.details.clone(),
+        severity: vulnerability_severity(vulnerability, &component.purl),
+        confidence: Confidence::High,
+        evidence: BTreeSet::from([evidence.clone()]),
+        applicability: Some(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
+            component,
+            inventory,
+            evidence: &BTreeSet::from([evidence]),
+            affected_ranges: &affected_ranges,
+        })),
+        remediation,
+        risk: None,
+        first_seen: None,
+        last_seen: None,
+        modified: vulnerability.modified.clone(),
+        status: FindingStatus::Open,
+    }
 }
 
 fn affected_ranges(vulnerability: &Vulnerability, purl: &str) -> Vec<OsvAffectedRange> {
@@ -754,7 +783,7 @@ mod tests {
     use std::{collections::BTreeSet, time::Duration};
 
     use super::*;
-    use crate::model::{Asset, AssetId, AssetKind, Scope};
+    use crate::model::{Asset, AssetId, AssetKind, ComponentId, Scope};
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -805,10 +834,18 @@ mod tests {
 
     #[test]
     fn rejects_invalid_base_url() {
-        assert!(matches!(
-            OsvClient::new("not a URL", 4),
-            Err(OsvError::InvalidBaseUrl(_))
-        ));
+        for url in [
+            "not a URL",
+            "data:text/plain,hello",
+            "mailto:advisories@example.com",
+            "urn:isbn:0451450523",
+            "ftp://mirror.example.com/osv",
+        ] {
+            assert!(
+                matches!(OsvClient::new(url, 4), Err(OsvError::InvalidBaseUrl(_))),
+                "expected {url} to be rejected"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1236,6 +1273,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn truncates_retained_http_error_bodies() {
+        assert_eq!(
+            truncated_error_body(b"upstream unavailable"),
+            "upstream unavailable"
+        );
+
+        let long = vec![b'a'; MAX_ERROR_BODY_BYTES + 1];
+        assert_eq!(truncated_error_body(&long).len(), MAX_ERROR_BODY_BYTES);
+
+        // A multi-byte sequence cut at the retention boundary decodes lossily
+        // instead of panicking.
+        let mut multibyte = vec![b'x'; MAX_ERROR_BODY_BYTES - 1];
+        multibyte.extend_from_slice("é".as_bytes());
+        let retained = truncated_error_body(&multibyte);
+        assert_eq!(retained.chars().count(), MAX_ERROR_BODY_BYTES);
+        assert!(retained.ends_with('\u{FFFD}'));
+    }
     #[test]
     fn maps_cvss_score_boundaries() {
         assert_eq!(severity_from_score(0.0), Severity::Unknown);

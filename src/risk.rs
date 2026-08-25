@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, NaiveDate, Utc};
 
+use crate::analysis::EvidenceProperties;
 use crate::model::{
     ApplicabilityStatus, Component, ComponentId, Confidence, Evidence, Finding, FindingKind,
     FindingStatus, Inventory, Remediation, Risk, RuleId, Scope, Severity, stable_finding_id,
@@ -28,7 +29,7 @@ pub struct RiskScorer;
 
 impl RiskScorer {
     pub fn score(input: RiskInput<'_>) -> Risk {
-        let metadata = Metadata::new(input.evidence);
+        let metadata = EvidenceProperties::new(input.evidence);
         let mut factors = BTreeMap::new();
         factors.insert("severity".to_owned(), severity_points(input.severity));
         factors.insert("confidence".to_owned(), confidence_points(input.confidence));
@@ -107,7 +108,7 @@ fn scope_points(scope: Scope) -> i32 {
     }
 }
 
-fn fix_points(remediation: Option<&Remediation>, metadata: &Metadata<'_>) -> i32 {
+fn fix_points(remediation: Option<&Remediation>, metadata: &EvidenceProperties<'_>) -> i32 {
     if remediation.is_some_and(|item| !item.fixed_versions.is_empty())
         || metadata.boolean("fix.available") == Some(true)
     {
@@ -119,7 +120,7 @@ fn fix_points(remediation: Option<&Remediation>, metadata: &Metadata<'_>) -> i32
     }
 }
 
-fn age_points(metadata: &Metadata<'_>, as_of: NaiveDate) -> i32 {
+fn age_points(metadata: &EvidenceProperties<'_>, as_of: NaiveDate) -> i32 {
     let days = metadata
         .integer("component.age_days")
         .or_else(|| {
@@ -137,7 +138,7 @@ fn age_points(metadata: &Metadata<'_>, as_of: NaiveDate) -> i32 {
     }
 }
 
-fn cadence_points(metadata: &Metadata<'_>) -> i32 {
+fn cadence_points(metadata: &EvidenceProperties<'_>) -> i32 {
     match metadata
         .integer("release.cadence_days")
         .filter(|days| *days >= 0)
@@ -150,7 +151,7 @@ fn cadence_points(metadata: &Metadata<'_>) -> i32 {
     }
 }
 
-fn maintenance_points(metadata: &Metadata<'_>) -> i32 {
+fn maintenance_points(metadata: &EvidenceProperties<'_>) -> i32 {
     match metadata
         .value("maintenance.status")
         .map(str::to_ascii_lowercase)
@@ -199,7 +200,7 @@ impl OperationalRiskAnalyzer {
             let Some(evidence) = input.evidence_by_component.get(&component.identity) else {
                 continue;
             };
-            let metadata = Metadata::new(evidence);
+            let metadata = EvidenceProperties::new(evidence);
             let mut conditions = Vec::new();
 
             if matches!(
@@ -358,63 +359,6 @@ fn supports_condition(evidence: &Evidence, condition: &str) -> bool {
     };
     keys.iter()
         .any(|key| evidence.properties.contains_key(*key))
-}
-
-struct Metadata<'a> {
-    values: BTreeMap<&'a str, BTreeSet<&'a str>>,
-}
-
-impl<'a> Metadata<'a> {
-    fn new(evidence: &'a BTreeSet<Evidence>) -> Self {
-        let mut values: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-        for item in evidence {
-            for (key, value) in &item.properties {
-                values.entry(key).or_default().insert(value);
-            }
-        }
-        Self { values }
-    }
-
-    fn value(&self, key: &str) -> Option<&str> {
-        let values = self.values.get(key)?;
-        (values.len() == 1).then(|| *values.first().expect("non-empty metadata values"))
-    }
-
-    fn boolean(&self, key: &str) -> Option<bool> {
-        match self.value(key)? {
-            value if value.eq_ignore_ascii_case("true") || value == "1" => Some(true),
-            value if value.eq_ignore_ascii_case("false") || value == "0" => Some(false),
-            _ => None,
-        }
-    }
-
-    fn integer(&self, key: &str) -> Option<i64> {
-        self.value(key)?.parse().ok()
-    }
-
-    fn date(&self, key: &str) -> Option<NaiveDate> {
-        let value = self.value(key)?;
-        NaiveDate::parse_from_str(value, "%Y-%m-%d")
-            .ok()
-            .or_else(|| {
-                DateTime::parse_from_rfc3339(value)
-                    .ok()
-                    .map(|date| date.date_naive())
-            })
-    }
-
-    fn date_time(&self, key: &str) -> Option<DateTime<Utc>> {
-        let value = self.value(key)?;
-        DateTime::parse_from_rfc3339(value)
-            .ok()
-            .map(|date| date.with_timezone(&Utc))
-            .or_else(|| {
-                NaiveDate::parse_from_str(value, "%Y-%m-%d")
-                    .ok()?
-                    .and_hms_opt(0, 0, 0)
-                    .map(|date| date.and_utc())
-            })
-    }
 }
 
 #[cfg(test)]
@@ -767,5 +711,25 @@ mod tests {
             OperationalRiskConfig::default(),
         );
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn fix_availability_accepts_yes_no_boolean_grammar() {
+        let yes = risk(
+            Severity::Low,
+            Confidence::Low,
+            ApplicabilityStatus::Unknown,
+            Scope::Test,
+            &[("fix.available", "yes")],
+        );
+        let no = risk(
+            Severity::Low,
+            Confidence::Low,
+            ApplicabilityStatus::Unknown,
+            Scope::Test,
+            &[("fix.available", "no")],
+        );
+        assert_eq!(yes.factors["fix-availability"], -600);
+        assert_eq!(no.factors["fix-availability"], 500);
     }
 }
