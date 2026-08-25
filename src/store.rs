@@ -49,6 +49,8 @@ pub enum StoreError {
     InvalidMigrationHistory(String),
     #[error("stored monitor data is invalid: {0}")]
     InvalidMonitorData(String),
+    #[error("monitor target '{target_id}' already exists")]
+    MonitorTargetExists { target_id: String },
     #[error(
         "optimistic update conflict for {resource_type} '{resource_id}': expected version {expected}, current version {actual:?}"
     )]
@@ -699,6 +701,69 @@ impl Store {
         let interval =
             i64::try_from(target.interval_seconds).map_err(|_| StoreError::VersionOverflow)?;
         Ok(self.connection.execute("UPDATE monitor_targets SET source=?2,interval_seconds=?3,next_due_at=?4,source_fingerprint=?5,inventory_json=?6,advisory_digest=?7,policy_digest=?8,finding_ids_json=?9,updated_at=?10 WHERE target_id=?1",params![target.target_id,target.source,interval,target.next_due_at,target.source_fingerprint,inventory,target.advisory_digest,target.policy_digest,findings,target.updated_at])?==1)
+    }
+    pub fn add_monitor_target(&mut self, target: &MonitorTarget) -> Result<(), StoreError> {
+        if target.target_id.trim().is_empty() {
+            return Err(StoreError::InvalidMonitorData(
+                "monitor target id must not be blank".into(),
+            ));
+        }
+        if target.source.trim().is_empty() {
+            return Err(StoreError::InvalidMonitorData(
+                "monitor target source must not be blank".into(),
+            ));
+        }
+        if target.interval_seconds == 0 {
+            return Err(StoreError::InvalidMonitorData(
+                "monitor target interval must be greater than zero".into(),
+            ));
+        }
+        if target.next_due_at.trim().is_empty() || target.updated_at.trim().is_empty() {
+            return Err(StoreError::InvalidMonitorData(
+                "monitor target timestamps must not be blank".into(),
+            ));
+        }
+        if self.get_monitor_target(&target.target_id)?.is_some() {
+            return Err(StoreError::MonitorTargetExists {
+                target_id: target.target_id.clone(),
+            });
+        }
+        let findings = serde_json::to_string(&target.finding_ids)?;
+        let inventory = target
+            .inventory
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let interval =
+            i64::try_from(target.interval_seconds).map_err(|_| StoreError::VersionOverflow)?;
+        if let Err(error) = self.connection.execute("INSERT INTO monitor_targets(target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![target.target_id,target.source,interval,target.next_due_at,target.source_fingerprint,inventory,target.advisory_digest,target.policy_digest,findings,target.updated_at]) {
+            // All CHECK constraints are pre-validated above and existence was
+            // rejected before the insert, so a constraint violation here can
+            // only be the primary key (for example a concurrent registration).
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                return Err(StoreError::MonitorTargetExists {
+                    target_id: target.target_id.clone(),
+                });
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+    pub fn list_monitor_targets(
+        &self,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<MonitorTarget>, StoreError> {
+        let (limit, offset) = pagination(limit, offset)?;
+        let mut s=self.connection.prepare("SELECT target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at FROM monitor_targets ORDER BY target_id LIMIT ?1 OFFSET ?2")?;
+        let rows = s.query_map(params![limit, offset], read_monitor_target)?;
+        collect_sql_rows(rows)
+    }
+    pub fn remove_monitor_target(&mut self, target_id: &str) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM monitor_targets WHERE target_id=?1",
+            [target_id],
+        )? == 1)
     }
     pub fn get_monitor_cursor(&self, name: &str) -> Result<Option<MonitorCursor>, StoreError> {
         self.connection.query_row("SELECT name,cursor,etag,last_modified,advisory_digest,updated_at FROM monitor_cursors WHERE name=?1",[name],|r|Ok(MonitorCursor{name:r.get(0)?,cursor:r.get(1)?,etag:r.get(2)?,last_modified:r.get(3)?,advisory_digest:r.get(4)?,updated_at:r.get(5)?})).optional().map_err(Into::into)
@@ -2033,6 +2098,89 @@ mod tests {
             .unwrap()
             .len(),
             1
+        );
+    }
+
+    #[test]
+    fn add_monitor_target_inserts_and_lists_in_deterministic_order() {
+        let mut s = Store::open_memory().unwrap();
+        assert!(s.list_monitor_targets(10, 0).unwrap().is_empty());
+        s.add_monitor_target(&target("zeta", "2026-01-01Z"))
+            .unwrap();
+        s.add_monitor_target(&target("alpha", "2026-01-02Z"))
+            .unwrap();
+        assert_eq!(
+            s.list_monitor_targets(10, 0)
+                .unwrap()
+                .iter()
+                .map(|t| t.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+        assert_eq!(s.list_monitor_targets(1, 1).unwrap()[0].target_id, "zeta");
+        assert!(matches!(
+            s.list_monitor_targets(0, 0),
+            Err(StoreError::InvalidPageLimit(0))
+        ));
+    }
+
+    #[test]
+    fn duplicate_add_monitor_target_fails_cleanly() {
+        let mut s = Store::open_memory().unwrap();
+        s.add_monitor_target(&target("target", "2026-01-01Z"))
+            .unwrap();
+        assert!(matches!(
+            s.add_monitor_target(&target("target", "2026-01-02Z")),
+            Err(StoreError::MonitorTargetExists { target_id }) if target_id == "target"
+        ));
+    }
+
+    #[test]
+    fn add_monitor_target_rejects_invalid_registrations() {
+        let mut s = Store::open_memory().unwrap();
+        let mut invalid = target(" ", "2026-01-01Z");
+        assert!(matches!(
+            s.add_monitor_target(&invalid),
+            Err(StoreError::InvalidMonitorData(_))
+        ));
+        invalid.target_id = "blank-source".into();
+        invalid.source = "  ".into();
+        assert!(matches!(
+            s.add_monitor_target(&invalid),
+            Err(StoreError::InvalidMonitorData(_))
+        ));
+        invalid.source = "repo".into();
+        invalid.interval_seconds = 0;
+        assert!(matches!(
+            s.add_monitor_target(&invalid),
+            Err(StoreError::InvalidMonitorData(_))
+        ));
+        assert!(s.list_monitor_targets(10, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_monitor_target_reports_presence_then_absence_and_cascades_events() {
+        let mut s = Store::open_memory().unwrap();
+        assert!(!s.remove_monitor_target("target").unwrap());
+        s.add_monitor_target(&target("target", "2026-01-02Z"))
+            .unwrap();
+        s.append_monitor_event(&event("pending", "target", None))
+            .unwrap();
+        assert!(s.remove_monitor_target("target").unwrap());
+        assert_eq!(s.get_monitor_target("target").unwrap(), None);
+        assert!(!s.remove_monitor_target("target").unwrap());
+        assert!(
+            s.list_monitor_events(
+                &MonitorEventFilter {
+                    include_delivered: true,
+                    include_dead_lettered: true,
+                    ..Default::default()
+                },
+                10,
+                0
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 

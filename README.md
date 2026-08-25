@@ -2,7 +2,8 @@
 
 Hooray is an automation-first software security analysis and policy-enforcement
 engine. It builds a normalized dependency inventory from projects, CycloneDX
-SBOMs, archives, and OCI images; queries OSV for known vulnerabilities; adds
+and SPDX 2.x SBOMs, archives, and OCI images; queries OSV for known
+vulnerabilities; adds
 license, secret, infrastructure-as-code, SAST, malware-indicator, and
 operational-risk findings; evaluates an auditable policy; stores scan history in
 SQLite; and renders results for humans, CI systems, and security platforms.
@@ -20,10 +21,11 @@ Hooray accepts explicit input types or auto-detects them:
 
 - project directories containing supported lockfiles or manifests;
 - CycloneDX JSON SBOMs with nested components and dependency relationships;
+- SPDX 2.x JSON SBOMs, detected by their `spdxVersion` key;
 - ZIP and TAR artifacts containing supported dependency files;
 - OCI image-layout directories;
 - OCI or Docker image TAR files; and
-- CycloneDX JSON from standard input for `scan sbom` and `scan auto`.
+- CycloneDX or SPDX 2.x JSON from standard input for `scan sbom` and `scan auto`.
 
 Inventory components retain package URLs, versions, scopes, provenance,
 locations, licenses, and dependency edges. Stable component, location, finding,
@@ -64,8 +66,10 @@ fields are rejected. Rules can select findings by:
 - exact SPDX license expression;
 - dependency scope;
 - package-URL glob;
-- rule-ID glob; and
-- advisory-ID glob.
+- rule-ID glob;
+- advisory-ID glob;
+- fix availability; and
+- exact CVE or advisory identifiers matched against advisory IDs and aliases.
 
 Rules are evaluated by descending priority and then rule ID. Outcomes are
 `allow`, `warn`, or `deny`; if no rule matches, `default_outcome` applies.
@@ -73,6 +77,8 @@ Policies can fail closed when applicability or license data is unknown.
 
 Exceptions are deliberately narrow and auditable. Every exception requires an
 ID, owner, reason, ticket, RFC 3339 expiry, and at least one exact selector.
+Secret findings can be pinned exactly by the SHA-256 fingerprint recorded in
+their evidence.
 Exception selectors cannot contain globs. Optional compensating controls are
 recorded with the exception, and expired exceptions do not apply.
 
@@ -92,6 +98,13 @@ rules:
     selectors:
       minimum_severity: critical
       scopes: [runtime]
+  - id: deny-unfixed-cves
+    priority: 90
+    outcome: deny
+    reason: Known CVEs without available fixes block release
+    selectors:
+      cves: [CVE-2026-1234]
+      fix_available: false
   - id: allow-mit
     priority: 50
     outcome: allow
@@ -158,12 +171,20 @@ IaC checks include:
   non-root `USER`;
 - Kubernetes host networking, privileged containers, and privilege escalation;
 - CloudFormation S3 buckets without public-access blocking and RDS instances
-  without storage encryption.
+  without storage encryption;
+- nginx and Apache weak TLS protocol lists plus server-version disclosure;
+- PostgreSQL `pg_hba.conf` trust authentication and `postgresql.conf` SSL
+  disabled with md5/plain password encryption;
+- Redis disabled protected mode and empty `requirepass`; and
+- sshd root login, password authentication, protocol version 1, and empty
+  passwords permitted.
 
 SAST rules target concrete dangerous syntax in Rust, JavaScript/TypeScript,
 Python, Go, Java, and C#, including dynamic shell execution, dynamic evaluation,
-and formatted or concatenated SQL. These are focused static rules, not a
-compiler-complete data-flow engine.
+formatted or concatenated SQL, MD5/SHA-1 digest selection, and unsafe
+deserialization such as `pickle.loads`, unrestricted `yaml.load`,
+`ObjectInputStream.readObject`, and `BinaryFormatter.Deserialize`. These are
+focused static rules, not a compiler-complete data-flow engine.
 
 Malware analysis supports exact caller-supplied SHA-256 signatures in the
 library API, executable/script polyglot indicators, embedded PE/ELF signatures,
@@ -204,16 +225,27 @@ The monitor service persists targets, inventory snapshots, advisory and policy
 digests, finding sets, and alert events in SQLite. It rescans only when source
 content changes, reevaluates when source/advisory/policy digests change,
 deduplicates events, retries delivery with bounded exponential backoff,
-dead-letters exhausted events, and prunes expired records. The current CLI
-notifier emits JSON alert events to standard error:
+dead-letters exhausted events, and prunes expired records.
+
+Targets register through the CLI. `monitor targets add TARGET_ID --source
+SOURCE --interval-seconds SECONDS` stores a watch entry, `list` paginates
+registered targets, and `remove` deletes a target together with its queued
+events.
 
 ```bash
 hooray monitor --once
 hooray monitor
+hooray monitor targets add webapp --source ./webapp --interval-seconds 300
+hooray monitor targets list --limit 50 --offset 0 --format json
+hooray monitor targets remove webapp
 ```
 
-Monitor targets must already exist in the database; the CLI does not provide a
-target-registration command.
+The CLI notifier emits JSON alert events to standard error by default. Passing
+`--webhook-url URL` together with `--webhook-secret-env VAR` switches delivery
+to an HTTPS-only webhook signed with the shared integration HMAC scheme. The
+secret is resolved from the named environment variable before the loop starts
+and never appears in errors or logs; the flags are required as a pair, and
+omitting both keeps standard-error delivery.
 
 ### HTTP API
 
@@ -287,9 +319,11 @@ jobs.
 
 Review generated templates before adoption. The integration library also
 renders bounded GitHub SARIF and check-run payloads, GitLab Code Quality, Slack
-summaries, VS Code/LSP diagnostics, pull-request gates, and HTTPS-only signed
-webhooks. Webhook signatures are versioned, secrets must be 16–4,096 bytes,
-URLs cannot contain credentials, and verification uses constant-time comparison.
+summaries, VS Code/LSP diagnostics, pull-request gates, Jira create-issue
+payloads with escaped wiki markup and capped finding lists, and HTTPS-only
+signed webhooks. Webhook signatures are versioned, secrets must be 16–4,096
+bytes, URLs cannot contain credentials, and verification uses constant-time
+comparison.
 
 ## Installation
 
@@ -331,7 +365,10 @@ hooray history show RUN_ID [--format json|yaml] [--output FILE]
 hooray history diff PREVIOUS_RUN_ID CURRENT_RUN_ID [--format json|yaml] [--output FILE]
 hooray report RUN_ID [--format FORMAT] [--output FILE]
 hooray serve
-hooray monitor [--once]
+hooray monitor [--once] [--webhook-url URL --webhook-secret-env VAR]
+hooray monitor targets add TARGET_ID --source SOURCE --interval-seconds SECONDS
+hooray monitor targets list [--limit 1..1000] [--offset N] [--format json|yaml|table] [--output FILE]
+hooray monitor targets remove TARGET_ID
 hooray integrations generate pre-commit|github-actions|gitlab-ci|gitlab-security [--output FILE]
 ```
 
@@ -374,6 +411,7 @@ history, and standalone policy-evaluation commands support JSON and YAML only.
 | `spdx` | SPDX 2.3 JSON inventory |
 | `gitlab-code-quality` | GitLab Code Quality JSON |
 | `json-lines` | NDJSON envelopes for run, component, finding, policy, and summary records |
+| `csv` | RFC 4180 flat finding rows with fixed columns from `stable_finding_id` through `first_location_path` |
 | `gitlab-artifacts` | Atomic directory bundle containing all five GitLab artifacts |
 
 The `gitlab-artifacts` directory contains exactly
@@ -452,10 +490,22 @@ legacy severity-only `--fail-on` interface.
 | --- | --- | --- |
 | Rust | `Cargo.lock`, optional sibling `Cargo.toml` | Packages, checksums, direct dependency hints, Cargo purls |
 | npm | `package-lock.json` | Package graph, dev/optional scope, npm purls |
-| Python | `requirements.txt` | Pinned `name==version` requirements, PyPI purls |
-| Go | `go.sum` | Module/version entries, Go purls |
+| Yarn | `yarn.lock` classic or Berry | Locked packages with dependency edges, npm purls |
+| pnpm | `pnpm-lock.yaml` | Locked packages with dev/optional scope, npm purls |
+| Python pip | `requirements.txt` | Pinned `name==version` requirements, PyPI purls |
+| Python Poetry | `poetry.lock` | Locked PyPI packages, PyPI purls |
+| Python Pipenv | `Pipfile.lock` | Pinned default/develop packages, PyPI purls |
+| Ruby | `Gemfile.lock` | `GEM`-section specs, gem purls |
+| Go | `go.mod` requirements | Module/version entries, Go purls |
+| Swift | `Package.resolved` v1 or v2 | Pinned identities and versions, Swift purls |
+| Dart | `pubspec.lock` | Locked pub packages, pub purls |
+| CocoaPods | `Podfile.lock` | Pod entries, CocoaPods purls |
+| PHP | `composer.json` | Declared `require`/`require-dev` packages, composer purls; platform packages skipped |
+| Conda | `environment.yml` | Dependency list entries, conda purls |
+| Helm | `Chart.yaml` | Declared chart dependencies, Helm purls |
 | NuGet | `packages.lock.json` | Framework dependency graph, direct/transitive hints, NuGet purls |
 | CycloneDX | JSON SBOM with versioned purls | Nested and declared dependency edges, scope, provenance |
+| SPDX | 2.x JSON detected by `spdxVersion` | Packages, checksums, declared `DEPENDS_ON` relationships |
 | OCI/Docker | OCI layout or OCI/Docker TAR | Layer application with whiteouts, digest validation, supported lockfiles from final filesystem |
 | Generic artifact | `.zip` or `.tar` | Supported lockfiles discovered in the bounded archive |
 

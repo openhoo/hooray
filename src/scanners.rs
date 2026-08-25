@@ -304,6 +304,7 @@ pub fn analyze_bytes(
     if let Some(text) = decode_text(bytes) {
         scan_secrets(text, config, &mut builder);
         scan_iac(path, text, &mut builder);
+        scan_service_config(path, text, &mut builder);
         scan_sast(path, text, &mut builder);
     }
     builder.finish(bytes.len() as u64)
@@ -1016,6 +1017,454 @@ fn find_structured_scalar(text: &str, value: &str) -> Option<usize> {
         })
 }
 
+const WEAK_TLS_PROTOCOL_TOKENS: &[&str] = &["sslv2", "sslv3", "tlsv1", "tlsv1.0", "tlsv1.1"];
+
+struct ServiceConfigRule<'a> {
+    rule: &'a str,
+    summary: &'a str,
+    details: &'a str,
+    remediation: &'a str,
+    severity: Severity,
+    cwe: &'a str,
+    references: &'a [&'a str],
+}
+
+fn add_service_finding(
+    builder: &mut FindingBuilder<'_>,
+    rule: &ServiceConfigRule<'_>,
+    description: String,
+    line: u32,
+    column: u32,
+) {
+    builder.add(FindingSpec {
+        kind: FindingKind::Iac,
+        rule: rule.rule,
+        line,
+        column,
+        summary: rule.summary,
+        details: rule.details,
+        severity: rule.severity,
+        confidence: Confidence::High,
+        description,
+        references: rule.references,
+        properties: BTreeMap::new(),
+        redacted: false,
+        remediation: rule.remediation,
+        cwe: Some(rule.cwe),
+    });
+}
+
+fn scan_service_config(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    let nginx_conf =
+        name == "nginx.conf" || (name.starts_with("nginx.") && name.ends_with(".conf"));
+    if nginx_conf {
+        scan_nginx_config(text, builder);
+    }
+    if name.ends_with(".conf")
+        && !nginx_conf
+        && !matches!(
+            name.as_str(),
+            "pg_hba.conf" | "postgresql.conf" | "redis.conf"
+        )
+    {
+        scan_apache_config(text, builder);
+    }
+    match name.as_str() {
+        "pg_hba.conf" => scan_pg_hba_config(text, builder),
+        "postgresql.conf" => scan_postgresql_config(text, builder),
+        "redis.conf" => scan_redis_config(text, builder),
+        "sshd_config" => scan_sshd_config(text, builder),
+        _ => {}
+    }
+}
+
+fn config_lines(text: &str) -> impl Iterator<Item = (u32, usize, &str)> {
+    let mut offset = 0_usize;
+    text.lines().enumerate().map(move |(index, line)| {
+        let start = offset;
+        offset += line.len() + 1;
+        (index as u32 + 1, start, line)
+    })
+}
+
+fn effective_config_line(line: &str) -> &str {
+    line.split_once('#').map_or(line, |(code, _)| code).trim()
+}
+
+fn split_config_directive(line: &str) -> Option<(&str, &str)> {
+    line.split_once(char::is_whitespace)
+}
+
+fn directive_column(line: &str) -> u32 {
+    u32::try_from(line.len() - line.trim_start().len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
+}
+
+fn argument_tokens(arguments: &str) -> impl Iterator<Item = &str> {
+    arguments
+        .split(|character: char| character.is_whitespace() || character == ',' || character == ';')
+        .filter(|token| !token.is_empty())
+}
+
+fn is_weak_protocol_token(token: &str) -> bool {
+    let normalized = token.trim_matches(['+', '-']);
+    WEAK_TLS_PROTOCOL_TOKENS
+        .iter()
+        .any(|weak| normalized.eq_ignore_ascii_case(weak))
+}
+
+fn enables_weak_protocol(token: &str) -> bool {
+    !token.starts_with('-') && is_weak_protocol_token(token)
+}
+
+fn config_assignment(line: &str) -> Option<(&str, &str)> {
+    let content = effective_config_line(line);
+    if content.is_empty() {
+        return None;
+    }
+    let (key, value) = content
+        .split_once('=')
+        .or_else(|| content.split_once(char::is_whitespace))?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, unquote_config_value(value)))
+}
+
+fn unquote_config_value(value: &str) -> &str {
+    let trimmed = value.trim();
+    let Some(first) = trimmed.chars().next() else {
+        return "";
+    };
+    if (first == '"' || first == '\'')
+        && trimmed.len() >= 2 * first.len_utf8()
+        && trimmed.ends_with(first)
+    {
+        return &trimmed[first.len_utf8()..trimmed.len() - first.len_utf8()];
+    }
+    trimmed
+}
+
+const NGINX_WEAK_TLS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.nginx.weak-tls-protocol",
+    summary: "Nginx enables deprecated TLS protocols",
+    details: "The ssl_protocols directive explicitly lists SSLv2, SSLv3, TLSv1, or TLSv1.1.",
+    remediation: "Restrict ssl_protocols to TLSv1.2 and TLSv1.3.",
+    severity: Severity::High,
+    cwe: "CWE-327",
+    references: &["https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_protocols"],
+};
+
+const NGINX_SERVER_TOKENS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.nginx.server-tokens",
+    summary: "Nginx broadcasts its server version",
+    details: "The server_tokens directive is set to on, exposing the exact version in headers and error pages.",
+    remediation: "Set server_tokens off to reduce fingerprinting.",
+    severity: Severity::Low,
+    cwe: "CWE-200",
+    references: &["https://nginx.org/en/docs/http/ngx_http_core_module.html#server_tokens"],
+};
+
+const APACHE_WEAK_TLS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.apache.weak-tls-protocol",
+    summary: "Apache enables deprecated SSL/TLS protocols",
+    details: "The SSLProtocol directive enables SSLv2, SSLv3, TLSv1, or TLSv1.1.",
+    remediation: "Enable only TLSv1.2 and TLSv1.3 in SSLProtocol.",
+    severity: Severity::High,
+    cwe: "CWE-327",
+    references: &["https://httpd.apache.org/docs/current/mod/mod_ssl.html#sslprotocol"],
+};
+
+const APACHE_SERVER_TOKENS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.apache.server-tokens",
+    summary: "Apache discloses detailed server information",
+    details: "The ServerTokens directive is Full or OS, sending product, version, and OS details in response headers.",
+    remediation: "Set ServerTokens Prod to minimize version disclosure.",
+    severity: Severity::Low,
+    cwe: "CWE-200",
+    references: &["https://httpd.apache.org/docs/current/mod/core.html#servertokens"],
+};
+
+const PG_HBA_TRUST_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.pg-hba.trust-authentication",
+    summary: "PostgreSQL pg_hba entry trusts connections without authentication",
+    details: "A pg_hba.conf record uses the trust auth method, granting access without any credential check.",
+    remediation: "Replace trust with scram-sha-256 or certificate authentication.",
+    severity: Severity::Critical,
+    cwe: "CWE-306",
+    references: &["https://www.postgresql.org/docs/current/auth-pg-hba-conf.html"],
+};
+
+const POSTGRES_SSL_OFF_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.postgres.ssl-disabled",
+    summary: "PostgreSQL accepts unencrypted connections",
+    details: "The ssl setting is off, so client traffic is not encrypted.",
+    remediation: "Enable ssl and require encrypted connections for remote clients.",
+    severity: Severity::High,
+    cwe: "CWE-319",
+    references: &["https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-SSL"],
+};
+
+const POSTGRES_WEAK_PASSWORD_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.postgres.weak-password-encryption",
+    summary: "PostgreSQL stores passwords with a weak scheme",
+    details: "password_encryption is md5 or plain instead of a modern password-based scheme.",
+    remediation: "Set password_encryption to scram-sha-256 and re-set roles to upgrade stored verifiers.",
+    severity: Severity::Medium,
+    cwe: "CWE-916",
+    references: &[
+        "https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-PASSWORD-ENCRYPTION",
+    ],
+};
+
+const REDIS_PROTECTED_MODE_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.redis.protected-mode-disabled",
+    summary: "Redis protected mode disabled",
+    details: "protected-mode no lets Redis serve external clients even when no authentication is configured.",
+    remediation: "Keep protected-mode yes or configure ACLs and bind addresses before exposing Redis.",
+    severity: Severity::High,
+    cwe: "CWE-306",
+    references: &["https://redis.io/docs/latest/operate/oss_and_mgmt/admin/"],
+};
+
+const REDIS_EMPTY_PASSWORD_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.redis.empty-password",
+    summary: "Redis requirepass configured with an empty password",
+    details: "The requirepass directive is set to an empty quoted string, disabling authentication.",
+    remediation: "Configure a strong requirepass value or ACL users instead of an empty password.",
+    severity: Severity::High,
+    cwe: "CWE-521",
+    references: &["https://redis.io/docs/latest/operate/oss_and_mgmt/admin/"],
+};
+
+const SSHD_ROOT_LOGIN_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.sshd.root-login-permitted",
+    summary: "SSH permits direct root login",
+    details: "PermitRootLogin yes allows logins straight into the root account.",
+    remediation: "Use PermitRootLogin no (or prohibit-password) and escalate via sudo.",
+    severity: Severity::High,
+    cwe: "CWE-250",
+    references: &["https://man.openbsd.org/sshd_config#PermitRootLogin"],
+};
+
+const SSHD_PASSWORD_AUTH_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.sshd.password-authentication",
+    summary: "SSH permits password authentication",
+    details: "PasswordAuthentication yes allows brute-forceable password logins.",
+    remediation: "Require public key authentication.",
+    severity: Severity::Medium,
+    cwe: "CWE-521",
+    references: &["https://man.openbsd.org/sshd_config#PasswordAuthentication"],
+};
+
+const SSHD_PROTOCOL_ONE_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.sshd.protocol-version-1",
+    summary: "SSH protocol version 1 enabled",
+    details: "Protocol 1 enables the deprecated SSHv1 protocol with weak integrity guarantees.",
+    remediation: "Support SSH protocol version 2 only.",
+    severity: Severity::High,
+    cwe: "CWE-327",
+    references: &["https://man.openbsd.org/sshd_config#Protocol"],
+};
+
+const SSHD_EMPTY_PASSWORDS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.sshd.empty-passwords-permitted",
+    summary: "SSH permits empty passwords",
+    details: "PermitEmptyPasswords yes lets accounts without passwords authenticate.",
+    remediation: "Reject empty passwords with PermitEmptyPasswords no.",
+    severity: Severity::High,
+    cwe: "CWE-521",
+    references: &["https://man.openbsd.org/sshd_config#PermitEmptyPasswords"],
+};
+
+fn scan_nginx_config(text: &str, builder: &mut FindingBuilder<'_>) {
+    for (number, _, line) in config_lines(text) {
+        let content = effective_config_line(line);
+        let Some((directive, arguments)) = split_config_directive(content) else {
+            continue;
+        };
+        if directive.eq_ignore_ascii_case("ssl_protocols")
+            && argument_tokens(arguments).any(is_weak_protocol_token)
+        {
+            add_service_finding(
+                builder,
+                &NGINX_WEAK_TLS_RULE,
+                content.to_owned(),
+                number,
+                directive_column(line),
+            );
+        } else if directive.eq_ignore_ascii_case("server_tokens")
+            && argument_tokens(arguments)
+                .next()
+                .is_some_and(|value| value.eq_ignore_ascii_case("on"))
+        {
+            add_service_finding(
+                builder,
+                &NGINX_SERVER_TOKENS_RULE,
+                content.to_owned(),
+                number,
+                directive_column(line),
+            );
+        }
+    }
+}
+
+fn scan_apache_config(text: &str, builder: &mut FindingBuilder<'_>) {
+    for (number, _, line) in config_lines(text) {
+        let content = effective_config_line(line);
+        let Some((directive, arguments)) = split_config_directive(content) else {
+            continue;
+        };
+        if directive.eq_ignore_ascii_case("SSLProtocol")
+            && argument_tokens(arguments).any(enables_weak_protocol)
+        {
+            add_service_finding(
+                builder,
+                &APACHE_WEAK_TLS_RULE,
+                content.to_owned(),
+                number,
+                directive_column(line),
+            );
+        } else if directive.eq_ignore_ascii_case("ServerTokens")
+            && argument_tokens(arguments).next().is_some_and(|value| {
+                value.eq_ignore_ascii_case("full") || value.eq_ignore_ascii_case("os")
+            })
+        {
+            add_service_finding(
+                builder,
+                &APACHE_SERVER_TOKENS_RULE,
+                content.to_owned(),
+                number,
+                directive_column(line),
+            );
+        }
+    }
+}
+
+fn scan_pg_hba_config(text: &str, builder: &mut FindingBuilder<'_>) {
+    for (number, _, line) in config_lines(text) {
+        let entry = effective_config_line(line);
+        let field_count = entry.split_whitespace().count();
+        let trust_method = entry
+            .split_whitespace()
+            .last()
+            .is_some_and(|method| method.eq_ignore_ascii_case("trust"));
+        if field_count >= 4 && trust_method {
+            add_service_finding(
+                builder,
+                &PG_HBA_TRUST_RULE,
+                entry.to_owned(),
+                number,
+                directive_column(line),
+            );
+        }
+    }
+}
+
+fn scan_postgresql_config(text: &str, builder: &mut FindingBuilder<'_>) {
+    for (number, _, line) in config_lines(text) {
+        let Some((key, value)) = config_assignment(line) else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("ssl") && value.eq_ignore_ascii_case("off") {
+            add_service_finding(
+                builder,
+                &POSTGRES_SSL_OFF_RULE,
+                effective_config_line(line).to_owned(),
+                number,
+                directive_column(line),
+            );
+        } else if key.eq_ignore_ascii_case("password_encryption")
+            && (value.eq_ignore_ascii_case("md5") || value.eq_ignore_ascii_case("plain"))
+        {
+            add_service_finding(
+                builder,
+                &POSTGRES_WEAK_PASSWORD_RULE,
+                effective_config_line(line).to_owned(),
+                number,
+                directive_column(line),
+            );
+        }
+    }
+}
+
+fn scan_redis_config(text: &str, builder: &mut FindingBuilder<'_>) {
+    for (number, _, line) in config_lines(text) {
+        let Some((key, value)) = config_assignment(line) else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("protected-mode") && value.eq_ignore_ascii_case("no") {
+            add_service_finding(
+                builder,
+                &REDIS_PROTECTED_MODE_RULE,
+                effective_config_line(line).to_owned(),
+                number,
+                directive_column(line),
+            );
+        } else if key.eq_ignore_ascii_case("requirepass") && value.is_empty() {
+            add_service_finding(
+                builder,
+                &REDIS_EMPTY_PASSWORD_RULE,
+                effective_config_line(line).to_owned(),
+                number,
+                directive_column(line),
+            );
+        }
+    }
+}
+
+fn scan_sshd_config(text: &str, builder: &mut FindingBuilder<'_>) {
+    for (number, _, line) in config_lines(text) {
+        let entry = effective_config_line(line);
+        let Some((keyword, arguments)) = split_config_directive(entry) else {
+            continue;
+        };
+        let Some(value) = argument_tokens(arguments).next() else {
+            continue;
+        };
+        if keyword.eq_ignore_ascii_case("PermitRootLogin") && value.eq_ignore_ascii_case("yes") {
+            add_service_finding(
+                builder,
+                &SSHD_ROOT_LOGIN_RULE,
+                entry.to_owned(),
+                number,
+                directive_column(line),
+            );
+        } else if keyword.eq_ignore_ascii_case("PasswordAuthentication")
+            && value.eq_ignore_ascii_case("yes")
+        {
+            add_service_finding(
+                builder,
+                &SSHD_PASSWORD_AUTH_RULE,
+                entry.to_owned(),
+                number,
+                directive_column(line),
+            );
+        } else if keyword.eq_ignore_ascii_case("Protocol") && value == "1" {
+            add_service_finding(
+                builder,
+                &SSHD_PROTOCOL_ONE_RULE,
+                entry.to_owned(),
+                number,
+                directive_column(line),
+            );
+        } else if keyword.eq_ignore_ascii_case("PermitEmptyPasswords")
+            && value.eq_ignore_ascii_case("yes")
+        {
+            add_service_finding(
+                builder,
+                &SSHD_EMPTY_PASSWORDS_RULE,
+                entry.to_owned(),
+                number,
+                directive_column(line),
+            );
+        }
+    }
+}
+
 struct SastRule {
     rule: &'static str,
     regex: Regex,
@@ -1047,6 +1496,22 @@ static SAST_RULES: LazyLock<BTreeMap<&'static str, Vec<SastRule>>> = LazyLock::n
                     Severity::High,
                     "Use parameterized queries and bind every untrusted value.",
                 ),
+                (
+                    "sast.rust.weak-hash-md5",
+                    r"\bMd5\s*::\s*new\s*\(",
+                    "MD5 hash construction",
+                    "CWE-327",
+                    Severity::Medium,
+                    "Use SHA-256 or BLAKE3; MD5 is broken for security-sensitive digests.",
+                ),
+                (
+                    "sast.rust.weak-hash-sha1",
+                    r"\bSha1\s*::\s*new\s*\(",
+                    "SHA-1 hash construction",
+                    "CWE-327",
+                    Severity::Medium,
+                    "Use SHA-256 or BLAKE3; SHA-1 is broken for security-sensitive digests.",
+                ),
             ][..],
         ),
         (
@@ -1075,6 +1540,14 @@ static SAST_RULES: LazyLock<BTreeMap<&'static str, Vec<SastRule>>> = LazyLock::n
                     "CWE-89",
                     Severity::High,
                     "Use driver placeholders and parameter binding.",
+                ),
+                (
+                    "sast.javascript.weak-hash",
+                    r#"\bcreateHash\s*\(\s*["'](md5|sha1)["']\s*\)"#,
+                    "Weak hash algorithm selected",
+                    "CWE-327",
+                    Severity::Medium,
+                    "Hash with createHash('sha256') or stronger algorithms.",
                 ),
             ][..],
         ),
@@ -1105,6 +1578,38 @@ static SAST_RULES: LazyLock<BTreeMap<&'static str, Vec<SastRule>>> = LazyLock::n
                     Severity::High,
                     "Use DB-API placeholders and a separate parameter sequence.",
                 ),
+                (
+                    "sast.python.weak-hash-md5",
+                    r"\bhashlib\.md5\s*\(",
+                    "MD5 hash usage",
+                    "CWE-327",
+                    Severity::Medium,
+                    "Prefer hashlib.sha256 or stronger for security-sensitive digests.",
+                ),
+                (
+                    "sast.python.weak-hash-sha1",
+                    r"\bhashlib\.sha1\s*\(",
+                    "SHA-1 hash usage",
+                    "CWE-327",
+                    Severity::Medium,
+                    "Prefer hashlib.sha256 or stronger for security-sensitive digests.",
+                ),
+                (
+                    "sast.python.pickle-deserialization",
+                    r"\bpickle\.loads?\s*\(",
+                    "Pickle deserialization",
+                    "CWE-502",
+                    Severity::High,
+                    "Exchange data in inert formats such as JSON instead of unpickling bytes.",
+                ),
+                (
+                    "sast.python.yaml-unsafe-load",
+                    r"\byaml\.load\s*\(",
+                    "YAML load without a restricted Loader",
+                    "CWE-502",
+                    Severity::High,
+                    "Use yaml.safe_load or pass an explicit Loader limited to safe types.",
+                ),
             ][..],
         ),
         (
@@ -1125,6 +1630,22 @@ static SAST_RULES: LazyLock<BTreeMap<&'static str, Vec<SastRule>>> = LazyLock::n
                     "CWE-89",
                     Severity::High,
                     "Use database/sql placeholders and pass values as query arguments.",
+                ),
+                (
+                    "sast.go.weak-hash-md5",
+                    r"\bmd5\.New\s*\(",
+                    "MD5 hash construction",
+                    "CWE-327",
+                    Severity::Medium,
+                    "Use crypto/sha256 or stronger hashes for security-sensitive digests.",
+                ),
+                (
+                    "sast.go.weak-hash-sha1",
+                    r"\bsha1\.New\s*\(",
+                    "SHA-1 hash construction",
+                    "CWE-327",
+                    Severity::Medium,
+                    "Use crypto/sha256 or stronger hashes for security-sensitive digests.",
                 ),
             ][..],
         ),
@@ -1147,6 +1668,22 @@ static SAST_RULES: LazyLock<BTreeMap<&'static str, Vec<SastRule>>> = LazyLock::n
                     Severity::High,
                     "Use PreparedStatement placeholders and typed setters.",
                 ),
+                (
+                    "sast.java.weak-hash",
+                    r#"\bMessageDigest\s*\.\s*getInstance\s*\(\s*["'](MD5|SHA-1|SHA1)["']\s*\)"#,
+                    "Weak MessageDigest algorithm requested",
+                    "CWE-327",
+                    Severity::Medium,
+                    "Request SHA-256 or stronger digest algorithms.",
+                ),
+                (
+                    "sast.java.unsafe-deserialization",
+                    r"\bObjectInputStream\b[^;\n]*?\.readObject\s*\(",
+                    "Native Java deserialization",
+                    "CWE-502",
+                    Severity::High,
+                    "Parse untrusted bytes with schema-based formats instead of ObjectInputStream.readObject.",
+                ),
             ][..],
         ),
         (
@@ -1167,6 +1704,22 @@ static SAST_RULES: LazyLock<BTreeMap<&'static str, Vec<SastRule>>> = LazyLock::n
                     "CWE-89",
                     Severity::High,
                     "Use SQL parameters or ExecuteSqlInterpolated with trusted query structure.",
+                ),
+                (
+                    "sast.csharp.weak-hash",
+                    r"\b(?:MD5|SHA1)\.Create\s*\(\s*\)",
+                    "Weak hash algorithm instance",
+                    "CWE-327",
+                    Severity::Medium,
+                    "Create SHA256 or stronger hash instances for security-sensitive digests.",
+                ),
+                (
+                    "sast.csharp.unsafe-deserialization",
+                    r"\bBinaryFormatter\b[^;\n]*?\.Deserialize\s*\(",
+                    "BinaryFormatter deserialization",
+                    "CWE-502",
+                    Severity::High,
+                    "Replace BinaryFormatter with a safe serializer; never deserialize untrusted input.",
                 ),
             ][..],
         ),
@@ -1217,6 +1770,11 @@ fn scan_sast(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
             {
                 continue;
             }
+            if rule.rule == "sast.python.yaml-unsafe-load"
+                && yaml_call_specifies_loader(&text[matched.end()..])
+            {
+                continue;
+            }
             let (line, column) = indexed_line_column(&line_starts, matched.start());
             builder.add(FindingSpec { kind: FindingKind::Sast, rule: rule.rule, line, column, summary: rule.summary, details: "A language-specific call expression uses a dangerous sink with dynamic or explicitly unsafe syntax.", severity: rule.severity, confidence: Confidence::High, description: "Dangerous sink invocation detected; source expression omitted.".to_owned(), references: &["https://owasp.org/www-project-code-review-guide/"], properties: BTreeMap::new(), redacted: true, remediation: rule.remediation, cwe: Some(rule.cwe) });
         }
@@ -1249,6 +1807,46 @@ fn has_single_literal_argument(after_open_paren: &str) -> bool {
         }
     }
     false
+}
+
+static YAML_LOADER_KWARG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bLoader\s*=").expect("constant YAML Loader kwarg regex"));
+
+fn yaml_call_specifies_loader(after_open_paren: &str) -> bool {
+    const MAX_CALL_ARGUMENT_SCAN_BYTES: usize = 16 * 1024;
+    let mut depth = 0_usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut end = after_open_paren.len().min(MAX_CALL_ARGUMENT_SCAN_BYTES);
+    for (index, character) in after_open_paren.char_indices() {
+        if index >= MAX_CALL_ARGUMENT_SCAN_BYTES {
+            break;
+        }
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' | '[' | '{' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    end = index;
+                    break;
+                }
+                depth -= 1;
+            }
+            ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    YAML_LOADER_KWARG_REGEX.is_match(&after_open_paren[..end])
 }
 
 fn offset_in_comment_or_string_prefix(text: &str, offset: usize, extension: &str) -> bool {
@@ -1802,6 +2400,353 @@ mod tests {
         );
         assert!(has(&output, "malware.sha256-denylist"));
         assert!(!has(&output, "secret.github-token"));
+    }
+
+    #[test]
+    fn nginx_rules_flag_weak_tls_protocols_and_version_disclosure() {
+        let output = analyze(
+            "etc/nginx/nginx.conf",
+            "server {\n  ssl_protocols SSLv3 TLSv1.1;\n  server_tokens on;\n}\n",
+        );
+        assert!(has(&output, "iac.nginx.weak-tls-protocol"));
+        assert!(has(&output, "iac.nginx.server-tokens"));
+        let finding = output
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id.as_str() == "iac.nginx.server-tokens")
+            .unwrap();
+        let location = output
+            .locations
+            .iter()
+            .find(|location| Some(&location.id) == finding.location_id.as_ref())
+            .unwrap();
+        assert_eq!(location.start.unwrap().line, 3);
+        let hardened = analyze(
+            "etc/nginx/nginx.conf",
+            "server {\n  ssl_protocols TLSv1.2 TLSv1.3;\n  server_tokens off;\n}\n",
+        );
+        assert!(!has(&hardened, "iac.nginx.weak-tls-protocol"));
+        assert!(!has(&hardened, "iac.nginx.server-tokens"));
+    }
+
+    #[test]
+    fn apache_rules_flag_enabled_weak_protocols_and_verbose_server_tokens() {
+        let output = analyze(
+            "conf/httpd.conf",
+            "SSLProtocol -ALL +SSLv3\nServerTokens OS\n",
+        );
+        assert!(has(&output, "iac.apache.weak-tls-protocol"));
+        assert!(has(&output, "iac.apache.server-tokens"));
+        assert!(has(
+            &analyze("httpd.conf", "SSLProtocol +TLSv1\n"),
+            "iac.apache.weak-tls-protocol"
+        ));
+        assert!(!has(
+            &analyze("httpd.conf", "SSLProtocol -TLSv1\n"),
+            "iac.apache.weak-tls-protocol"
+        ));
+        let hardened = analyze(
+            "conf/httpd.conf",
+            "SSLProtocol -ALL +TLSv1.2\nServerTokens Prod\n",
+        );
+        assert!(!has(&hardened, "iac.apache.weak-tls-protocol"));
+        assert!(!has(&hardened, "iac.apache.server-tokens"));
+    }
+
+    #[test]
+    fn pg_hba_trust_entries_are_flagged_as_critical_missing_authentication() {
+        let output = analyze(
+            "data/pg_hba.conf",
+            "# TYPE DATABASE USER ADDRESS METHOD\nlocal all all trust\nhost app app 10.0.0.0/8 scram-sha-256\n",
+        );
+        let findings = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "iac.pg-hba.trust-authentication")
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[0].kind, FindingKind::Iac);
+    }
+
+    #[test]
+    fn postgresql_ssl_and_password_encryption_rules_flag_concrete_values() {
+        let output = analyze(
+            "postgresql.conf",
+            "ssl = off\npassword_encryption = md5\npassword_encryption = plain\n",
+        );
+        assert!(has(&output, "iac.postgres.ssl-disabled"));
+        assert!(has(&output, "iac.postgres.weak-password-encryption"));
+        let hardened = analyze(
+            "postgresql.conf",
+            "ssl = on\npassword_encryption = scram-sha-256\n",
+        );
+        assert!(!has(&hardened, "iac.postgres.ssl-disabled"));
+        assert!(!has(&hardened, "iac.postgres.weak-password-encryption"));
+    }
+
+    #[test]
+    fn redis_protected_mode_and_empty_requirepass_rules_fire_together() {
+        let output = analyze("redis.conf", "protected-mode no\nrequirepass \"\"\n");
+        assert!(has(&output, "iac.redis.protected-mode-disabled"));
+        assert!(has(&output, "iac.redis.empty-password"));
+        let secured = analyze(
+            "redis.conf",
+            "protected-mode yes\nrequirepass S3cure-Passphrase\n",
+        );
+        assert!(!has(&secured, "iac.redis.protected-mode-disabled"));
+        assert!(!has(&secured, "iac.redis.empty-password"));
+    }
+
+    #[test]
+    fn sshd_rules_flag_each_weak_directive_and_ignore_hardened_values() {
+        let weak = analyze(
+            "etc/ssh/sshd_config",
+            "PermitRootLogin yes\nPasswordAuthentication yes\nProtocol 1\nPermitEmptyPasswords yes\n",
+        );
+        assert!(has(&weak, "iac.sshd.root-login-permitted"));
+        assert!(has(&weak, "iac.sshd.password-authentication"));
+        assert!(has(&weak, "iac.sshd.protocol-version-1"));
+        assert!(has(&weak, "iac.sshd.empty-passwords-permitted"));
+        let hardened = analyze(
+            "etc/ssh/sshd_config",
+            "# PermitRootLogin yes\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nProtocol 2\nPermitEmptyPasswords no\n",
+        );
+        assert!(!has(&hardened, "iac.sshd.root-login-permitted"));
+        assert!(!has(&hardened, "iac.sshd.password-authentication"));
+        assert!(!has(&hardened, "iac.sshd.protocol-version-1"));
+        assert!(!has(&hardened, "iac.sshd.empty-passwords-permitted"));
+    }
+
+    #[test]
+    fn commented_service_config_directives_are_ignored() {
+        let commented = analyze(
+            "nginx.conf",
+            "# ssl_protocols SSLv3;\n# server_tokens on;\n",
+        );
+        assert!(!has(&commented, "iac.nginx.weak-tls-protocol"));
+        assert!(!has(&commented, "iac.nginx.server-tokens"));
+        let pg = analyze("pg_hba.conf", "# local all all trust\n");
+        assert!(!has(&pg, "iac.pg-hba.trust-authentication"));
+    }
+
+    #[test]
+    fn service_config_routing_requires_known_filenames() {
+        assert!(has(
+            &analyze("myapp.conf", "ServerTokens Full\n"),
+            "iac.apache.server-tokens"
+        ));
+        assert!(!has(
+            &analyze("notes.txt", "ServerTokens Full\n"),
+            "iac.apache.server-tokens"
+        ));
+        assert!(!has(
+            &analyze("app.conf", "protected-mode no\n"),
+            "iac.redis.protected-mode-disabled"
+        ));
+        assert!(has(
+            &analyze("redis.conf", "protected-mode no\n"),
+            "iac.redis.protected-mode-disabled"
+        ));
+    }
+
+    #[test]
+    fn service_config_files_in_nested_directories_are_scanned() {
+        let directory = tempdir().unwrap();
+        let nginx_dir = directory.path().join("etc").join("nginx");
+        fs::create_dir_all(&nginx_dir).unwrap();
+        fs::write(
+            nginx_dir.join("nginx.default.conf"),
+            "ssl_protocols TLSv1;\n",
+        )
+        .unwrap();
+        let ssh_dir = directory.path().join("etc").join("ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::write(ssh_dir.join("sshd_config"), "PasswordAuthentication yes\n").unwrap();
+        let output = scan_path(
+            directory.path(),
+            &asset(),
+            &ScannerConfig::default(),
+            &MalwareSignatures::default(),
+        )
+        .unwrap();
+        assert!(has(&output, "iac.nginx.weak-tls-protocol"));
+        assert!(has(&output, "iac.sshd.password-authentication"));
+    }
+
+    #[test]
+    fn python_weak_hash_calls_are_flagged_with_safe_negative() {
+        let output = analyze(
+            "x.py",
+            "digest = hashlib.md5(payload)\nlegacy = hashlib.sha1(payload)\n",
+        );
+        assert!(has(&output, "sast.python.weak-hash-md5"));
+        assert!(has(&output, "sast.python.weak-hash-sha1"));
+        let modern = analyze("x.py", "modern = hashlib.sha256(payload)");
+        assert!(!has(&modern, "sast.python.weak-hash-md5"));
+        assert!(!has(&modern, "sast.python.weak-hash-sha1"));
+    }
+
+    #[test]
+    fn javascript_createhash_flags_only_weak_algorithms() {
+        let output = analyze(
+            "x.js",
+            "const a = createHash('md5');\nconst b = createHash(\"sha1\");\n",
+        );
+        let count = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.weak-hash")
+            .count();
+        assert_eq!(count, 2);
+        assert!(!has(
+            &analyze("x.ts", "const h = createHash('sha256');"),
+            "sast.javascript.weak-hash"
+        ));
+    }
+
+    #[test]
+    fn go_weak_hash_constructors_are_flagged() {
+        let output = analyze("x.go", "h := md5.New()\ns := sha1.New()\n");
+        assert!(has(&output, "sast.go.weak-hash-md5"));
+        assert!(has(&output, "sast.go.weak-hash-sha1"));
+        let modern = analyze("x.go", "h := sha256.New()");
+        assert!(!has(&modern, "sast.go.weak-hash-md5"));
+        assert!(!has(&modern, "sast.go.weak-hash-sha1"));
+    }
+
+    #[test]
+    fn java_message_digest_flags_weak_instances_only() {
+        let output = analyze(
+            "X.java",
+            "MessageDigest a = MessageDigest.getInstance(\"MD5\");\nMessageDigest b = MessageDigest.getInstance(\"SHA-1\");\n",
+        );
+        assert!(has(&output, "sast.java.weak-hash"));
+        assert!(!has(
+            &analyze(
+                "X.java",
+                "MessageDigest d = MessageDigest.getInstance(\"SHA-256\");"
+            ),
+            "sast.java.weak-hash"
+        ));
+    }
+
+    #[test]
+    fn csharp_weak_hash_factories_are_flagged() {
+        let output = analyze("X.cs", "var a = MD5.Create();\nvar b = SHA1.Create();\n");
+        let count = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.csharp.weak-hash")
+            .count();
+        assert_eq!(count, 2);
+        assert!(!has(
+            &analyze("X.cs", "var h = SHA256.Create();"),
+            "sast.csharp.weak-hash"
+        ));
+    }
+
+    #[test]
+    fn rust_weak_hash_constructors_are_flagged() {
+        let output = analyze(
+            "x.rs",
+            "let mut h = Md5::new();\nlet mut s = Sha1::new();\n",
+        );
+        assert!(has(&output, "sast.rust.weak-hash-md5"));
+        assert!(has(&output, "sast.rust.weak-hash-sha1"));
+        let modern = analyze("x.rs", "let mut h = Sha256::new();");
+        assert!(!has(&modern, "sast.rust.weak-hash-md5"));
+        assert!(!has(&modern, "sast.rust.weak-hash-sha1"));
+    }
+
+    #[test]
+    fn python_pickle_deserialization_is_flagged() {
+        assert!(has(
+            &analyze("x.py", "obj = pickle.loads(blob)"),
+            "sast.python.pickle-deserialization"
+        ));
+        assert!(!has(
+            &analyze("x.py", "text = json.loads(blob)"),
+            "sast.python.pickle-deserialization"
+        ));
+    }
+
+    #[test]
+    fn python_yaml_load_requires_restricted_loader() {
+        assert!(has(
+            &analyze("x.py", "cfg = yaml.load(doc)"),
+            "sast.python.yaml-unsafe-load"
+        ));
+        assert!(!has(
+            &analyze("x.py", "cfg = yaml.load(doc, Loader=yaml.SafeLoader)"),
+            "sast.python.yaml-unsafe-load"
+        ));
+        assert!(!has(
+            &analyze(
+                "x.py",
+                "cfg = yaml.load(read(path), Loader=yaml.SafeLoader)"
+            ),
+            "sast.python.yaml-unsafe-load"
+        ));
+        assert!(!has(
+            &analyze("x.py", "safe = yaml.safe_load(doc)"),
+            "sast.python.yaml-unsafe-load"
+        ));
+    }
+
+    #[test]
+    fn java_objectinputstream_readobject_chain_is_flagged() {
+        assert!(has(
+            &analyze(
+                "X.java",
+                "Object o = new ObjectInputStream(in).readObject();"
+            ),
+            "sast.java.unsafe-deserialization"
+        ));
+        assert!(!has(
+            &analyze(
+                "X.java",
+                "ObjectInputStream stream = new ObjectInputStream(in);"
+            ),
+            "sast.java.unsafe-deserialization"
+        ));
+    }
+
+    #[test]
+    fn csharp_binaryformatter_deserialize_chain_is_flagged() {
+        assert!(has(
+            &analyze(
+                "X.cs",
+                "var graph = ((BinaryFormatter)new BinaryFormatter()).Deserialize(stream);"
+            ),
+            "sast.csharp.unsafe-deserialization"
+        ));
+        assert!(!has(
+            &analyze("X.cs", "var model = serializer.Deserialize(stream);"),
+            "sast.csharp.unsafe-deserialization"
+        ));
+    }
+
+    #[test]
+    fn sast_weak_hash_evidence_is_redacted_and_commented_code_ignored() {
+        let output = analyze(
+            "x.js",
+            "const h = createHash('md5').update(secret).digest('hex');",
+        );
+        let finding = output
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id.as_str() == "sast.javascript.weak-hash")
+            .unwrap();
+        assert!(finding.evidence.iter().next().unwrap().redacted);
+        assert!(!has(
+            &analyze("x.js", "// const h = createHash('md5');"),
+            "sast.javascript.weak-hash"
+        ));
+        assert!(!has(
+            &analyze("x.py", "# digest = hashlib.md5(x)"),
+            "sast.python.weak-hash-md5"
+        ));
     }
 
     #[test]

@@ -40,10 +40,11 @@ pub enum ReportFormat {
     Spdx,
     GitLabCodeQuality,
     JsonLines,
+    Csv,
 }
 
 impl ReportFormat {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Json,
         Self::Yaml,
         Self::Table,
@@ -56,6 +57,7 @@ impl ReportFormat {
         Self::Spdx,
         Self::GitLabCodeQuality,
         Self::JsonLines,
+        Self::Csv,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -72,6 +74,7 @@ impl ReportFormat {
             Self::Spdx => "spdx",
             Self::GitLabCodeQuality => "gitlab-code-quality",
             Self::JsonLines => "jsonl",
+            Self::Csv => "csv",
         }
     }
 
@@ -85,6 +88,7 @@ impl ReportFormat {
             Self::Html => "html",
             Self::CycloneDxVex | Self::GitLabCycloneDx => "cdx.json",
             Self::JsonLines => "jsonl",
+            Self::Csv => "csv",
         }
     }
 
@@ -100,6 +104,7 @@ impl ReportFormat {
             Self::CycloneDxVex => "application/vnd.cyclonedx+json",
             Self::GitLabCycloneDx => "application/vnd.cyclonedx+json",
             Self::JsonLines => "application/x-ndjson",
+            Self::Csv => "text/csv; charset=utf-8",
         }
     }
 }
@@ -127,6 +132,7 @@ impl FromStr for ReportFormat {
             "spdx" | "spdx-json" | "spdx-2.3" => Ok(Self::Spdx),
             "gitlab" | "gitlab-code-quality" | "code-quality" => Ok(Self::GitLabCodeQuality),
             "jsonl" | "ndjson" | "json-lines" => Ok(Self::JsonLines),
+            "csv" => Ok(Self::Csv),
             _ => Err(ParseReportFormatError(value.to_owned())),
         }
     }
@@ -237,6 +243,7 @@ fn render_with_limit(
         ReportFormat::JsonLines => {
             render_json_lines(&sanitized, limit, &ReportIndex::new(&sanitized))
         }
+        ReportFormat::Csv => render_csv(&sanitized, limit, &ReportIndex::new(&sanitized)),
     }
 }
 
@@ -1619,6 +1626,154 @@ fn render_json_lines(
     output.finish()
 }
 
+/// RFC 4180 CSV columns for flat finding rows. Order is part of the public
+/// contract and must never change without a major report format revision.
+const CSV_HEADER: [&str; 13] = [
+    "stable_finding_id",
+    "kind",
+    "severity",
+    "confidence",
+    "applicability",
+    "risk_score",
+    "advisory_ids",
+    "purl",
+    "scope",
+    "remediation_fixed_version",
+    "policy_outcome",
+    "location_count",
+    "first_location_path",
+];
+
+fn render_csv(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
+    let mut output = BoundedWriter::new(limit);
+    bounded_write_all(&mut output, csv_row(CSV_HEADER).as_bytes())?;
+    for finding in report.findings.values() {
+        let component = finding
+            .component_id
+            .as_ref()
+            .and_then(|id| report.inventory.components.get(id));
+        let locations = csv_finding_locations(index, finding);
+        let advisories: BTreeSet<&str> = finding
+            .advisory_id
+            .iter()
+            .map(String::as_str)
+            .chain(finding.aliases.iter().map(String::as_str))
+            .collect();
+        let fixed_versions = finding
+            .remediation
+            .as_ref()
+            .map(|remediation| {
+                remediation
+                    .fixed_versions
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .unwrap_or_default();
+        let row = [
+            finding.id.as_str(),
+            finding.kind.as_str(),
+            finding.severity.as_str(),
+            &enum_label(finding.confidence),
+            &finding
+                .applicability
+                .as_ref()
+                .map(|item| enum_label(item.status))
+                .unwrap_or_default(),
+            &finding
+                .risk
+                .as_ref()
+                .map_or_else(String::new, |risk| risk.score().to_string()),
+            &advisories.iter().copied().collect::<Vec<_>>().join(";"),
+            component.map_or("", |item| item.purl.as_str()),
+            &component.map_or_else(String::new, |item| enum_label(item.scope)),
+            &fixed_versions,
+            csv_policy_outcome(index.policies(&finding.id)),
+            &locations.len().to_string(),
+            locations
+                .first()
+                .map_or("", |location| location.path.as_str()),
+        ];
+        bounded_write_all(&mut output, csv_row(row).as_bytes())?;
+    }
+    output.finish()
+}
+
+/// Locations of a finding in deterministic display order: the direct finding
+/// location first, then evidence locations in their sorted set order,
+/// deduplicated, mirroring the SARIF location selection convention.
+fn csv_finding_locations<'a>(index: &ReportIndex<'a>, finding: &Finding) -> Vec<&'a Location> {
+    let mut location_ids: Vec<&LocationId> = Vec::new();
+    if let Some(id) = &finding.location_id {
+        location_ids.push(id);
+    }
+    for evidence in &finding.evidence {
+        for id in &evidence.locations {
+            if !location_ids.contains(&id) {
+                location_ids.push(id);
+            }
+        }
+    }
+    location_ids
+        .into_iter()
+        .filter_map(|id| index.locations.get(id).copied())
+        .collect()
+}
+
+/// Most severe policy outcome across the finding's decisions:
+/// deny beats warn beats allow; no decision renders as an empty cell.
+fn csv_policy_outcome(decisions: &[&PolicyDecision]) -> &'static str {
+    let mut selected = "";
+    for decision in decisions {
+        match decision.outcome {
+            PolicyOutcome::Deny => return policy_outcome(decision.outcome),
+            PolicyOutcome::Warn if selected.is_empty() || selected == "allow" => {
+                selected = policy_outcome(decision.outcome);
+            }
+            PolicyOutcome::Allow if selected.is_empty() => {
+                selected = policy_outcome(decision.outcome);
+            }
+            PolicyOutcome::Warn | PolicyOutcome::Allow => {}
+        }
+    }
+    selected
+}
+
+fn csv_row<'a, I>(fields: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut line = String::new();
+    for (position, field) in fields.into_iter().enumerate() {
+        if position > 0 {
+            line.push(',');
+        }
+        line.push_str(&csv_field(field));
+    }
+    line.push('\n');
+    line
+}
+
+/// RFC 4180 field escaping: quote fields containing commas, quotes, or line
+/// breaks, double embedded quotes, and normalize CR/CR-LF to LF inside values.
+fn csv_field(value: &str) -> String {
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized.contains([',', '"', '\n']) {
+        format!("\"{}\"", normalized.replace('"', "\"\""))
+    } else {
+        normalized
+    }
+}
+
+fn enum_label(value: impl fmt::Debug) -> String {
+    format!("{value:?}").to_ascii_lowercase()
+}
+
 fn pretty_json(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, ReportError> {
     let mut output = BoundedWriter::new(limit);
     let mut serializer = serde_json::Serializer::pretty(&mut output);
@@ -2095,6 +2250,125 @@ mod tests {
         }
     }
 
+    fn parse_csv(text: &str) -> Vec<Vec<String>> {
+        let mut rows = Vec::new();
+        let mut row = Vec::new();
+        let mut field = String::new();
+        let mut quoted = false;
+        let mut chars = text.chars().peekable();
+        while let Some(char) = chars.next() {
+            match char {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    field.push('"');
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => row.push(std::mem::take(&mut field)),
+                '\n' if !quoted => {
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                }
+                other => field.push(other),
+            }
+        }
+        assert!(!quoted, "unterminated quoted CSV field");
+        assert!(row.is_empty() && field.is_empty(), "trailing CSV data");
+        rows
+    }
+
+    #[test]
+    fn csv_format_parses_and_carries_csv_metadata() {
+        assert_eq!("csv".parse::<ReportFormat>().unwrap(), ReportFormat::Csv);
+        assert_eq!(ReportFormat::Csv.as_str(), "csv");
+        assert_eq!(ReportFormat::Csv.extension(), "csv");
+        assert_eq!(ReportFormat::Csv.media_type(), "text/csv; charset=utf-8");
+    }
+
+    #[test]
+    fn csv_empty_report_renders_header_only() {
+        let mut report = fixture();
+        report.findings.clear();
+        report.policy_decisions.clear();
+        report.policy_summary = crate::model::PolicySummary::default();
+        let text = render_to_string(&report, ReportFormat::Csv).unwrap();
+        assert_eq!(
+            text,
+            "stable_finding_id,kind,severity,confidence,applicability,risk_score,advisory_ids,purl,scope,remediation_fixed_version,policy_outcome,location_count,first_location_path\n"
+        );
+    }
+
+    #[test]
+    fn csv_renders_header_and_escaped_deterministic_rows() {
+        let mut report = fixture();
+        let hostile_id = FindingId::new("finding:comma").unwrap();
+        let hostile = Finding {
+            id: hostile_id.clone(),
+            kind: FindingKind::Sast,
+            rule_id: RuleId::new("rule:comma").unwrap(),
+            advisory_id: None,
+            component_id: None,
+            location_id: None,
+            aliases: BTreeSet::from(["x,\"y\"\nz".to_owned()]),
+            summary: Some("has,comma \"quote\"\nand newline".into()),
+            details: None,
+            severity: Severity::Low,
+            confidence: Confidence::Low,
+            evidence: BTreeSet::new(),
+            applicability: None,
+            remediation: Some(Remediation {
+                description: "fix it".into(),
+                fixed_versions: BTreeSet::from(["1,\"2\"\n3".to_owned(), "9.9.9".to_owned()]),
+                references: BTreeSet::new(),
+            }),
+            risk: None,
+            first_seen: None,
+            last_seen: None,
+            modified: None,
+            status: FindingStatus::Open,
+        };
+        report.findings.insert(hostile_id, hostile);
+        let text = render_to_string(&report, ReportFormat::Csv).unwrap();
+        assert_eq!(text, render_to_string(&report, ReportFormat::Csv).unwrap());
+        let rows = parse_csv(&text);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            vec![
+                "stable_finding_id".to_owned(),
+                "kind".to_owned(),
+                "severity".to_owned(),
+                "confidence".to_owned(),
+                "applicability".to_owned(),
+                "risk_score".to_owned(),
+                "advisory_ids".to_owned(),
+                "purl".to_owned(),
+                "scope".to_owned(),
+                "remediation_fixed_version".to_owned(),
+                "policy_outcome".to_owned(),
+                "location_count".to_owned(),
+                "first_location_path".to_owned(),
+            ]
+        );
+        assert_eq!(rows[1][0], "finding:comma");
+        assert_eq!(rows[1][6], "x,\"y\"\nz");
+        assert_eq!(rows[1][9], "1,\"2\"\n3;9.9.9");
+        assert_eq!(rows[1][10], "");
+        assert_eq!(rows[1][11], "0");
+        assert_eq!(rows[1][12], "");
+        assert_eq!(rows[2][0], "finding:stable-1");
+        assert_eq!(rows[2][1], "vulnerability");
+        assert_eq!(rows[2][2], "high");
+        assert_eq!(rows[2][3], "high");
+        assert_eq!(rows[2][4], "affected");
+        assert_eq!(rows[2][5], "9000");
+        assert_eq!(rows[2][6], "CVE-2026-0001;GHSA-test");
+        assert_eq!(rows[2][7], "pkg:cargo/dep@1.2.3");
+        assert_eq!(rows[2][8], "runtime");
+        assert_eq!(rows[2][9], "2.0.0");
+        assert_eq!(rows[2][10], "deny");
+        assert_eq!(rows[2][11], "1");
+        assert_eq!(rows[2][12], "src/a & b.rs");
+    }
     #[test]
     fn every_format_is_deterministic_utf8_and_redacts_metadata() {
         let report = fixture();

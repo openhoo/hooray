@@ -7,6 +7,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use serde_yaml::Value as Yaml;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -132,6 +133,11 @@ impl ScanInput {
         {
             return Ok(Self::CycloneDx(canonical));
         }
+        if lower.ends_with(".spdx.json")
+            || crate::sbom::looks_like_spdx(&read_prefix(&canonical, 4096)?)
+        {
+            return Ok(Self::CycloneDx(canonical));
+        }
         if lower.ends_with(".zip") {
             return Ok(Self::Archive {
                 path: canonical,
@@ -248,6 +254,50 @@ fn scan_virtual_files(
             }
             "packages.lock.json" => {
                 parse_nuget_lock(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "yarn.lock" => {
+                parse_yarn_lock(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "pnpm-lock.yaml" => {
+                parse_pnpm_lock(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "poetry.lock" => {
+                parse_poetry_lock(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "Pipfile.lock" => {
+                parse_pipfile_lock(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "Gemfile.lock" => {
+                parse_gemfile_lock(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "Package.resolved" => {
+                parse_package_resolved(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "pubspec.lock" => {
+                parse_pubspec_lock(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "Podfile.lock" => {
+                parse_podfile_lock(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "composer.json" => {
+                parse_composer_json(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "environment.yml" => {
+                parse_conda_environment(path, bytes, &mut builder)?;
+                recognized = true;
+            }
+            "Chart.yaml" => {
+                parse_chart_yaml(path, bytes, &mut builder)?;
                 recognized = true;
             }
             _ => {}
@@ -742,6 +792,768 @@ fn parse_nuget_lock(
     Ok(())
 }
 
+const MAX_LOCKFILE_ENTRIES: usize = 100_000;
+
+fn entry_bound(count: usize, path: &str, format: &'static str) -> Result<(), InputError> {
+    if count > MAX_LOCKFILE_ENTRIES {
+        Err(malformed_msg(
+            path,
+            format,
+            format!("more than {MAX_LOCKFILE_ENTRIES} entries"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Splits an npm-style `name@locator` descriptor into package name and locator,
+/// honoring `@scope/name` packages and optional pnpm `/`-prefixed lockfile keys.
+fn split_descriptor(descriptor: &str) -> Option<(&str, &str)> {
+    let rest = descriptor.strip_prefix('/').unwrap_or(descriptor);
+    if let Some(scoped) = rest.strip_prefix('@') {
+        let at = scoped.find('@')?;
+        Some((&rest[..at + 1], &rest[at + 2..]))
+    } else {
+        let at = rest.find('@')?;
+        Some((&rest[..at], &rest[at + 1..]))
+    }
+}
+
+type YarnEntries = BTreeMap<String, (String, Vec<(String, bool)>)>;
+type YarnCurrent = (String, String, Vec<(String, bool)>);
+
+fn parse_yarn_lock(path: &str, bytes: &[u8], out: &mut InventoryBuilder) -> Result<(), InputError> {
+    let text = utf8(bytes, path, "yarn.lock")?;
+    if text.starts_with("__metadata:") || text.contains("\n__metadata:") {
+        parse_yarn_berry(path, text, out)
+    } else {
+        parse_yarn_classic(path, text, out)
+    }
+}
+
+fn parse_yarn_classic(
+    path: &str,
+    text: &str,
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let mut entries: YarnEntries = BTreeMap::new();
+    let mut current: Option<YarnCurrent> = None;
+    let mut mode = 0_u8;
+    for raw in text.lines() {
+        let trimmed = raw.trim_end().trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !raw.starts_with(' ') && !raw.starts_with('\t') {
+            let header = trimmed.strip_suffix(':').ok_or_else(|| {
+                malformed_msg(
+                    path,
+                    "yarn.lock",
+                    format!("invalid entry header {trimmed:?}"),
+                )
+            })?;
+            if let Some((name, version, deps)) = current.take() {
+                insert_yarn_entry(&mut entries, path, name, version, deps)?;
+            }
+            let descriptor = header
+                .split(',')
+                .next()
+                .unwrap_or(header)
+                .trim()
+                .trim_matches('"');
+            let Some((name, _)) = split_descriptor(descriptor) else {
+                return Err(malformed_msg(
+                    path,
+                    "yarn.lock",
+                    format!("invalid descriptor {descriptor:?}"),
+                ));
+            };
+            current = Some((name.to_owned(), String::new(), Vec::new()));
+            mode = 0;
+            continue;
+        }
+        let Some((_, version, deps)) = current.as_mut() else {
+            return Err(malformed_msg(
+                path,
+                "yarn.lock",
+                format!("unexpected indented line {trimmed:?}"),
+            ));
+        };
+        match mode {
+            0 => {
+                if let Some(value) = trimmed.strip_prefix("version ") {
+                    *version = value.trim().trim_matches('"').to_owned();
+                } else if trimmed == "dependencies:" {
+                    mode = 1;
+                } else if trimmed == "optionalDependencies:" {
+                    mode = 2;
+                }
+            }
+            _ => {
+                if trimmed == "dependencies:" {
+                    mode = 1;
+                } else if trimmed == "optionalDependencies:" {
+                    mode = 2;
+                } else if let Some(dep) = trimmed.split_whitespace().next() {
+                    deps.push((dep.to_owned(), mode == 2));
+                }
+            }
+        }
+    }
+    if let Some((name, version, deps)) = current.take() {
+        insert_yarn_entry(&mut entries, path, name, version, deps)?;
+    }
+    add_yarn_entries(path, entries, out)
+}
+
+fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Result<(), InputError> {
+    let doc: Yaml = serde_yaml::from_str(text).map_err(|e| malformed(path, "yarn.lock", e))?;
+    let Some(root) = doc.as_mapping() else {
+        return Err(malformed_msg(
+            path,
+            "yarn.lock",
+            "expected a mapping of lockfile entries",
+        ));
+    };
+    let mut entries: YarnEntries = BTreeMap::new();
+    for (key, value) in root {
+        let Some(key) = key.as_str() else { continue };
+        if key == "__metadata" {
+            continue;
+        }
+        let Some(version) = value.get("version").and_then(Yaml::as_str) else {
+            continue;
+        };
+        let descriptor = value
+            .get("resolution")
+            .and_then(Yaml::as_str)
+            .unwrap_or(key);
+        let Some((name, locator)) = split_descriptor(descriptor) else {
+            continue;
+        };
+        if locator.starts_with("workspace:")
+            || locator.starts_with("link:")
+            || locator.starts_with("portal:")
+            || locator.starts_with("file:")
+        {
+            continue;
+        }
+        let mut deps: Vec<(String, bool)> = Vec::new();
+        for (field, optional) in [("dependencies", false), ("optionalDependencies", true)] {
+            if let Some(map) = value.get(field).and_then(Yaml::as_mapping) {
+                for (dep, _) in map {
+                    if let Some(dep) = dep.as_str() {
+                        deps.push((dep.to_owned(), optional));
+                    }
+                }
+            }
+        }
+        deps.sort();
+        deps.dedup();
+        entry_bound(entries.len() + 1, path, "yarn.lock")?;
+        entries
+            .entry(name.to_owned())
+            .or_insert((version.to_owned(), deps));
+    }
+    add_yarn_entries(path, entries, out)
+}
+
+fn insert_yarn_entry(
+    entries: &mut YarnEntries,
+    path: &str,
+    name: String,
+    version: String,
+    mut deps: Vec<(String, bool)>,
+) -> Result<(), InputError> {
+    entry_bound(entries.len() + 1, path, "yarn.lock")?;
+    if version.is_empty() {
+        return Err(malformed_msg(
+            path,
+            "yarn.lock",
+            format!("entry {name} has no version"),
+        ));
+    }
+    deps.sort();
+    deps.dedup();
+    entries.entry(name).or_insert((version, deps));
+    Ok(())
+}
+
+fn add_yarn_entries(
+    path: &str,
+    entries: YarnEntries,
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let mut ids: BTreeMap<String, ComponentId> = BTreeMap::new();
+    for (name, (version, _)) in &entries {
+        let id = out.add("npm", name, version, Scope::Runtime, path, BTreeSet::new())?;
+        ids.insert(name.clone(), id);
+    }
+    for (name, (_, deps)) in &entries {
+        let Some(from) = ids.get(name) else { continue };
+        for (dep, optional) in deps {
+            if let Some(to) = ids.get(dep) {
+                out.edge(from, to, Scope::Runtime, *optional);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_pnpm_lock(path: &str, bytes: &[u8], out: &mut InventoryBuilder) -> Result<(), InputError> {
+    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "pnpm-lock.yaml")?)
+        .map_err(|e| malformed(path, "pnpm-lock.yaml", e))?;
+    let packages = doc.get("packages").and_then(Yaml::as_mapping);
+    let importers = doc.get("importers").and_then(Yaml::as_mapping);
+    if packages.is_none() && importers.is_none() {
+        return Err(malformed_msg(
+            path,
+            "pnpm-lock.yaml",
+            "missing packages and importers sections",
+        ));
+    }
+    let mut ids: BTreeMap<String, ComponentId> = BTreeMap::new();
+    if let Some(packages) = packages {
+        entry_bound(packages.len(), path, "pnpm-lock.yaml")?;
+        for (key, entry) in packages {
+            let Some(key) = key.as_str() else { continue };
+            let Some((name, key_version)) = pnpm_key_parts(key) else {
+                continue;
+            };
+            let version = entry
+                .get("version")
+                .and_then(Yaml::as_str)
+                .unwrap_or(key_version);
+            if version.is_empty() {
+                continue;
+            }
+            let dev = entry.get("dev").and_then(Yaml::as_bool).unwrap_or(false);
+            let optional = entry
+                .get("optional")
+                .and_then(Yaml::as_bool)
+                .unwrap_or(false);
+            let scope = if dev {
+                Scope::Development
+            } else if optional {
+                Scope::Optional
+            } else {
+                Scope::Runtime
+            };
+            let id = out.add("npm", name, version, scope, path, BTreeSet::new())?;
+            ids.insert(name.to_owned(), id);
+        }
+        for (key, entry) in packages {
+            let Some((name, _)) = key.as_str().and_then(pnpm_key_parts) else {
+                continue;
+            };
+            let Some(from) = ids.get(name) else { continue };
+            let Some(deps) = entry.get("dependencies").and_then(Yaml::as_mapping) else {
+                continue;
+            };
+            for (dep, _) in deps {
+                if let Some(to) = dep.as_str().and_then(|dep| ids.get(dep)) {
+                    out.edge(from, to, Scope::Runtime, false);
+                }
+            }
+        }
+    }
+    if let Some(importers) = importers {
+        for importer in importers.values() {
+            for (field, scope) in [
+                ("dependencies", Scope::Runtime),
+                ("devDependencies", Scope::Development),
+                ("optionalDependencies", Scope::Optional),
+            ] {
+                let Some(deps) = importer.get(field).and_then(Yaml::as_mapping) else {
+                    continue;
+                };
+                for (dep, spec) in deps {
+                    let Some(dep) = dep.as_str() else { continue };
+                    if ids.contains_key(dep) {
+                        continue;
+                    }
+                    let Some(version) = pnpm_spec_version(spec) else {
+                        continue;
+                    };
+                    if version.is_empty() {
+                        continue;
+                    }
+                    let id = out.add("npm", dep, &version, scope, path, BTreeSet::new())?;
+                    ids.insert(dep.to_owned(), id);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pnpm_key_parts(key: &str) -> Option<(&str, &str)> {
+    let (name, version) = split_descriptor(key)?;
+    let version = version.split('(').next().unwrap_or(version);
+    (!version.is_empty()).then_some((name, version))
+}
+
+fn pnpm_spec_version(spec: &Yaml) -> Option<String> {
+    let Some(text) = spec.as_str() else {
+        return spec
+            .get("version")
+            .and_then(Yaml::as_str)
+            .map(str::to_owned);
+    };
+    if ["link:", "workspace:", "file:", "portal:"]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+    {
+        return None;
+    }
+    if let Some((_, version)) = pnpm_key_parts(text) {
+        return Some(version.to_owned());
+    }
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn parse_poetry_lock(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let text = utf8(bytes, path, "poetry.lock")?;
+    let value: toml::Value = toml::from_str(text).map_err(|e| malformed(path, "poetry.lock", e))?;
+    let Some(packages) = value.get("package").and_then(toml::Value::as_array) else {
+        return Err(malformed_msg(
+            path,
+            "poetry.lock",
+            "missing [[package]] entries",
+        ));
+    };
+    entry_bound(packages.len(), path, "poetry.lock")?;
+    let mut ids: BTreeMap<String, ComponentId> = BTreeMap::new();
+    for package in packages {
+        let name = package
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| malformed_msg(path, "poetry.lock", "package missing name"))?;
+        let version = package
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                malformed_msg(
+                    path,
+                    "poetry.lock",
+                    format!("package {name} missing version"),
+                )
+            })?;
+        let category = package
+            .get("category")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("main");
+        let optional = package
+            .get("optional")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        let scope = if category == "dev" {
+            Scope::Development
+        } else if optional {
+            Scope::Optional
+        } else {
+            Scope::Runtime
+        };
+        let id = out.add("pypi", name, version, scope, path, BTreeSet::new())?;
+        ids.insert(name.to_ascii_lowercase(), id);
+    }
+    for package in packages {
+        let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        let Some(from) = ids.get(&name.to_ascii_lowercase()) else {
+            continue;
+        };
+        let Some(deps) = package.get("dependencies").and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for dep in deps.keys() {
+            if dep == "python" {
+                continue;
+            }
+            if let Some(to) = ids.get(&dep.to_ascii_lowercase()) {
+                out.edge(from, to, Scope::Runtime, false);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_pipfile_lock(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|e| malformed(path, "Pipfile.lock", e))?;
+    let Some(root) = value.as_object() else {
+        return Err(malformed_msg(
+            path,
+            "Pipfile.lock",
+            "expected a JSON object",
+        ));
+    };
+    for (section, scope) in [("default", Scope::Runtime), ("develop", Scope::Development)] {
+        let Some(packages) = root.get(section).and_then(Value::as_object) else {
+            continue;
+        };
+        entry_bound(packages.len(), path, "Pipfile.lock")?;
+        for (name, entry) in packages {
+            let Some(version) = entry.get("version").and_then(Value::as_str) else {
+                continue;
+            };
+            let version = version.strip_prefix("==").unwrap_or(version);
+            if version.is_empty() {
+                continue;
+            }
+            out.add("pypi", name, version, scope, path, BTreeSet::new())?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_gemfile_lock(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let text = utf8(bytes, path, "Gemfile.lock")?;
+    let mut section = String::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim_end().trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !raw.starts_with(' ') && !raw.starts_with('\t') {
+            section = trimmed.to_owned();
+            continue;
+        }
+        if section != "GEM" {
+            continue;
+        }
+        let spec = trimmed;
+        if spec == "specs:" || spec.starts_with("remote:") {
+            continue;
+        }
+        let Some(open) = spec.find(" (") else {
+            return Err(malformed_msg(
+                path,
+                "Gemfile.lock",
+                format!("invalid gem spec {spec:?}"),
+            ));
+        };
+        let name = &spec[..open];
+        let versions = spec[open + 2..].trim_end_matches(')');
+        let version = versions.split(", ").next().unwrap_or(versions);
+        let version = version.split('-').next().unwrap_or(version);
+        if name.is_empty() || version.is_empty() {
+            return Err(malformed_msg(
+                path,
+                "Gemfile.lock",
+                format!("invalid gem spec {spec:?}"),
+            ));
+        }
+        entry_bound(out.components.len() + 1, path, "Gemfile.lock")?;
+        out.add("gem", name, version, Scope::Runtime, path, BTreeSet::new())?;
+    }
+    Ok(())
+}
+
+fn parse_package_resolved(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|e| malformed(path, "Package.resolved", e))?;
+    let pins = value
+        .get("pins")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            value
+                .get("object")
+                .and_then(|object| object.get("pins"))
+                .and_then(Value::as_array)
+        })
+        .ok_or_else(|| malformed_msg(path, "Package.resolved", "missing pins array"))?;
+    entry_bound(pins.len(), path, "Package.resolved")?;
+    for pin in pins {
+        let name = pin
+            .get("identity")
+            .or_else(|| pin.get("package"))
+            .and_then(Value::as_str);
+        let version = pin
+            .get("state")
+            .and_then(|state| state.get("version"))
+            .and_then(Value::as_str);
+        let (Some(name), Some(version)) = (name, version) else {
+            continue;
+        };
+        if name.is_empty() || version.is_empty() {
+            continue;
+        }
+        out.add(
+            "swift",
+            name,
+            version,
+            Scope::Runtime,
+            path,
+            BTreeSet::new(),
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_pubspec_lock(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "pubspec.lock")?)
+        .map_err(|e| malformed(path, "pubspec.lock", e))?;
+    let Some(packages) = doc.get("packages").and_then(Yaml::as_mapping) else {
+        return Err(malformed_msg(
+            path,
+            "pubspec.lock",
+            "missing packages section",
+        ));
+    };
+    entry_bound(packages.len(), path, "pubspec.lock")?;
+    for (key, entry) in packages {
+        let Some(name) = key.as_str() else { continue };
+        let Some(source) = entry.get("source").and_then(Yaml::as_str) else {
+            continue;
+        };
+        if source != "hosted" {
+            continue;
+        }
+        let Some(version) = entry.get("version").and_then(Yaml::as_str) else {
+            continue;
+        };
+        let dependency = entry
+            .get("dependency")
+            .and_then(Yaml::as_str)
+            .unwrap_or_default();
+        let scope = if dependency.ends_with("dev") {
+            Scope::Development
+        } else {
+            Scope::Runtime
+        };
+        out.add("pub", name, version, scope, path, BTreeSet::new())?;
+    }
+    Ok(())
+}
+
+fn parse_podfile_lock(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let text = utf8(bytes, path, "Podfile.lock")?;
+    let mut section = String::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim_end().trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !raw.starts_with(' ') && !raw.starts_with('\t') {
+            section = trimmed.trim_end_matches(':').to_owned();
+            continue;
+        }
+        if section != "PODS" {
+            continue;
+        }
+        let Some(entry) = trimmed.strip_prefix("- ") else {
+            continue;
+        };
+        let Some(open) = entry.find(" (") else {
+            return Err(malformed_msg(
+                path,
+                "Podfile.lock",
+                format!("pod entry missing version {entry:?}"),
+            ));
+        };
+        let full_name = &entry[..open];
+        let name = full_name.split('/').next().unwrap_or(full_name);
+        let versions = entry[open + 2..].trim_end_matches(')');
+        let version = versions.split(", ").next().unwrap_or(versions);
+        if name.is_empty() || version.is_empty() {
+            return Err(malformed_msg(
+                path,
+                "Podfile.lock",
+                format!("pod entry missing version {entry:?}"),
+            ));
+        }
+        entry_bound(out.components.len() + 1, path, "Podfile.lock")?;
+        out.add(
+            "cocoapods",
+            name,
+            version,
+            Scope::Runtime,
+            path,
+            BTreeSet::new(),
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_composer_json(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|e| malformed(path, "composer.json", e))?;
+    let root = value
+        .as_object()
+        .ok_or_else(|| malformed_msg(path, "composer.json", "expected a JSON object"))?;
+    if let Some(version) = root
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        out.asset.version = Some(version.to_owned());
+    }
+    for (section, scope) in [
+        ("require", Scope::Runtime),
+        ("require-dev", Scope::Development),
+    ] {
+        let Some(packages) = root.get(section).and_then(Value::as_object) else {
+            continue;
+        };
+        entry_bound(packages.len(), path, "composer.json")?;
+        for (name, constraint) in packages {
+            // Platform packages (php, ext-*, lib-*, composer) carry no vendor/name pair.
+            if !name.contains('/') {
+                continue;
+            }
+            let Some(constraint) = constraint.as_str() else {
+                continue;
+            };
+            if constraint.is_empty() {
+                continue;
+            }
+            out.add("composer", name, constraint, scope, path, BTreeSet::new())?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_conda_environment(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "environment.yml")?)
+        .map_err(|e| malformed(path, "environment.yml", e))?;
+    let Some(dependencies) = doc.get("dependencies").and_then(Yaml::as_sequence) else {
+        return Err(malformed_msg(
+            path,
+            "environment.yml",
+            "missing dependencies list",
+        ));
+    };
+    entry_bound(dependencies.len(), path, "environment.yml")?;
+    let mut pip = Vec::new();
+    for entry in dependencies {
+        if let Some(spec) = entry.as_str() {
+            add_conda_spec(path, spec, out)?;
+        } else if let Some(lines) = entry.get("pip").and_then(Yaml::as_sequence) {
+            for line in lines {
+                if let Some(cleaned) = line.as_str().and_then(clean_pip_requirement) {
+                    pip.push(cleaned);
+                }
+            }
+        }
+    }
+    if !pip.is_empty() {
+        let requirements = pip.join("\n");
+        parse_requirements(path, requirements.as_bytes(), out)?;
+    }
+    Ok(())
+}
+
+fn add_conda_spec(path: &str, spec: &str, out: &mut InventoryBuilder) -> Result<(), InputError> {
+    let spec = spec.split('#').next().unwrap_or(spec).trim();
+    let spec = spec.rsplit("::").next().unwrap_or(spec);
+    let name_end = spec
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
+        .unwrap_or(spec.len());
+    let name = &spec[..name_end];
+    if name.is_empty() {
+        return Ok(());
+    }
+    let version = spec[name_end..]
+        .trim_start_matches(|c: char| "=<>!~ ".contains(c))
+        .split([',', ';', ' ', '\t'])
+        .next()
+        .unwrap_or_default();
+    if version.is_empty() {
+        return Ok(());
+    }
+    entry_bound(out.components.len() + 1, path, "environment.yml")?;
+    out.add(
+        "conda",
+        name,
+        version,
+        Scope::Runtime,
+        path,
+        BTreeSet::new(),
+    )?;
+    Ok(())
+}
+
+fn clean_pip_requirement(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with("-r")
+        || trimmed.starts_with("-e")
+    {
+        return None;
+    }
+    let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim();
+    trimmed.contains("==").then(|| trimmed.to_owned())
+}
+
+fn parse_chart_yaml(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "Chart.yaml")?)
+        .map_err(|e| malformed(path, "Chart.yaml", e))?;
+    if let Some(version) = doc
+        .get("version")
+        .and_then(Yaml::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        out.asset.version = Some(version.to_owned());
+    }
+    let Some(dependencies) = doc.get("dependencies").and_then(Yaml::as_sequence) else {
+        return Ok(());
+    };
+    entry_bound(dependencies.len(), path, "Chart.yaml")?;
+    for dependency in dependencies {
+        let Some(name) = dependency.get("name").and_then(Yaml::as_str) else {
+            continue;
+        };
+        let Some(version) = dependency.get("version").and_then(Yaml::as_str) else {
+            continue;
+        };
+        if name.is_empty() || version.is_empty() {
+            continue;
+        }
+        out.add("helm", name, version, Scope::Runtime, path, BTreeSet::new())?;
+    }
+    Ok(())
+}
+
 fn scan_oci_layout(root: &Path, config: &Config) -> Result<Inventory, InputError> {
     reject_symlink_ancestors(root)?;
     let index = read_limited(&root.join("index.json"), config.max_input_bytes)?;
@@ -1071,6 +1883,17 @@ fn has_project_manifest(root: &Path) -> Result<bool, InputError> {
         "requirements.txt",
         "go.mod",
         "packages.lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "Pipfile.lock",
+        "Gemfile.lock",
+        "Package.resolved",
+        "pubspec.lock",
+        "Podfile.lock",
+        "composer.json",
+        "environment.yml",
+        "Chart.yaml",
     ] {
         let path = root.join(name);
         if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()) {
@@ -1091,6 +1914,17 @@ fn is_inventory_file(path: &Path) -> bool {
                 | "go.mod"
                 | "go.sum"
                 | "packages.lock.json"
+                | "yarn.lock"
+                | "pnpm-lock.yaml"
+                | "poetry.lock"
+                | "Pipfile.lock"
+                | "Gemfile.lock"
+                | "Package.resolved"
+                | "pubspec.lock"
+                | "Podfile.lock"
+                | "composer.json"
+                | "environment.yml"
+                | "Chart.yaml"
         )
     })
 }
@@ -1564,6 +2398,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn detection_routes_spdx_documents_by_extension_and_content() {
+        let dir = tempdir().unwrap();
+        let document = r#"{"spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT","name":"x"}"#;
+        for name in ["sbom.spdx.json", "plain.json"] {
+            let path = dir.path().join(name);
+            fs::write(&path, document).unwrap();
+            assert!(
+                matches!(
+                    ScanInput::detect(&path, &config()),
+                    Ok(ScanInput::CycloneDx(_))
+                ),
+                "{name} should route to the SBOM entry"
+            );
+        }
+        let cyclonedx = dir.path().join("bom.json");
+        fs::write(
+            &cyclonedx,
+            r#"{"bomFormat":"CycloneDX","specVersion":"1.5"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ScanInput::detect(&cyclonedx, &config()),
+            Ok(ScanInput::CycloneDx(_))
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn detection_rejects_non_file_non_directory_paths() {
@@ -2030,5 +2891,569 @@ mod tests {
                 maximum: 4
             })
         ));
+    }
+
+    fn new_ecosystem_fixture(name: &str) -> &'static str {
+        match name {
+            "yarn.lock" => "a@1:\n  version \"1\"\n",
+            "pnpm-lock.yaml" => {
+                "lockfileVersion: '9.0'\npackages:\n  a@1:\n    resolution: {integrity: sha512-x}\n"
+            }
+            "poetry.lock" => "[[package]]\nname = 'a'\nversion = '1'\n",
+            "Pipfile.lock" => "{}",
+            "Gemfile.lock" => "GEM\n  specs:\n    a (1)\n",
+            "Package.resolved" => "{\"pins\":[]}",
+            "pubspec.lock" => "packages: {}\n",
+            "Podfile.lock" => "PODS:\n  - A (1)\n",
+            "composer.json" => "{}",
+            "environment.yml" => "dependencies: []\n",
+            _ => "apiVersion: v2\n",
+        }
+    }
+
+    #[test]
+    fn detects_new_ecosystem_project_directories() {
+        for name in [
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "poetry.lock",
+            "Pipfile.lock",
+            "Gemfile.lock",
+            "Package.resolved",
+            "pubspec.lock",
+            "Podfile.lock",
+            "composer.json",
+            "environment.yml",
+            "Chart.yaml",
+        ] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join(name), new_ecosystem_fixture(name)).unwrap();
+            let inventory = scan_path(dir.path(), &config()).unwrap();
+            assert_eq!(inventory.asset.kind, AssetKind::Repository, "{name}");
+        }
+    }
+
+    #[test]
+    fn scans_yarn_lock_classic_and_berry_formats() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("yarn.lock"),
+            concat!(
+                "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT.\n",
+                "\n",
+                "left-pad@^1.3.0:\n",
+                "  version \"1.3.0\"\n",
+                "  resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz\"\n",
+                "  integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8yNrjeoQk1w==\n",
+                "  dependencies:\n",
+                "    kind-of \"^6.0.3\"\n",
+                "\n",
+                "kind-of@^6.0.3:\n",
+                "  version \"6.0.3\"\n",
+                "\n",
+                "\"@babel/core@^7.0.0\":\n",
+                "  version \"7.23.0\"\n",
+                "  dependencies:\n",
+                "    \"@babel/code-generator\" \"^7.22.0\"\n",
+                "  optionalDependencies:\n",
+                "    fsevents \"^2.3.2\"\n",
+                "\n",
+                "fsevents@^2.3.2:\n",
+                "  version \"2.3.2\"\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "@babel/core" && c.version == "7.23.0")
+        );
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "left-pad" && c.version == "1.3.0")
+        );
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "kind-of" && c.version == "6.0.3")
+        );
+        assert!(
+            !inventory
+                .components
+                .values()
+                .any(|c| c.name == "@babel/code-generator")
+        );
+        assert_eq!(inventory.components.len(), 4);
+        assert_eq!(inventory.dependencies.len(), 2);
+        assert!(inventory.dependencies.iter().any(|e| e.optional));
+
+        let berry = tempdir().unwrap();
+        fs::write(
+            berry.path().join("yarn.lock"),
+            concat!(
+                "# This file is generated by running \"yarn install\" inside your project.\n",
+                "__metadata:\n",
+                "  version: 8\n",
+                "  cacheKey: 10c0\n",
+                "\n",
+                "\"left-pad@npm:1.3.0\":\n",
+                "  version: 1.3.0\n",
+                "  resolution: \"left-pad@npm:1.3.0\"\n",
+                "  dependencies:\n",
+                "    kind-of: ^6.0.3\n",
+                "  languageName: node\n",
+                "  linkType: hard\n",
+                "\n",
+                "\"kind-of@npm:^6.0.3\":\n",
+                "  version: 6.0.3\n",
+                "  resolution: \"kind-of@npm:6.0.3\"\n",
+                "  languageName: node\n",
+                "  linkType: hard\n",
+                "\n",
+                "\"my-app@workspace:.\":\n",
+                "  version: 0.0.0-use.local\n",
+                "  resolution: \"my-app@workspace:.\"\n",
+                "  dependencies:\n",
+                "    left-pad: ^1.3.0\n",
+                "  languageName: unknown\n",
+                "  linkType: soft\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(berry.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 2);
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "left-pad" && c.version == "1.3.0")
+        );
+        assert!(!inventory.components.values().any(|c| c.name == "my-app"));
+        assert_eq!(inventory.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn scans_pnpm_lock_importers_and_packages() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            concat!(
+                "lockfileVersion: '9.0'\n",
+                "\n",
+                "importers:\n",
+                "  .:\n",
+                "    dependencies:\n",
+                "      lodash:\n",
+                "        specifier: ^4.17.21\n",
+                "        version: 4.17.21\n",
+                "    devDependencies:\n",
+                "      typescript:\n",
+                "        specifier: ^5.0.0\n",
+                "        version: 5.2.2\n",
+                "\n",
+                "packages:\n",
+                "\n",
+                "  lodash@4.17.21:\n",
+                "    resolution: {integrity: sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg}\n",
+                "    dev: false\n",
+                "\n",
+                "  typescript@5.2.2:\n",
+                "    resolution: {integrity: sha512-mIbW0Sf0MfmZIkWwZlNdcLYy4EBEOJaCKdqXmQOf9zQiEUxJ0jEroBNkdwgY2PLq9mRlMkORLp+V0OsdbNQPA}\n",
+                "    dev: true\n",
+                "\n",
+                "  chokidar@3.5.3:\n",
+                "    resolution: {integrity: sha512-ynBi1dZ7l5dXKUeXlV+1dCBJbAwxWfllPhtuK1qN5G5pXGDX1n7IvYiA3TQmRfHFRhXk2QBWmVBQlBlyYCUAA}\n",
+                "    optional: true\n",
+                "    hasBin: true\n",
+                "    dependencies:\n",
+                "      anymatch: '3.1.3'\n",
+                "\n",
+                "  anymatch@3.1.3:\n",
+                "    resolution: {integrity: sha512-z4s7hNABNkPnHhVBMuUoCJhJSxkwkutdBmM9E2jY0GkqGnJGdyxpmVdMk9HtNi2F4}\n",
+                "\n",
+                "  left-pad@1.3.0:\n",
+                "    resolution: {integrity: sha512-xIxjYzfAtRcAwY6CwSChWBFjJXyInpY3wLjWkgOaKQ3JDmGmoRV4vSuYqQoVOyjKw}\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let scope_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.scope)
+        };
+        assert_eq!(scope_of("lodash"), Some(Scope::Runtime));
+        assert_eq!(scope_of("typescript"), Some(Scope::Development));
+        assert_eq!(scope_of("chokidar"), Some(Scope::Optional));
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "left-pad" && c.version == "1.3.0")
+        );
+        assert!(inventory.dependencies.iter().any(|e| {
+            inventory.components.get(&e.from).map(|c| c.name.as_str()) == Some("chokidar")
+                && inventory.components.get(&e.to).map(|c| c.name.as_str()) == Some("anymatch")
+        }));
+    }
+
+    #[test]
+    fn scans_poetry_and_pipfile_python_locks() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("poetry.lock"),
+            concat!(
+                "[metadata]\n",
+                "lock-version = \"2.0\"\n",
+                "\n",
+                "[[package]]\n",
+                "name = \"requests\"\n",
+                "version = \"2.31.0\"\n",
+                "optional = false\n",
+                "category = \"main\"\n",
+                "dependencies = { charset-normalizer = { version = \"^3.0\" } }\n",
+                "\n",
+                "[[package]]\n",
+                "name = \"charset-normalizer\"\n",
+                "version = \"3.3.2\"\n",
+                "category = \"main\"\n",
+                "\n",
+                "[[package]]\n",
+                "name = \"pytest\"\n",
+                "version = \"7.4.2\"\n",
+                "category = \"dev\"\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let scope_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.scope)
+        };
+        assert_eq!(scope_of("requests"), Some(Scope::Runtime));
+        assert_eq!(scope_of("pytest"), Some(Scope::Development));
+        assert_eq!(inventory.components.len(), 3);
+        assert!(inventory.dependencies.iter().any(|e| {
+            inventory.components.get(&e.from).map(|c| c.name.as_str()) == Some("requests")
+                && inventory.components.get(&e.to).map(|c| c.name.as_str())
+                    == Some("charset-normalizer")
+        }));
+
+        let pipfile = tempdir().unwrap();
+        fs::write(
+            pipfile.path().join("Pipfile.lock"),
+            r#"{"_meta":{"requires":{}},"default":{"requests":{"version":"==2.31.0","hashes":["sha256:abc"]}},"develop":{"pytest":{"version":"==7.4.2"}}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(pipfile.path(), &config()).unwrap();
+        let scope_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.scope)
+        };
+        assert_eq!(scope_of("requests"), Some(Scope::Runtime));
+        assert_eq!(scope_of("pytest"), Some(Scope::Development));
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "requests" && c.version == "2.31.0")
+        );
+    }
+
+    #[test]
+    fn scans_gemfile_and_package_resolved_locks() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Gemfile.lock"),
+            concat!(
+                "GEM\n",
+                "  remote: https://rubygems.org/\n",
+                "  specs:\n",
+                "    rake (13.0.6)\n",
+                "    nokogiri (1.15.2-x86_64-linux)\n",
+                "    bundler (2.4.10, 2.4.19)\n",
+                "\n",
+                "PLATFORMS\n",
+                "  ruby\n",
+                "  x86_64-linux\n",
+                "\n",
+                "DEPENDENCIES\n",
+                "  rake\n",
+                "\n",
+                "BUNDLED WITH\n",
+                "   2.4.19\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let version_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.version.clone())
+        };
+        assert_eq!(version_of("rake").as_deref(), Some("13.0.6"));
+        assert_eq!(version_of("nokogiri").as_deref(), Some("1.15.2"));
+        assert_eq!(version_of("bundler").as_deref(), Some("2.4.10"));
+        assert_eq!(inventory.components.len(), 3);
+
+        let resolved = tempdir().unwrap();
+        fs::write(
+            resolved.path().join("Package.resolved"),
+            r#"{"version":2,"pins":[{"identity":"swift-log","kind":"remoteSourceXCMerge","state":{"version":"1.5.3"}},{"identity":"swift-argument-parser","kind":"remoteSourceXCMerge","state":{"revision":"abc123","branch":"main"}}]}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(resolved.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 1);
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "swift-log" && c.version == "1.5.3")
+        );
+
+        let legacy = tempdir().unwrap();
+        fs::write(
+            legacy.path().join("Package.resolved"),
+            r#"{"object":{"pins":[{"package":"Alamofire","repositoryURL":"https://github.com/Alamofire/Alamofire.git","state":{"version":"5.8.0"}}]}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(legacy.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 1);
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "Alamofire" && c.version == "5.8.0")
+        );
+    }
+
+    #[test]
+    fn scans_pubspec_and_podfile_locks() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pubspec.lock"),
+            concat!(
+                "sdks:\n",
+                "  dart: \">=3.0.0 <4.0.0\"\n",
+                "packages:\n",
+                "  http:\n",
+                "    dependency: \"direct main\"\n",
+                "    source: hosted\n",
+                "    version: \"1.1.0\"\n",
+                "  test:\n",
+                "    dependency: \"direct dev\"\n",
+                "    source: hosted\n",
+                "    version: \"1.24.3\"\n",
+                "  collection:\n",
+                "    dependency: transitive\n",
+                "    source: hosted\n",
+                "    version: \"1.18.0\"\n",
+                "  flutter:\n",
+                "    dependency: \"direct main\"\n",
+                "    source: sdk\n",
+                "    version: \"0.0.0\"\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let scope_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.scope)
+        };
+        assert_eq!(scope_of("http"), Some(Scope::Runtime));
+        assert_eq!(scope_of("test"), Some(Scope::Development));
+        assert_eq!(scope_of("collection"), Some(Scope::Runtime));
+        assert_eq!(inventory.components.len(), 3);
+
+        let pods = tempdir().unwrap();
+        fs::write(
+            pods.path().join("Podfile.lock"),
+            concat!(
+                "PODS:\n",
+                "  - SDWebImage/Core (5.15.5)\n",
+                "  - SDWebImage/MapKit (5.15.5)\n",
+                "  - Firebase/Auth (10.4.0)\n",
+                "\n",
+                "DEPENDENCIES:\n",
+                "  - Firebase/Auth (= 10.4.0)\n",
+                "\n",
+                "SPEC REPOS:\n",
+                "  trunk:\n",
+                "    - Firebase\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(pods.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 2);
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "SDWebImage" && c.version == "5.15.5")
+        );
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "Firebase" && c.version == "10.4.0")
+        );
+    }
+
+    #[test]
+    fn scans_composer_conda_and_chart_inputs() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("composer.json"),
+            r#"{"name":"acme/app","version":"1.2.3","require":{"php":">=8.1","ext-json":"*","symfony/console":"^6.3","monolog/monolog":"^3.0"},"require-dev":{"phpunit/phpunit":"^10.0"}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.version.as_deref(), Some("1.2.3"));
+        let scope_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.scope)
+        };
+        assert_eq!(scope_of("symfony/console"), Some(Scope::Runtime));
+        assert_eq!(scope_of("phpunit/phpunit"), Some(Scope::Development));
+        assert!(
+            !inventory
+                .components
+                .values()
+                .any(|c| c.name == "php" || c.name == "ext-json")
+        );
+        assert_eq!(inventory.components.len(), 3);
+
+        let conda = tempdir().unwrap();
+        fs::write(
+            conda.path().join("environment.yml"),
+            concat!(
+                "name: ml\n",
+                "dependencies:\n",
+                "  - python=3.11\n",
+                "  - conda-forge::numpy=1.24.*\n",
+                "  - pytorch>=2.0,<3\n",
+                "  - pip\n",
+                "  - pip:\n",
+                "      - requests==2.31.0\n",
+                "      - --index-url https://example.com/simple\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(conda.path(), &config()).unwrap();
+        let version_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.version.clone())
+        };
+        assert_eq!(version_of("python").as_deref(), Some("3.11"));
+        assert_eq!(version_of("numpy").as_deref(), Some("1.24.*"));
+        assert_eq!(version_of("pytorch").as_deref(), Some("2.0"));
+        assert_eq!(version_of("requests").as_deref(), Some("2.31.0"));
+        assert_eq!(inventory.components.len(), 4);
+
+        let chart = tempdir().unwrap();
+        fs::write(
+            chart.path().join("Chart.yaml"),
+            concat!(
+                "apiVersion: v2\n",
+                "name: myapp\n",
+                "version: 1.4.2\n",
+                "dependencies:\n",
+                "  - name: postgresql\n",
+                "    version: \"13.2.0\"\n",
+                "    repository: https://charts.bitnami.com/bitnami\n",
+                "  - name: redis\n",
+                "    version: \"17.15.0\"\n",
+                "    condition: redis.enabled\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(chart.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.version.as_deref(), Some("1.4.2"));
+        assert_eq!(inventory.components.len(), 2);
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "postgresql" && c.version == "13.2.0")
+        );
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "redis" && c.version == "17.15.0")
+        );
+    }
+
+    #[test]
+    fn malformed_new_ecosystem_inputs_name_the_rejected_format() {
+        let cases = [
+            (
+                "yarn.lock",
+                "left-pad@^1.3.0\n  version \"1.3.0\"\n",
+                "yarn.lock",
+            ),
+            ("pnpm-lock.yaml", "packages: 42\n", "pnpm-lock.yaml"),
+            ("poetry.lock", "[[package]]\nname = 'a'\n", "poetry.lock"),
+            ("Pipfile.lock", "[1,2]", "Pipfile.lock"),
+            ("Gemfile.lock", "GEM\n  specs:\n    rake\n", "Gemfile.lock"),
+            ("Package.resolved", "{\"pins\": 42}", "Package.resolved"),
+            ("pubspec.lock", "packages: 42\n", "pubspec.lock"),
+            ("Podfile.lock", "PODS:\n  - SDWebImage\n", "Podfile.lock"),
+            ("composer.json", "[1]", "composer.json"),
+            ("environment.yml", "dependencies: 42\n", "environment.yml"),
+            ("Chart.yaml", "dependencies: [unclosed\n", "Chart.yaml"),
+        ];
+        for (name, contents, expected_format) in cases {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join(name), contents).unwrap();
+            let error = scan_path(dir.path(), &config()).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    InputError::Malformed { format, .. } if format == expected_format
+                ),
+                "unexpected error for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn lockfile_entry_bound_rejects_oversized_counts() {
+        let error = entry_bound(MAX_LOCKFILE_ENTRIES + 1, "yarn.lock", "yarn.lock").unwrap_err();
+        assert!(matches!(
+            error,
+            InputError::Malformed { format, .. } if format == "yarn.lock"
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "malformed yarn.lock document at yarn.lock: more than {MAX_LOCKFILE_ENTRIES} entries"
+            )
+        );
+        assert!(entry_bound(MAX_LOCKFILE_ENTRIES, "yarn.lock", "yarn.lock").is_ok());
     }
 }

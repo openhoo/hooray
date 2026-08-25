@@ -39,10 +39,18 @@ pub enum SbomError {
     ConflictingComponent(String),
     #[error("dependency '{from}' references unknown component '{to}'")]
     UnknownDependency { from: String, to: String },
+    #[error("failed to parse SPDX JSON: {0}")]
+    SpdxMalformedJson(String),
+    #[error("unsupported SPDX version '{found}'; expected SPDX-2.x")]
+    UnsupportedSpdxVersion { found: String },
+    #[error("duplicate SPDXID '{0}'")]
+    DuplicateSpdxId(String),
     #[error("invalid inventory: {0}")]
     InvalidInventory(#[from] ModelInvariantError),
 }
 
+/// Parses an SBOM document, auto-detecting SPDX 2.x JSON via the `spdxVersion`
+/// key and otherwise applying the CycloneDX JSON flow.
 pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
     if input.is_empty() {
         return Err(SbomError::Empty);
@@ -52,6 +60,10 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
             actual: input.len(),
             maximum: MAX_SBOM_BYTES,
         });
+    }
+
+    if looks_like_spdx(input) {
+        return parse_spdx(input);
     }
 
     let sbom: CycloneDxSbom = serde_json::from_slice(input)?;
@@ -448,6 +460,298 @@ struct CycloneDxDependency {
     depends_on: Vec<String>,
 }
 
+fn parse_spdx(input: &[u8]) -> Result<Inventory, SbomError> {
+    let document: SpdxDocument = serde_json::from_slice(input)
+        .map_err(|error| SbomError::SpdxMalformedJson(error.to_string()))?;
+    if !document.spdx_version.trim().starts_with("SPDX-2.") {
+        return Err(SbomError::UnsupportedSpdxVersion {
+            found: document.spdx_version.trim().to_owned(),
+        });
+    }
+    if document.packages.is_empty() {
+        return Err(SbomError::NoComponents);
+    }
+    let digest = hex_digest(input);
+    let asset_id =
+        AssetId::new(format!("sbom:sha256:{digest}")).map_err(|_| SbomError::InvalidFormat)?;
+    let asset = Asset {
+        id: asset_id.clone(),
+        name: trimmed(document.name.as_deref())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "SPDX SBOM".to_owned()),
+        kind: AssetKind::Sbom,
+        version: None,
+        metadata: spdx_asset_metadata(&document),
+    };
+    let source = Source {
+        kind: SourceKind::Sbom,
+        locator: format!("sha256:{digest}"),
+        digest: Some(format!("sha256:{digest}")),
+    };
+    let mut state = ParseState {
+        asset_id: &asset_id,
+        source: &source,
+        components: BTreeMap::new(),
+        dependencies: BTreeSet::new(),
+        refs: BTreeMap::new(),
+        count: 0,
+    };
+    collect_spdx_packages(&document.packages, &mut state)?;
+    collect_spdx_relationships(
+        &document.relationships,
+        &state.refs,
+        &mut state.dependencies,
+    )?;
+    let inventory = Inventory {
+        asset,
+        components: state.components,
+        locations: BTreeSet::new(),
+        dependencies: state.dependencies,
+    };
+    inventory.validate()?;
+    Ok(inventory)
+}
+
+fn collect_spdx_packages(
+    packages: &[SpdxPackage],
+    state: &mut ParseState<'_>,
+) -> Result<(), SbomError> {
+    for (index, package) in packages.iter().enumerate() {
+        state.count += 1;
+        if state.count > MAX_COMPONENTS {
+            return Err(SbomError::TooManyComponents);
+        }
+        let package_path = format!("packages[{index}]");
+        let spdx_id = required(&package.spdx_id, "SPDXID", &package_path)?;
+        let name = required(&package.name, "name", &package_path)?;
+        let version = required(&package.version_info, "versionInfo", &package_path)?;
+        let purl = match spdx_package_purl(package) {
+            Some(purl) => {
+                if !is_versioned_purl(&purl) {
+                    return Err(SbomError::InvalidComponent {
+                        path: package_path.clone(),
+                        field: "purl",
+                    });
+                }
+                purl
+            }
+            None => format!("{name}@{version}"),
+        };
+        let identity = stable_component_id(&purl).map_err(|_| SbomError::InvalidComponent {
+            path: package_path.clone(),
+            field: "purl",
+        })?;
+        let location_path = format!("spdx-id:{spdx_id}");
+        let location_id =
+            stable_location_id(state.asset_id, &location_path, None).map_err(|_| {
+                SbomError::InvalidComponent {
+                    path: package_path.clone(),
+                    field: "SPDXID",
+                }
+            })?;
+        let component = Component {
+            identity: identity.clone(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+            purl: purl.clone(),
+            scope: Scope::Unknown,
+            provenance: BTreeSet::from([state.source.clone()]),
+            licenses: parse_spdx_licenses(package.license_concluded.as_deref()),
+            locations: BTreeSet::from([Location {
+                id: location_id,
+                asset_id: state.asset_id.clone(),
+                path: location_path,
+                start: None,
+                end: None,
+            }]),
+        };
+        if let Some(existing) = state.components.get_mut(&identity) {
+            if existing.name != component.name || existing.version != component.version {
+                return Err(SbomError::ConflictingComponent(purl));
+            }
+            existing.provenance.extend(component.provenance);
+            existing.licenses.extend(component.licenses);
+            existing.locations.extend(component.locations);
+        } else {
+            state.components.insert(identity.clone(), component);
+        }
+        if state.refs.insert(spdx_id.to_owned(), identity).is_some() {
+            return Err(SbomError::DuplicateSpdxId(spdx_id.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn spdx_package_purl(package: &SpdxPackage) -> Option<String> {
+    package
+        .external_refs
+        .iter()
+        .filter(|reference| trimmed(reference.reference_type.as_deref()) == Some("purl"))
+        .find_map(|reference| trimmed(reference.reference_locator.as_deref()))
+        .map(str::to_owned)
+}
+
+fn collect_spdx_relationships(
+    relationships: &[SpdxRelationship],
+    refs: &BTreeMap<String, ComponentId>,
+    output: &mut BTreeSet<DependencyEdge>,
+) -> Result<(), SbomError> {
+    for relationship in relationships {
+        if relationship.relationship_type.trim() != "DEPENDS_ON" {
+            continue;
+        }
+        let Some(from) = refs.get(&relationship.spdx_element_id) else {
+            return Err(SbomError::UnknownDependency {
+                from: relationship.spdx_element_id.clone(),
+                to: relationship.spdx_element_id.clone(),
+            });
+        };
+        let Some(to) = refs.get(&relationship.related_spdx_element) else {
+            return Err(SbomError::UnknownDependency {
+                from: relationship.spdx_element_id.clone(),
+                to: relationship.related_spdx_element.clone(),
+            });
+        };
+        if from != to {
+            output.insert(DependencyEdge {
+                from: from.clone(),
+                to: to.clone(),
+                scope: Scope::Unknown,
+                optional: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn parse_spdx_licenses(value: Option<&str>) -> BTreeSet<License> {
+    let Some(expression) = trimmed(value) else {
+        return BTreeSet::new();
+    };
+    if expression == "NOASSERTION" || expression == "NONE" {
+        return BTreeSet::new();
+    }
+    BTreeSet::from([License {
+        expression: Some(expression.to_owned()),
+        name: None,
+        url: None,
+    }])
+}
+
+pub(crate) fn looks_like_spdx(input: &[u8]) -> bool {
+    const KEY: &[u8] = b"\"spdxVersion\"";
+    let mut offset = 0;
+    while let Some(index) = input[offset..]
+        .windows(KEY.len())
+        .position(|window| window == KEY)
+    {
+        let key_start = offset + index;
+        let after = key_start + KEY.len();
+        let colon = input[after..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count();
+        if input.get(after + colon) != Some(&b':') {
+            offset = after;
+            continue;
+        }
+        let before = input[..key_start]
+            .iter()
+            .rev()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count();
+        let preceded = key_start
+            .checked_sub(before + 1)
+            .is_some_and(|index| matches!(input[index], b'{' | b','));
+        if preceded {
+            return true;
+        }
+        offset = after;
+    }
+    false
+}
+
+fn spdx_asset_metadata(document: &SpdxDocument) -> BTreeMap<String, Value> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "spdx.spdxVersion".to_owned(),
+        Value::String(document.spdx_version.clone()),
+    );
+    let mut checksums = BTreeSet::new();
+    for package in &document.packages {
+        let Some(spdx_id) = trimmed(package.spdx_id.as_deref()) else {
+            continue;
+        };
+        for checksum in &package.checksums {
+            let Some(algorithm) = trimmed(checksum.algorithm.as_deref()) else {
+                continue;
+            };
+            let Some(value) = trimmed(checksum.checksum_value.as_deref()) else {
+                continue;
+            };
+            checksums.insert(format!("{spdx_id} {algorithm}:{value}"));
+        }
+    }
+    if !checksums.is_empty() {
+        metadata.insert(
+            "spdx.packageChecksums".to_owned(),
+            Value::Array(checksums.into_iter().map(Value::String).collect()),
+        );
+    }
+    metadata
+}
+
+#[derive(Debug, Deserialize)]
+struct SpdxDocument {
+    #[serde(rename = "spdxVersion")]
+    spdx_version: String,
+    name: Option<String>,
+    #[serde(default)]
+    packages: Vec<SpdxPackage>,
+    #[serde(default)]
+    relationships: Vec<SpdxRelationship>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpdxPackage {
+    #[serde(rename = "SPDXID")]
+    spdx_id: Option<String>,
+    name: Option<String>,
+    #[serde(rename = "versionInfo")]
+    version_info: Option<String>,
+    #[serde(rename = "licenseConcluded")]
+    license_concluded: Option<String>,
+    #[serde(default)]
+    checksums: Vec<SpdxChecksum>,
+    #[serde(default, rename = "externalRefs")]
+    external_refs: Vec<SpdxExternalRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpdxChecksum {
+    algorithm: Option<String>,
+    #[serde(rename = "checksumValue")]
+    checksum_value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpdxExternalRef {
+    #[serde(rename = "referenceType")]
+    reference_type: Option<String>,
+    #[serde(rename = "referenceLocator")]
+    reference_locator: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpdxRelationship {
+    #[serde(rename = "spdxElementId")]
+    spdx_element_id: String,
+    #[serde(rename = "relationshipType")]
+    relationship_type: String,
+    #[serde(rename = "relatedSpdxElement")]
+    related_spdx_element: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +1034,168 @@ mod tests {
                 .path,
             "purl:pkg:cargo/a@1"
         );
+    }
+
+    #[test]
+    fn builds_inventory_from_minimal_spdx_document() {
+        let input = br#"{
+          "spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT","name":"spdx-service",
+          "documentDescribes":["SPDXRef-Package-app"],
+          "packages":[
+            {"SPDXID":"SPDXRef-Package-app","name":"app","versionInfo":"1.0.0",
+             "licenseConcluded":"MIT OR Apache-2.0",
+             "checksums":[{"algorithm":"SHA256","checksumValue":"aa11"}],
+             "externalRefs":[{"referenceCategory":"PACKAGE-MANAGER","referenceType":"purl","referenceLocator":"pkg:cargo/app@1.0.0"}]},
+            {"SPDXID":"SPDXRef-Package-lib","name":"lib","versionInfo":"2.1.0",
+             "licenseConcluded":"NOASSERTION",
+             "checksums":[{"algorithm":"SHA1","checksumValue":"bb22"},{"algorithm":"SHA256","checksumValue":"cc33"}],
+             "externalRefs":[{"referenceCategory":"PACKAGE-MANAGER","referenceType":"purl","referenceLocator":"pkg:cargo/lib@2.1.0"}]}
+          ],
+          "relationships":[
+            {"spdxElementId":"SPDXRef-DOCUMENT","relationshipType":"DESCRIBES","relatedSpdxElement":"SPDXRef-Package-app"},
+            {"spdxElementId":"SPDXRef-Package-app","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-lib"}
+          ]
+        }"#;
+        let inventory = parse_cyclonedx(input).unwrap();
+        assert_eq!(inventory.asset.name, "spdx-service");
+        assert!(inventory.asset.id.as_str().starts_with("sbom:sha256:"));
+        assert_eq!(inventory.asset.metadata["spdx.spdxVersion"], "SPDX-2.3");
+        assert_eq!(inventory.components.len(), 2);
+        let ids = inventory
+            .components
+            .values()
+            .map(|component| (component.name.as_str(), component.identity.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let app = &inventory.components[&ids["app"]];
+        assert_eq!(app.purl, "pkg:cargo/app@1.0.0");
+        assert_eq!(app.version, "1.0.0");
+        assert!(app.licenses.contains(&License {
+            expression: Some("MIT OR Apache-2.0".into()),
+            name: None,
+            url: None,
+        }));
+        assert_eq!(
+            app.locations.iter().next().unwrap().path,
+            "spdx-id:SPDXRef-Package-app"
+        );
+        let lib = &inventory.components[&ids["lib"]];
+        assert!(lib.licenses.is_empty());
+        assert!(inventory.dependencies.contains(&DependencyEdge {
+            from: ids["app"].clone(),
+            to: ids["lib"].clone(),
+            scope: Scope::Unknown,
+            optional: false,
+        }));
+        assert_eq!(inventory.dependencies.len(), 1);
+        assert_eq!(
+            inventory.asset.metadata["spdx.packageChecksums"],
+            Value::Array(vec![
+                Value::String("SPDXRef-Package-app SHA256:aa11".into()),
+                Value::String("SPDXRef-Package-lib SHA1:bb22".into()),
+                Value::String("SPDXRef-Package-lib SHA256:cc33".into()),
+            ])
+        );
+        inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn routes_spdx_by_key_shape_and_keeps_cyclonedx_flow_unchanged() {
+        let spdx = br#"{"spdxVersion":"SPDX-2.2","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"}]}"#;
+        assert!(parse_cyclonedx(spdx).is_ok());
+        let cyclonedx = br#"{"bomFormat":"CycloneDX","components":[{"name":"a","version":"1","purl":"pkg:cargo/a@1","licenses":[{"expression":"mentions \"spdxVersion\" handling"}]}]}"#;
+        let inventory = parse_cyclonedx(cyclonedx).unwrap();
+        assert_eq!(inventory.components.len(), 1);
+        assert!(matches!(
+            parse_cyclonedx(br#"{}"#),
+            Err(SbomError::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn falls_back_to_name_and_version_without_fabricating_purl() {
+        let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"openssl","versionInfo":"3.2.1"}]}"#;
+        let inventory = parse_cyclonedx(input).unwrap();
+        let component = inventory.components.values().next().unwrap();
+        assert_eq!(component.purl, "openssl@3.2.1");
+        assert!(!component.purl.starts_with("pkg:"));
+        assert_eq!(
+            component.identity,
+            stable_component_id("openssl@3.2.1").unwrap()
+        );
+        inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_spdx_documents() {
+        assert!(matches!(
+            parse_cyclonedx(br#"{"spdxVersion":"SPDX-3.0","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"}]}"#),
+            Err(SbomError::UnsupportedSpdxVersion { found }) if found == "SPDX-3.0"
+        ));
+        assert!(matches!(
+            parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","pack x"#),
+            Err(SbomError::SpdxMalformedJson(_))
+        ));
+        assert!(matches!(
+            parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","versionInfo":"1"}]}"#),
+            Err(SbomError::InvalidComponent { field: "name", .. })
+        ));
+        assert!(matches!(
+            parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a"}]}"#),
+            Err(SbomError::InvalidComponent { field: "versionInfo", .. })
+        ));
+        assert!(matches!(
+            parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"},{"SPDXID":"SPDXRef-a","name":"b","versionInfo":"2"}]}"#),
+            Err(SbomError::DuplicateSpdxId(id)) if id == "SPDXRef-a"
+        ));
+        assert!(matches!(
+            parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"}],"relationships":[{"spdxElementId":"SPDXRef-a","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-missing"}]}"#),
+            Err(SbomError::UnknownDependency { from, to }) if from == "SPDXRef-a" && to == "SPDXRef-missing"
+        ));
+        assert!(matches!(
+            parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1","externalRefs":[{"referenceType":"purl","referenceLocator":"pkg:cargo/a"}]}]}"#),
+            Err(SbomError::InvalidComponent { field: "purl", .. })
+        ));
+    }
+
+    #[test]
+    fn ignores_spdx_self_dependencies_and_other_relationship_types() {
+        let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"}],"relationships":[{"spdxElementId":"SPDXRef-a","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-a"},{"spdxElementId":"SPDXRef-a","relationshipType":"CONTAINS","relatedSpdxElement":"SPDXRef-a"}]}"#;
+        let inventory = parse_cyclonedx(input).unwrap();
+        assert!(inventory.dependencies.is_empty());
+    }
+
+    #[test]
+    fn rejects_oversized_spdx_input_before_decoding() {
+        let mut input = br#"{"spdxVersion":"SPDX-2.3"}"#.to_vec();
+        input.resize(MAX_SBOM_BYTES + 1, b' ');
+        assert!(matches!(
+            parse_cyclonedx(&input),
+            Err(SbomError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn enforces_spdx_component_count_boundary() {
+        let asset_id = AssetId::new("asset:test").unwrap();
+        let source = Source {
+            kind: SourceKind::Sbom,
+            locator: "fixture".into(),
+            digest: None,
+        };
+        let mut state = parse_state(&asset_id, &source);
+        state.count = MAX_COMPONENTS;
+        let packages = [SpdxPackage {
+            spdx_id: Some("SPDXRef-a".into()),
+            name: Some("a".into()),
+            version_info: Some("1".into()),
+            license_concluded: None,
+            checksums: Vec::new(),
+            external_refs: Vec::new(),
+        }];
+        assert!(matches!(
+            collect_spdx_packages(&packages, &mut state),
+            Err(SbomError::TooManyComponents)
+        ));
     }
 
     fn wire_component() -> CycloneDxComponent {

@@ -12,6 +12,9 @@ use crate::model::{
 
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
 
+/// Evidence property key carrying the SHA-256 fingerprint of a secret finding.
+const FINGERPRINT_EVIDENCE_PROPERTY: &str = "fingerprint_sha256";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -70,6 +73,10 @@ pub struct RuleSelectors {
     pub rule_ids: BTreeSet<String>,
     #[serde(default)]
     pub advisory_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub fix_available: Option<bool>,
+    #[serde(default)]
+    pub cves: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +120,8 @@ pub struct ExceptionSelectors {
     pub scope: Option<Scope>,
     #[serde(default)]
     pub license_expression: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +205,9 @@ impl Policy {
             validate_globs(rule, "purls", &rule.selectors.purls)?;
             validate_globs(rule, "rule_ids", &rule.selectors.rule_ids)?;
             validate_globs(rule, "advisory_ids", &rule.selectors.advisory_ids)?;
+            for cve in &rule.selectors.cves {
+                require_text(format!("rule '{}'.selectors.cves", rule.id), cve)?;
+            }
             for expression in &rule.selectors.license_expressions {
                 require_text(
                     format!("rule '{}'.selectors.license_expressions", rule.id),
@@ -264,6 +276,7 @@ impl ExceptionSelectors {
             && self.advisory_id.is_none()
             && self.scope.is_none()
             && self.license_expression.is_none()
+            && self.fingerprint.is_none()
     }
 }
 
@@ -451,6 +464,24 @@ impl CompiledRule<'_> {
         {
             return false;
         }
+        if selectors
+            .fix_available
+            .is_some_and(|required| finding.remediation.is_some() != required)
+        {
+            return false;
+        }
+        if !selectors.cves.is_empty()
+            && !finding
+                .advisory_id
+                .as_deref()
+                .is_some_and(|id| selectors.cves.contains(id))
+            && !finding
+                .aliases
+                .iter()
+                .any(|alias| selectors.cves.contains(alias))
+        {
+            return false;
+        }
         if !selectors.license_expressions.is_empty() {
             let expressions = component.map(known_license_expressions).unwrap_or_default();
             if expressions.is_empty() && fail_closed.unknown_licenses {
@@ -511,6 +542,14 @@ fn exception_matches(
             .is_none_or(|value| component.is_some_and(|component| value == component.scope))
         && selectors.license_expression.as_deref().is_none_or(|value| {
             component.is_some_and(|component| known_license_expressions(component).contains(value))
+        })
+        && selectors.fingerprint.as_deref().is_none_or(|value| {
+            finding.evidence.iter().any(|evidence| {
+                evidence
+                    .properties
+                    .get(FINGERPRINT_EVIDENCE_PROPERTY)
+                    .is_some_and(|fingerprint| fingerprint == value)
+            })
         })
 }
 
@@ -584,6 +623,7 @@ fn validate_exact_exception_selectors(exception: &PolicyException) -> Result<(),
             "license_expression",
             exception.selectors.license_expression.as_deref(),
         ),
+        ("fingerprint", exception.selectors.fingerprint.as_deref()),
     ] {
         if let Some(value) = value {
             require_text(
@@ -608,9 +648,9 @@ fn validate_exact_exception_selectors(exception: &PolicyException) -> Result<(),
 mod tests {
     use super::*;
     use crate::model::{
-        Asset, AssetId, AssetKind, ComponentId, FindingId, FindingStatus, License, Risk, RuleId,
+        Asset, AssetId, AssetKind, ComponentId, Evidence, FindingId, FindingStatus, License,
+        Remediation, Risk, RuleId,
     };
-
     fn now() -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339("2026-07-21T12:00:00Z").unwrap()
     }
@@ -948,5 +988,222 @@ mod tests {
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.summary.denied, 2);
+    }
+
+    #[test]
+    fn fix_available_selector_requires_remediation_presence() {
+        let inventory = inventory(Some("MIT"), Scope::Runtime, "pkg:cargo/example@1");
+        let mut fixable = rule("fixable", 0, PolicyOutcome::Deny);
+        fixable.selectors.fix_available = Some(true);
+        let mut remediated = finding("finding");
+        remediated.remediation = Some(Remediation {
+            description: "upgrade".to_owned(),
+            fixed_versions: BTreeSet::from(["2.0.0".to_owned()]),
+            references: BTreeSet::new(),
+        });
+        assert_eq!(
+            evaluate_one(&policy(vec![fixable.clone()]), remediated, &inventory).outcome,
+            PolicyOutcome::Deny
+        );
+        assert_eq!(
+            evaluate_one(
+                &policy(vec![fixable.clone()]),
+                finding("finding"),
+                &inventory
+            )
+            .outcome,
+            PolicyOutcome::Allow
+        );
+        fixable.selectors.fix_available = Some(false);
+        assert_eq!(
+            evaluate_one(&policy(vec![fixable]), finding("finding"), &inventory).outcome,
+            PolicyOutcome::Deny
+        );
+    }
+
+    #[test]
+    fn cves_selector_matches_advisory_id_or_alias_exactly() {
+        let inventory = inventory(Some("MIT"), Scope::Runtime, "pkg:cargo/example@1");
+        let mut cve_rule = rule("known-cve", 0, PolicyOutcome::Deny);
+        cve_rule.selectors.cves.insert("CVE-2026-1234".to_owned());
+
+        let mut aliased = finding("finding");
+        aliased.aliases.insert("CVE-2026-1234".to_owned());
+        assert_eq!(
+            evaluate_one(&policy(vec![cve_rule.clone()]), aliased, &inventory).outcome,
+            PolicyOutcome::Deny
+        );
+
+        let mut advisory = finding("finding");
+        advisory.advisory_id = Some("CVE-2026-1234".to_owned());
+        assert_eq!(
+            evaluate_one(&policy(vec![cve_rule.clone()]), advisory, &inventory).outcome,
+            PolicyOutcome::Deny
+        );
+
+        let mut wrong_case = finding("finding");
+        wrong_case.aliases.insert("cve-2026-1234".to_owned());
+        assert_eq!(
+            evaluate_one(&policy(vec![cve_rule.clone()]), wrong_case, &inventory).outcome,
+            PolicyOutcome::Allow
+        );
+
+        let mut unknown = finding("finding");
+        unknown.aliases.insert("CVE-2026-9999".to_owned());
+        assert_eq!(
+            evaluate_one(&policy(vec![cve_rule]), unknown, &inventory).outcome,
+            PolicyOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn fingerprint_exception_suppresses_matching_finding_until_expiry() {
+        const FINGERPRINT: &str =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let inventory = inventory(Some("MIT"), Scope::Runtime, "pkg:cargo/example@1");
+        let secret = || {
+            let mut finding = finding("finding");
+            finding.evidence.insert(Evidence {
+                description: "secret fingerprint".to_owned(),
+                locations: BTreeSet::new(),
+                references: BTreeSet::new(),
+                properties: BTreeMap::from([(
+                    "fingerprint_sha256".to_owned(),
+                    FINGERPRINT.to_owned(),
+                )]),
+                redacted: true,
+            });
+            finding
+        };
+        let mut policy = policy(vec![rule("deny", 0, PolicyOutcome::Deny)]);
+        policy.exceptions.push(PolicyException {
+            id: "secret-exception".to_owned(),
+            owner: "security".to_owned(),
+            reason: "approved secret acceptance".to_owned(),
+            ticket: "SEC-2".to_owned(),
+            expires_at: "2026-07-22T12:00:00Z".to_owned(),
+            compensating_controls: BTreeSet::new(),
+            selectors: ExceptionSelectors {
+                fingerprint: Some(FINGERPRINT.to_owned()),
+                ..ExceptionSelectors::default()
+            },
+        });
+        let selected = evaluate_one(&policy, secret(), &inventory);
+        assert_eq!(selected.outcome, PolicyOutcome::Allow);
+        assert_eq!(selected.exception_id.as_deref(), Some("secret-exception"));
+
+        policy.exceptions[0].expires_at = "2026-07-21T12:00:00Z".to_owned();
+        assert_eq!(
+            evaluate_one(&policy, secret(), &inventory).outcome,
+            PolicyOutcome::Deny
+        );
+
+        policy.exceptions[0].expires_at = "2026-07-22T12:00:00Z".to_owned();
+        policy.exceptions[0].selectors.fingerprint = Some("0".repeat(64));
+        assert_eq!(
+            evaluate_one(&policy, secret(), &inventory).outcome,
+            PolicyOutcome::Deny
+        );
+    }
+
+    #[test]
+    fn new_selectors_parse_in_yaml_and_toml() {
+        let fingerprint = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let yaml = r#"version: 1
+rules:
+  - id: fixable
+    outcome: deny
+    reason: remediation is available
+    selectors:
+      fix_available: true
+      cves:
+        - CVE-2026-1234
+exceptions:
+  - id: secret-exception
+    owner: security
+    reason: approved secret acceptance
+    ticket: SEC-2
+    expires_at: "2026-07-22T12:00:00Z"
+    selectors:
+      fingerprint: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+"#;
+        let parsed = Policy::from_yaml(yaml).unwrap();
+        assert_eq!(parsed.rules[0].selectors.fix_available, Some(true));
+        assert_eq!(
+            parsed.rules[0].selectors.cves,
+            BTreeSet::from(["CVE-2026-1234".to_owned()])
+        );
+        assert_eq!(
+            parsed.exceptions[0].selectors.fingerprint.as_deref(),
+            Some(fingerprint)
+        );
+
+        let toml = r#"version = 1
+[[rules]]
+id = "fixable"
+outcome = "deny"
+reason = "remediation is available"
+
+[rules.selectors]
+fix_available = true
+cves = ["CVE-2026-1234"]
+
+[[exceptions]]
+id = "secret-exception"
+owner = "security"
+reason = "approved secret acceptance"
+ticket = "SEC-2"
+expires_at = "2026-07-22T12:00:00Z"
+
+[exceptions.selectors]
+fingerprint = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+"#;
+        let parsed = Policy::from_toml(toml).unwrap();
+        assert_eq!(parsed.rules[0].selectors.fix_available, Some(true));
+        assert_eq!(
+            parsed.rules[0].selectors.cves,
+            BTreeSet::from(["CVE-2026-1234".to_owned()])
+        );
+        assert_eq!(
+            parsed.exceptions[0].selectors.fingerprint.as_deref(),
+            Some(fingerprint)
+        );
+    }
+
+    #[test]
+    fn new_selectors_reject_empty_cves_globby_fingerprints_and_unknown_fields() {
+        let mut empty_cve = rule("known-cve", 0, PolicyOutcome::Deny);
+        empty_cve.selectors.cves.insert("   ".to_owned());
+        assert!(matches!(
+            policy(vec![empty_cve]).validate(),
+            Err(PolicyError::EmptyField { .. })
+        ));
+
+        let mut globbed = policy(Vec::new());
+        globbed.exceptions.push(PolicyException {
+            id: "globbed-fingerprint".to_owned(),
+            owner: "security".to_owned(),
+            reason: "reason".to_owned(),
+            ticket: "SEC-3".to_owned(),
+            expires_at: "2026-07-22T12:00:00Z".to_owned(),
+            compensating_controls: BTreeSet::new(),
+            selectors: ExceptionSelectors {
+                fingerprint: Some("abc*def".to_owned()),
+                ..ExceptionSelectors::default()
+            },
+        });
+        assert!(matches!(
+            globbed.validate(),
+            Err(PolicyError::NonExactExceptionSelector { .. })
+        ));
+
+        assert!(Policy::from_yaml(
+            "version: 1\nrules:\n  - id: r\n    outcome: deny\n    reason: x\n    selectors:\n      fix_availability: true\n"
+        )
+        .is_err());
+        assert!(Policy::from_toml(
+            "version = 1\n[[rules]]\nid = \"r\"\noutcome = \"deny\"\nreason = \"x\"\n[rules.selectors]\nfix_availability = true\n"
+        )
+        .is_err());
     }
 }

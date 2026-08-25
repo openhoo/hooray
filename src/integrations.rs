@@ -19,6 +19,8 @@ const MIN_WEBHOOK_SECRET_BYTES: usize = 16;
 const MAX_WEBHOOK_SECRET_BYTES: usize = 4_096;
 const MAX_URL_BYTES: usize = 2_048;
 const MAX_EVENT_BYTES: usize = 128;
+const JIRA_MAX_LISTED_FINDINGS: usize = 10;
+const JIRA_MAX_SUMMARY_CHARS: usize = 255;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntegrationLimits {
@@ -347,6 +349,91 @@ impl IntegrationGenerator {
             }),
             selected.truncated,
         )
+    }
+
+    /// Builds a Jira REST create-issue payload summarizing a scan report.
+    /// Pure function: deterministic ordering, deny findings before warnings,
+    /// capped at JIRA_MAX_LISTED_FINDINGS entries like the Slack summary.
+    pub fn jira_issue(&self, report: &ScanReport) -> Value {
+        let selected = self.selected_findings(report);
+        let mut denied_lines: Vec<String> = Vec::new();
+        let mut warned_lines: Vec<String> = Vec::new();
+        for finding in &selected.items {
+            let mut denied = false;
+            let mut warned = false;
+            for decision in &report.policy_decisions {
+                if decision.finding_id.as_ref() != Some(&finding.id) {
+                    continue;
+                }
+                match decision.outcome {
+                    PolicyOutcome::Deny => denied = true,
+                    PolicyOutcome::Warn => warned = true,
+                    PolicyOutcome::Allow => {}
+                }
+            }
+            let line = format!(
+                "* *{}* {{{}}} — {}",
+                finding.severity,
+                finding.rule_id.as_str(),
+                escape_jira_wiki(&self.finding_title(finding)),
+            );
+            if denied {
+                denied_lines.push(line);
+            } else if warned {
+                warned_lines.push(line);
+            }
+        }
+        denied_lines.truncate(JIRA_MAX_LISTED_FINDINGS);
+        let warn_budget = JIRA_MAX_LISTED_FINDINGS - denied_lines.len();
+        let warn_omitted = warned_lines.len().saturating_sub(warn_budget);
+        warned_lines.truncate(warn_budget);
+        let listed = denied_lines.len() + warned_lines.len();
+
+        let mut description = String::from("h2. Policy summary\n");
+        description.push_str(&format!("* Denied: {}\n", report.policy_summary.denied));
+        description.push_str(&format!("* Warnings: {}\n", report.policy_summary.warned));
+        description.push_str(&format!("* Findings: {}\n", report.findings.len()));
+        description.push_str(&format!(
+            "* Run: {}{}{}\n",
+            "{{",
+            report.run.id.as_str(),
+            "}}"
+        ));
+        if !denied_lines.is_empty() {
+            description.push_str("\nh2. Top policy denials\n");
+            for line in &denied_lines {
+                description.push_str(line);
+                description.push('\n');
+            }
+        }
+        if !warned_lines.is_empty() {
+            description.push_str("\nh2. Top warnings\n");
+            for line in &warned_lines {
+                description.push_str(line);
+                description.push('\n');
+            }
+        }
+        if selected.truncated || warn_omitted > 0 {
+            description.push_str(&bounded_summary(selected.total, listed));
+            description.push('\n');
+        }
+        let summary: String = format!(
+            "Hooray scan: {} denied, {} warnings ({})",
+            report.policy_summary.denied,
+            report.policy_summary.warned,
+            report.run.id.as_str(),
+        )
+        .chars()
+        .take(JIRA_MAX_SUMMARY_CHARS)
+        .collect();
+        json!({
+            "fields": {
+                "summary": summary,
+                "description": description,
+                "issuetype": { "name": "Bug" },
+                "labels": ["hooray", "security"],
+            }
+        })
     }
 
     pub fn pre_commit_config(&self) -> Result<GeneratedArtifact, IntegrationError> {
@@ -818,6 +905,20 @@ fn escape_slack(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Flattens whitespace and backslash-escapes Jira wiki markup metacharacters
+/// so finding titles cannot inject headings, links, or formatting.
+fn escape_jira_wiki(value: &str) -> String {
+    let flattened = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut escaped = String::with_capacity(flattened.len());
+    for character in flattened.chars() {
+        if matches!(character, '[' | ']' | '{' | '}' | '*' | '~' | '^' | '!') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 fn percent_encode_path(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -1097,6 +1198,136 @@ mod tests {
             generator
                 .lsp_publish_diagnostics(&report(vec![]), "https://example/file.rs")
                 .is_err()
+        );
+    }
+
+    fn decision(policy: &str, finding_id: &str, outcome: PolicyOutcome) -> PolicyDecision {
+        PolicyDecision {
+            policy_id: PolicyId::new(policy).unwrap(),
+            finding_id: Some(FindingId::new(finding_id).unwrap()),
+            outcome,
+            reason: "test reason".into(),
+            exception_id: None,
+        }
+    }
+
+    #[test]
+    fn jira_issue_payload_has_rest_shape_and_static_defaults() {
+        let mut report = report(vec![
+            finding("finding:warned", FindingKind::Sast, Severity::Medium, true),
+            finding(
+                "finding:denied",
+                FindingKind::Vulnerability,
+                Severity::Critical,
+                true,
+            ),
+            finding("finding:plain", FindingKind::Iac, Severity::Low, true),
+        ]);
+        let decisions = BTreeSet::from([
+            decision("policy:block", "finding:denied", PolicyOutcome::Deny),
+            decision("policy:warn", "finding:warned", PolicyOutcome::Warn),
+        ]);
+        report.policy_summary = PolicySummary::from_decisions(&decisions);
+        report.policy_decisions = decisions;
+        let value = generator(10).jira_issue(&report);
+        let fields = &value["fields"];
+        assert_eq!(fields["issuetype"]["name"], "Bug");
+        assert_eq!(fields["labels"][0], "hooray");
+        assert_eq!(fields["labels"][1], "security");
+        let summary = fields["summary"].as_str().unwrap();
+        assert!(summary.contains("1 denied"), "{summary}");
+        assert!(summary.contains("1 warnings"), "{summary}");
+        assert!(summary.contains("run:test"), "{summary}");
+        assert!(summary.chars().count() <= 255);
+        let description = fields["description"].as_str().unwrap();
+        assert!(description.contains("h2. Policy summary"));
+        assert!(description.contains("{{run:test}}"), "{description}");
+        let deny_at = description.find("finding:denied").expect("denial listed");
+        let warn_at = description.find("finding:warned").expect("warning listed");
+        assert!(deny_at < warn_at);
+        assert!(!description.contains("finding:plain"));
+        assert_eq!(value, generator(10).jira_issue(&report));
+    }
+
+    #[test]
+    fn jira_issue_caps_listed_findings_deny_first_deterministically() {
+        let mut findings = Vec::new();
+        for index in 0..8 {
+            findings.push(finding(
+                &format!("finding:w{index:02}"),
+                FindingKind::Sast,
+                Severity::Low,
+                false,
+            ));
+        }
+        for index in 0..8 {
+            findings.push(finding(
+                &format!("finding:d{index:02}"),
+                FindingKind::Sast,
+                Severity::High,
+                false,
+            ));
+        }
+        let mut report = report(findings);
+        let mut decisions = BTreeSet::new();
+        for index in 0..8 {
+            decisions.insert(decision(
+                "policy:block",
+                &format!("finding:d{index:02}"),
+                PolicyOutcome::Deny,
+            ));
+            decisions.insert(decision(
+                "policy:warn",
+                &format!("finding:w{index:02}"),
+                PolicyOutcome::Warn,
+            ));
+        }
+        report.policy_summary = PolicySummary::from_decisions(&decisions);
+        report.policy_decisions = decisions;
+        let generator = generator(10);
+        let description = generator.jira_issue(&report)["fields"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for index in 0..8 {
+            assert!(description.contains(&format!("finding:d{index:02}")));
+        }
+        for index in 0..2 {
+            assert!(description.contains(&format!("finding:w{index:02}")));
+        }
+        for index in 2..8 {
+            assert!(!description.contains(&format!("finding:w{index:02}")));
+        }
+        assert!(description.contains("omitted by configured limit"));
+    }
+
+    #[test]
+    fn jira_issue_escapes_wiki_markup_and_redacts_secret_titles() {
+        let secret = "[github_token_redacted]";
+        let mut finding = finding(
+            "finding:secret",
+            FindingKind::Secret,
+            Severity::Critical,
+            false,
+        );
+        finding.summary = Some(format!("Leaked {secret} *now*"));
+        let mut report = report(vec![finding]);
+        let decisions = BTreeSet::from([decision(
+            "policy:block",
+            "finding:secret",
+            PolicyOutcome::Deny,
+        )]);
+        report.policy_summary = PolicySummary::from_decisions(&decisions);
+        report.policy_decisions = decisions;
+        let description = generator(10).jira_issue(&report)["fields"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(description.contains("Secret detected"));
+        assert!(!description.contains(&format!("Leaked {secret}")));
+        assert!(
+            description.contains("\\[github\\_token\\_redacted\\]")
+                || !description.contains("[github_token_redacted]")
         );
     }
 

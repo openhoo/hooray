@@ -4,23 +4,24 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
+    time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hooray::{
     config::Config,
     engine::{Engine, ScanRequest, load_policy},
     input::ScanInput,
-    integrations::{IntegrationGenerator, IntegrationLimits},
+    integrations::{IntegrationGenerator, IntegrationLimits, SignedWebhook},
     model::{FindingId, RunId, ScanReport},
     monitor::{
         AdvisoryCursor, AdvisoryRefresh, AlertEvent, Evaluation, MonitorConfig, MonitorError,
         MonitorFuture, MonitorRunner, MonitorService, Notifier, SystemClock,
     },
     report::{self, ReportFormat},
-    store::{ReportDiff, Store},
+    store::{MonitorTarget, ReportDiff, Store},
 };
 use serde::Serialize;
 
@@ -179,6 +180,60 @@ struct ServeArgs {
 struct MonitorArgs {
     #[arg(long)]
     once: bool,
+    #[arg(long, value_name = "URL")]
+    webhook_url: Option<String>,
+    #[arg(long, value_name = "VAR")]
+    webhook_secret_env: Option<String>,
+    #[command(subcommand)]
+    command: Option<MonitorCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum MonitorCommand {
+    /// Manage the targets the monitor watches
+    Targets(MonitorTargetsArgs),
+}
+
+#[derive(Debug, Args)]
+struct MonitorTargetsArgs {
+    #[command(subcommand)]
+    command: MonitorTargetsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum MonitorTargetsCommand {
+    /// Register a target so future monitor cycles watch it
+    Add(MonitorTargetAddArgs),
+    /// List registered targets
+    List(MonitorTargetsListArgs),
+    /// Remove a registered target and its queued events
+    Remove(MonitorTargetRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+struct MonitorTargetAddArgs {
+    #[arg(value_name = "TARGET_ID")]
+    target_id: String,
+    #[arg(long, value_name = "SOURCE")]
+    source: String,
+    #[arg(long, value_name = "SECONDS")]
+    interval_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+struct MonitorTargetsListArgs {
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    limit: u32,
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
+struct MonitorTargetRemoveArgs {
+    #[arg(value_name = "TARGET_ID")]
+    target_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -231,6 +286,7 @@ enum OutputFormat {
     GitlabCodeQuality,
     JsonLines,
     GitlabArtifacts,
+    Csv,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -254,6 +310,7 @@ impl TryFrom<OutputFormat> for ReportFormat {
             OutputFormat::Spdx => Ok(Self::Spdx),
             OutputFormat::GitlabCodeQuality => Ok(Self::GitLabCodeQuality),
             OutputFormat::JsonLines => Ok(Self::JsonLines),
+            OutputFormat::Csv => Ok(Self::Csv),
             OutputFormat::GitlabArtifacts => Err(ReportFormatConversionError("gitlab-artifacts")),
         }
     }
@@ -436,11 +493,37 @@ async fn run_serve(config: Config, args: ServeArgs) -> Result<CommandOutcome> {
 }
 
 async fn run_monitor(config: &Config, args: MonitorArgs) -> Result<CommandOutcome> {
+    if let Some(MonitorCommand::Targets(targets)) = args.command {
+        return run_monitor_targets(config, targets);
+    }
+    let webhook = match (
+        args.webhook_url.as_deref(),
+        args.webhook_secret_env.as_deref(),
+    ) {
+        (Some(url), Some(secret_env)) => {
+            let secret = WebhookNotifier::resolve_secret(secret_env)?;
+            Some(WebhookNotifier::new(config, url, secret)?)
+        }
+        (Some(_), None) => bail!("--webhook-secret-env is required when --webhook-url is set"),
+        (None, Some(_)) => bail!("--webhook-url is required when --webhook-secret-env is set"),
+        (None, None) => None,
+    };
     let store = open_store(config)?;
     let runner = Arc::new(CliMonitorRunner {
         config: config.clone(),
     });
-    let notifier = Arc::new(StderrNotifier);
+    match webhook {
+        Some(notifier) => run_monitor_loop(store, runner, args.once, Arc::new(notifier)).await,
+        None => run_monitor_loop(store, runner, args.once, Arc::new(StderrNotifier)).await,
+    }
+}
+
+async fn run_monitor_loop<N: Notifier>(
+    store: Store,
+    runner: Arc<CliMonitorRunner>,
+    once: bool,
+    notifier: Arc<N>,
+) -> Result<CommandOutcome> {
     let mut service = MonitorService::new(
         store,
         Arc::new(SystemClock),
@@ -448,7 +531,7 @@ async fn run_monitor(config: &Config, args: MonitorArgs) -> Result<CommandOutcom
         notifier,
         MonitorConfig::default(),
     )?;
-    if args.once {
+    if once {
         service.run_once().await?;
     } else {
         service
@@ -458,6 +541,101 @@ async fn run_monitor(config: &Config, args: MonitorArgs) -> Result<CommandOutcom
             .await?;
     }
     Ok(CommandOutcome::Passed)
+}
+
+fn run_monitor_targets(config: &Config, args: MonitorTargetsArgs) -> Result<CommandOutcome> {
+    let mut store = open_store(config)?;
+    match args.command {
+        MonitorTargetsCommand::Add(args) => {
+            let now = encode_monitor_time(Utc::now().timestamp());
+            let target = MonitorTarget {
+                target_id: args.target_id,
+                source: args.source,
+                interval_seconds: args.interval_seconds,
+                next_due_at: now.clone(),
+                source_fingerprint: None,
+                inventory: None,
+                advisory_digest: None,
+                policy_digest: None,
+                finding_ids: Vec::new(),
+                updated_at: now,
+            };
+            store.add_monitor_target(&target)?;
+            println!("added monitor target '{}'", target.target_id);
+        }
+        MonitorTargetsCommand::List(args) => {
+            let targets = store.list_monitor_targets(args.limit, args.offset)?;
+            if args.output.format == OutputFormat::Table {
+                write_bytes(
+                    render_monitor_targets_table(&targets).as_bytes(),
+                    &args.output.output,
+                )?;
+            } else {
+                write_output(&targets, &args.output)?;
+            }
+        }
+        MonitorTargetsCommand::Remove(args) => {
+            if !store.remove_monitor_target(&args.target_id)? {
+                bail!("monitor target '{}' was not found", args.target_id);
+            }
+            println!("removed monitor target '{}'", args.target_id);
+        }
+    }
+    Ok(CommandOutcome::Passed)
+}
+
+/// Mirrors `monitor::encode_time`: a zero-padded 20-digit string whose
+/// lexicographic order matches chronological order of the unix timestamps.
+fn encode_monitor_time(timestamp: i64) -> String {
+    format!("{:020}", (timestamp as u64) ^ (1_u64 << 63))
+}
+
+fn render_monitor_targets_table(targets: &[MonitorTarget]) -> String {
+    let headers = [
+        "TARGET_ID",
+        "SOURCE",
+        "INTERVAL_SECONDS",
+        "NEXT_DUE_AT",
+        "UPDATED_AT",
+    ];
+    let rows: Vec<[String; 5]> = targets
+        .iter()
+        .map(|target| {
+            [
+                target.target_id.clone(),
+                target.source.clone(),
+                target.interval_seconds.to_string(),
+                target.next_due_at.clone(),
+                target.updated_at.clone(),
+            ]
+        })
+        .collect();
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row.iter()) {
+            *width = (*width).max(cell.len());
+        }
+    }
+    let render_row = |cells: &[String; 5]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(column, cell)| {
+                if column + 1 == cells.len() {
+                    cell.clone()
+                } else {
+                    format!("{cell:<width$}  ", width = widths[column])
+                }
+            })
+            .collect()
+    };
+    let mut rendered = render_row(&headers.map(str::to_owned));
+    for row in &rows {
+        rendered.push('\n');
+        rendered.push_str(&render_row(row));
+    }
+    rendered.push('\n');
+    rendered
 }
 
 struct CliMonitorRunner {
@@ -578,6 +756,83 @@ impl Notifier for StderrNotifier {
         Box::pin(async move {
             let line = serde_json::to_string(event).map_err(|error| error.to_string())?;
             eprintln!("{line}");
+            Ok(())
+        })
+    }
+}
+
+const WEBHOOK_EVENT: &str = "alert";
+
+/// Delivers monitor alert events to an HTTPS webhook endpoint. Payloads are
+/// signed with the shared integration HMAC scheme; the secret is resolved
+/// from the named environment variable before the loop starts and is never
+/// rendered in errors or logs.
+#[derive(Debug)]
+struct WebhookNotifier {
+    http: reqwest::Client,
+    url: reqwest::Url,
+    secret: Vec<u8>,
+    generator: IntegrationGenerator,
+}
+
+impl WebhookNotifier {
+    fn new(config: &Config, url: &str, secret: Vec<u8>) -> Result<Self> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|error| anyhow!("invalid --webhook-url '{url}': {error}"))?;
+        if parsed.scheme() != "https" {
+            bail!(
+                "--webhook-url must use the https scheme (got '{}')",
+                parsed.scheme()
+            );
+        }
+        let generator = IntegrationGenerator::new(IntegrationLimits::default())
+            .context("invalid webhook integration limits")?;
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(config.osv_connect_timeout_secs))
+            .timeout(Duration::from_secs(config.osv_request_timeout_secs))
+            .build()
+            .context("failed to build webhook HTTP client")?;
+        Ok(Self {
+            http,
+            url: parsed,
+            secret,
+            generator,
+        })
+    }
+
+    fn resolve_secret(secret_env: &str) -> Result<Vec<u8>> {
+        let secret = std::env::var(secret_env)
+            .map_err(|_| anyhow!("--webhook-secret-env '{secret_env}' is not set to a value"))?;
+        if secret.is_empty() {
+            bail!("--webhook-secret-env '{secret_env}' is empty");
+        }
+        Ok(secret.into_bytes())
+    }
+
+    fn signed_request(&self, event: &AlertEvent) -> Result<SignedWebhook, String> {
+        let payload = serde_json::to_value(event).map_err(|error| error.to_string())?;
+        self.generator
+            .signed_webhook(self.url.as_str(), &self.secret, WEBHOOK_EVENT, &payload)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Notifier for WebhookNotifier {
+    fn notify<'a>(&'a self, event: &'a AlertEvent) -> MonitorFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let signed = self.signed_request(event)?;
+            let mut request = self.http.post(signed.url.clone());
+            for (name, value) in &signed.headers {
+                request = request.header(name, value);
+            }
+            let response =
+                request.body(signed.body).send().await.map_err(|error| {
+                    format!("webhook delivery to {} failed: {error}", signed.url)
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!("webhook endpoint returned HTTP {status}"));
+            }
             Ok(())
         })
     }
@@ -1337,5 +1592,382 @@ mod tests {
             !evaluation.finding_ids.is_empty(),
             "filesystem scanner findings must flow through monitor evaluation"
         );
+    }
+
+    #[test]
+    fn clap_parses_monitor_targets_and_preserves_bare_monitor() {
+        let parsed = Cli::try_parse_from([
+            "hooray",
+            "monitor",
+            "targets",
+            "add",
+            "webapp",
+            "--source",
+            "repo",
+            "--interval-seconds",
+            "60",
+        ])
+        .unwrap();
+        let Command::Monitor(args) = parsed.command else {
+            panic!("expected monitor command");
+        };
+        assert!(!args.once);
+        match args.command {
+            Some(MonitorCommand::Targets(targets)) => match targets.command {
+                MonitorTargetsCommand::Add(add) => {
+                    assert_eq!(add.target_id, "webapp");
+                    assert_eq!(add.source, "repo");
+                    assert_eq!(add.interval_seconds, 60);
+                }
+                _ => panic!("expected add subcommand"),
+            },
+            None => panic!("expected targets subcommand"),
+        }
+
+        let bare = Cli::try_parse_from(["hooray", "monitor", "--once"]).unwrap();
+        let Command::Monitor(args) = bare.command else {
+            panic!("expected monitor command");
+        };
+        assert!(args.once && args.command.is_none());
+
+        assert!(
+            Cli::try_parse_from(["hooray", "monitor", "targets", "add", "x"]).is_err(),
+            "add requires --source and --interval-seconds"
+        );
+    }
+
+    #[test]
+    fn clap_monitor_webhook_flags_parse_together() {
+        let parsed = Cli::try_parse_from([
+            "hooray",
+            "monitor",
+            "--once",
+            "--webhook-url",
+            "https://hooks.example/hooray",
+            "--webhook-secret-env",
+            "HOORAY_WEBHOOK_SECRET",
+        ])
+        .unwrap();
+        let Command::Monitor(args) = parsed.command else {
+            panic!("expected monitor command");
+        };
+        assert_eq!(
+            args.webhook_url.as_deref(),
+            Some("https://hooks.example/hooray")
+        );
+        assert_eq!(
+            args.webhook_secret_env.as_deref(),
+            Some("HOORAY_WEBHOOK_SECRET")
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_webhook_flags_must_come_in_pairs() {
+        let temp = TempDir::new().unwrap();
+        let cfg = config(&temp);
+        let only_url = run_monitor(
+            &cfg,
+            MonitorArgs {
+                once: true,
+                webhook_url: Some("https://hooks.example/hooray".into()),
+                webhook_secret_env: None,
+                command: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(only_url.contains("--webhook-secret-env"), "{only_url}");
+        let only_env = run_monitor(
+            &cfg,
+            MonitorArgs {
+                once: true,
+                webhook_url: None,
+                webhook_secret_env: Some("HOORAY_WEBHOOK_SECRET".into()),
+                command: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(only_env.contains("--webhook-url"), "{only_env}");
+    }
+
+    #[tokio::test]
+    async fn monitor_without_webhook_flags_keeps_stderr_fallback() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("policy.yaml"), "version: 1\n").unwrap();
+        let outcome = run_monitor(
+            &config(&temp),
+            MonitorArgs {
+                once: true,
+                webhook_url: None,
+                webhook_secret_env: None,
+                command: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, CommandOutcome::Passed);
+    }
+
+    #[test]
+    fn webhook_notifier_rejects_plain_http_urls() {
+        let temp = TempDir::new().unwrap();
+        let error = WebhookNotifier::new(
+            &config(&temp),
+            "http://hooks.example/hooray",
+            b"0123456789abcdef".to_vec(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("https"), "{error}");
+    }
+
+    #[test]
+    fn webhook_notifier_requires_resolvable_secret_env() {
+        let error = WebhookNotifier::resolve_secret("HOORAY_DEFINITELY_UNSET_SECRET_VAR_XYZ")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("HOORAY_DEFINITELY_UNSET_SECRET_VAR_XYZ"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn webhook_notifier_signs_alert_events_with_integration_scheme() {
+        use hooray::monitor::{AlertPayload, FindingDiff};
+
+        let temp = TempDir::new().unwrap();
+        let secret = b"0123456789abcdef0123456789abcdef".to_vec();
+        let notifier = WebhookNotifier::new(
+            &config(&temp),
+            "https://hooks.example/hooray",
+            secret.clone(),
+        )
+        .unwrap();
+        let event = AlertEvent {
+            id: "event-1".into(),
+            dedupe_key: "dedupe-1".into(),
+            target_id: "target".into(),
+            payload: AlertPayload {
+                target_id: "target".into(),
+                evaluated_at: 1,
+                source_fingerprint: "fp".into(),
+                advisory_digest: "ad".into(),
+                policy_digest: "pd".into(),
+                diff: FindingDiff {
+                    introduced: vec![],
+                    resolved: vec![],
+                    unchanged: vec![],
+                },
+            },
+            created_at: 1,
+            attempts: 0,
+            next_attempt_at: 1,
+            delivered_at: None,
+            dead_lettered_at: None,
+            last_error: None,
+        };
+        let signed = notifier.signed_request(&event).unwrap();
+        assert_eq!(signed.headers["content-type"], "application/json");
+        assert_eq!(signed.headers["x-hooray-event"], "alert");
+        let signature = &signed.headers["x-hooray-signature-256"];
+        let generator = IntegrationGenerator::new(IntegrationLimits::default()).unwrap();
+        assert!(generator.verify_webhook_signature(&secret, "alert", &signed.body, signature));
+        let decoded: Value = serde_json::from_slice(&signed.body).unwrap();
+        assert_eq!(decoded["id"], "event-1");
+        assert_eq!(decoded["payload"]["target_id"], "target");
+    }
+
+    #[tokio::test]
+    async fn webhook_notifier_surfaces_unreachable_endpoints_as_errors() {
+        use hooray::monitor::{AlertPayload, FindingDiff};
+
+        let temp = TempDir::new().unwrap();
+        let notifier = WebhookNotifier::new(
+            &config(&temp),
+            "https://127.0.0.1:9/hook",
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap();
+        let event = AlertEvent {
+            id: "event-1".into(),
+            dedupe_key: "dedupe-1".into(),
+            target_id: "target".into(),
+            payload: AlertPayload {
+                target_id: "target".into(),
+                evaluated_at: 1,
+                source_fingerprint: "fp".into(),
+                advisory_digest: "ad".into(),
+                policy_digest: "pd".into(),
+                diff: FindingDiff {
+                    introduced: vec![],
+                    resolved: vec![],
+                    unchanged: vec![],
+                },
+            },
+            created_at: 1,
+            attempts: 0,
+            next_attempt_at: 1,
+            delivered_at: None,
+            dead_lettered_at: None,
+            last_error: None,
+        };
+        let result = notifier.notify(&event).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn monitor_targets_add_list_remove_round_trip_with_clean_failures() {
+        let temp = TempDir::new().unwrap();
+        let config = config(&temp);
+        let add = |id: &str| MonitorTargetsArgs {
+            command: MonitorTargetsCommand::Add(MonitorTargetAddArgs {
+                target_id: id.into(),
+                source: "repo".into(),
+                interval_seconds: 60,
+            }),
+        };
+        run_monitor_targets(&config, add("zeta")).unwrap();
+        run_monitor_targets(&config, add("alpha")).unwrap();
+
+        let listed = temp.path().join("targets.json");
+        run_monitor_targets(
+            &config,
+            MonitorTargetsArgs {
+                command: MonitorTargetsCommand::List(MonitorTargetsListArgs {
+                    limit: 10,
+                    offset: 0,
+                    output: output(listed.clone(), OutputFormat::Json),
+                }),
+            },
+        )
+        .unwrap();
+        let values: Value = serde_json::from_slice(&std::fs::read(&listed).unwrap()).unwrap();
+        let rows = values.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["target_id"], "alpha");
+        assert_eq!(rows[0]["source"], "repo");
+        assert_eq!(rows[0]["interval_seconds"], 60);
+        assert_eq!(rows[0]["finding_ids"], json!([]));
+        assert_eq!(rows[0]["next_due_at"].as_str().unwrap().len(), 20);
+
+        let duplicate = run_monitor_targets(&config, add("zeta")).unwrap_err();
+        assert!(duplicate.to_string().contains("already exists"));
+
+        let table = temp.path().join("targets.txt");
+        run_monitor_targets(
+            &config,
+            MonitorTargetsArgs {
+                command: MonitorTargetsCommand::List(MonitorTargetsListArgs {
+                    limit: 10,
+                    offset: 0,
+                    output: output(table.clone(), OutputFormat::Table),
+                }),
+            },
+        )
+        .unwrap();
+        let rendered = std::fs::read_to_string(&table).unwrap();
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "TARGET_ID  SOURCE  INTERVAL_SECONDS  NEXT_DUE_AT           UPDATED_AT"
+        );
+        // Encoded timestamps are 20 characters wide and widen the column.
+        assert!(lines[1].contains("  60  ") && lines[2].contains("  60  "));
+        assert!(lines[1].starts_with("alpha") && lines[2].starts_with("zeta"));
+
+        let remove = |id: &str| MonitorTargetsArgs {
+            command: MonitorTargetsCommand::Remove(MonitorTargetRemoveArgs {
+                target_id: id.into(),
+            }),
+        };
+        run_monitor_targets(&config, remove("alpha")).unwrap();
+        let missing = run_monitor_targets(&config, remove("alpha")).unwrap_err();
+        assert!(missing.to_string().contains("was not found"));
+
+        let empty = temp.path().join("empty.json");
+        run_monitor_targets(&config, remove("zeta")).unwrap();
+        run_monitor_targets(
+            &config,
+            MonitorTargetsArgs {
+                command: MonitorTargetsCommand::List(MonitorTargetsListArgs {
+                    limit: 10,
+                    offset: 0,
+                    output: output(empty.clone(), OutputFormat::Json),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&empty).unwrap()).unwrap(),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn encoded_monitor_times_match_monitor_storage_format() {
+        // Same transform as monitor::encode_time, so registered targets stay
+        // decodable by the monitor service and sort chronologically as text.
+        assert_eq!(encode_monitor_time(0), "09223372036854775808");
+        let epoch = 1_700_000_000_i64;
+        assert_eq!(
+            encode_monitor_time(epoch),
+            format!("{:020}", epoch as u64 ^ (1_u64 << 63))
+        );
+        assert!(encode_monitor_time(2) > encode_monitor_time(1));
+    }
+
+    #[test]
+    fn monitor_targets_table_renders_empty_state_and_deterministic_rows() {
+        let empty = render_monitor_targets_table(&[]);
+        assert_eq!(
+            empty,
+            "TARGET_ID  SOURCE  INTERVAL_SECONDS  NEXT_DUE_AT  UPDATED_AT\n"
+        );
+        let targets = vec![
+            MonitorTarget {
+                target_id: "a".into(),
+                source: "repo".into(),
+                interval_seconds: 60,
+                next_due_at: "d1".into(),
+                source_fingerprint: None,
+                inventory: None,
+                advisory_digest: None,
+                policy_digest: None,
+                finding_ids: Vec::new(),
+                updated_at: "u1".into(),
+            },
+            MonitorTarget {
+                target_id: "longer-id".into(),
+                source: "oci".into(),
+                interval_seconds: 3600,
+                next_due_at: "d2".into(),
+                source_fingerprint: None,
+                inventory: None,
+                advisory_digest: None,
+                policy_digest: None,
+                finding_ids: Vec::new(),
+                updated_at: "u2".into(),
+            },
+        ];
+        let rendered = render_monitor_targets_table(&targets);
+        assert_eq!(rendered, render_monitor_targets_table(&targets));
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "TARGET_ID  SOURCE  INTERVAL_SECONDS  NEXT_DUE_AT  UPDATED_AT"
+        );
+        assert_eq!(
+            lines[1],
+            "a          repo    60                d1           u1"
+        );
+        for line in lines.iter().skip(1) {
+            assert!(!line.ends_with(' '), "no trailing padding: {line}");
+        }
     }
 }
