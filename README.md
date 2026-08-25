@@ -526,8 +526,8 @@ cargo llvm-cov --locked --all-targets --all-features --fail-under-lines 90
 cargo deny check advisories bans licenses sources
 ```
 
-The implemented test suite contains 376 tests and the current measured line
-coverage is 93.14%. CI enforces a 90% line-coverage floor. Commit messages
+The test suite covers every module with focused unit and end-to-end tests;
+CI measures line coverage on every run and enforces a 90% floor. Commit messages
 are linted as Conventional Commits, and dependency advisories, bans, licenses,
 and sources are checked on every pull request and push to `main`.
 
