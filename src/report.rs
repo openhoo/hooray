@@ -1461,6 +1461,13 @@ fn render_html(
             html_text(finding.summary.as_deref().unwrap_or(finding.rule_id.as_str())), html_text(&details)
         ));
     }
+    // Abort at the rows output bound like every other renderer: push_str
+    // drops an oversized row while later smaller rows still append, so the
+    // embedded text alone can finish under the limit with findings silently
+    // missing.
+    if rows.exceeded {
+        return Err(report_limit(limit));
+    }
     let mut output = BoundedText::new(limit);
     let _ = write!(
         output,
@@ -1760,13 +1767,23 @@ where
 }
 
 /// RFC 4180 field escaping: quote fields containing commas, quotes, or line
-/// breaks, double embedded quotes, and normalize CR/CR-LF to LF inside values.
+/// breaks, double embedded quotes, normalize CR/CR-LF to LF inside values,
+/// and neutralize spreadsheet formula injection (CWE-1236). Scanned paths
+/// and purls derive from hostile repository content, so a cell whose first
+/// character Excel/LibreOffice would evaluate (=, +, -, @, tab) gets an
+/// apostrophe prefix. Legitimate values starting with those characters gain
+/// a visible quote - the standard smallest-safe mitigation tradeoff.
 fn csv_field(value: &str) -> String {
     let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
-    if normalized.contains([',', '"', '\n']) {
-        format!("\"{}\"", normalized.replace('"', "\"\""))
+    let guarded = if normalized.starts_with(['=', '+', '-', '@', '\t']) {
+        format!("'{normalized}")
     } else {
         normalized
+    };
+    if guarded.contains([',', '"', '\n']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
     }
 }
 
@@ -2679,6 +2696,37 @@ mod tests {
                 "{format}"
             );
         }
+    }
+
+    #[test]
+    fn html_row_stream_overflow_aborts_instead_of_dropping_findings() {
+        let mut report = fixture();
+        report.findings.values_mut().next().unwrap().details = Some("x".repeat(9 * 1024));
+        // The single row exceeds the whole 8 KiB budget while the surrounding
+        // document shell stays far below it; pre-fix the row was silently
+        // dropped and the render succeeded with zero findings.
+        assert!(matches!(
+            render_with_limit(&report, ReportFormat::Html, 8 * 1024),
+            Err(ReportError::Limit(_))
+        ));
+    }
+
+    #[test]
+    fn csv_fields_neutralize_spreadsheet_formula_injection() {
+        for hostile in ["=cmd|'/c calc'!A0", "+1", "-1", "@SUM(A1)", "\tcmd"] {
+            let field = csv_field(hostile);
+            assert!(field.starts_with('\''), "{hostile} -> {field}");
+        }
+        assert_eq!(
+            csv_field("=cmd,\"x\""),
+            "\"'=cmd,\"\"x\"\"\"",
+            "guard composes with RFC 4180 quoting"
+        );
+        assert_eq!(
+            csv_field("src/main.rs"),
+            "src/main.rs",
+            "benign paths are unchanged"
+        );
     }
 
     #[test]

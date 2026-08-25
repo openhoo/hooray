@@ -17,6 +17,16 @@ use crate::{
 };
 
 const MAX_BATCH_SIZE: usize = 1_000;
+/// Upper bound on server-driven pagination pages fetched per queried purl.
+/// A conformant endpoint stops returning `next_page_token`; a mirror echoing
+/// a stable token must not loop `scan` forever.
+const MAX_PAGES_PER_PURL: usize = 100;
+/// Upper bound for buffering a single OSV response body, matching the 100 MiB
+/// local SBOM input bound. Client-level timeouts are validated configuration
+/// values this CLI OSV client deliberately does not wire (documented release
+/// limitation), so these in-process bounds fail closed against misbehaving
+/// endpoints instead.
+const MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum OsvError {
@@ -44,6 +54,14 @@ pub enum OsvError {
     InvalidVulnerabilityId,
     #[error("OSV batch response contained {actual} results for {expected} queries")]
     ResultCount { expected: usize, actual: usize },
+    #[error("OSV pagination for {purl} exceeded maximum {maximum} pages")]
+    PageLimit { purl: String, maximum: usize },
+    #[error("OSV response from {endpoint} of {actual} bytes exceeds maximum {maximum}")]
+    TooLarge {
+        endpoint: String,
+        actual: usize,
+        maximum: usize,
+    },
 }
 
 pub struct OsvClient {
@@ -116,7 +134,15 @@ impl OsvClient {
                 );
 
                 let mut page_token = result.next_page_token;
+                let mut pages = 0usize;
                 while let Some(token) = page_token.filter(|token| !token.is_empty()) {
+                    pages += 1;
+                    if pages > MAX_PAGES_PER_PURL {
+                        return Err(OsvError::PageLimit {
+                            purl: purl.to_owned(),
+                            maximum: MAX_PAGES_PER_PURL,
+                        });
+                    }
                     let page = self
                         .query_batch(&[Query::new(purl, Some(&token))])
                         .await?
@@ -191,14 +217,35 @@ impl OsvClient {
 }
 
 async fn decode_response<T: for<'de> Deserialize<'de>>(
-    response: Response,
+    mut response: Response,
     endpoint: &Url,
 ) -> Result<T, OsvError> {
     let status = response.status();
-    let bytes = response.bytes().await.map_err(|source| OsvError::Request {
+    if let Some(length) = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .filter(|length| *length > MAX_RESPONSE_BYTES)
+    {
+        return Err(OsvError::TooLarge {
+            endpoint: endpoint.to_string(),
+            actual: length,
+            maximum: MAX_RESPONSE_BYTES,
+        });
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|source| OsvError::Request {
         endpoint: endpoint.to_string(),
         source,
-    })?;
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(OsvError::TooLarge {
+                endpoint: endpoint.to_string(),
+                actual: bytes.len().saturating_add(chunk.len()),
+                maximum: MAX_RESPONSE_BYTES,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     if !status.is_success() {
         return Err(OsvError::Http {
             endpoint: endpoint.to_string(),
@@ -394,7 +441,7 @@ fn map_findings(
                         aliases: vulnerability.aliases.iter().cloned().collect(),
                         summary: vulnerability.summary.clone(),
                         details: vulnerability.details.clone(),
-                        severity: vulnerability_severity(vulnerability),
+                        severity: vulnerability_severity(vulnerability, &component.purl),
                         confidence: Confidence::High,
                         evidence: BTreeSet::from([evidence.clone()]),
                         applicability: Some(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
@@ -511,19 +558,33 @@ fn package_identity(purl: &str) -> &str {
         .map_or(package, |(identity, _)| identity)
 }
 
-fn vulnerability_severity(vulnerability: &Vulnerability) -> Severity {
+fn vulnerability_severity(vulnerability: &Vulnerability, purl: &str) -> Severity {
+    // Per-package severity sources (affected[].severity plus the affected[]
+    // database_specific/ecosystem_specific labels) must be scoped to the
+    // queried purl exactly like `affected_ranges`; a multi-package advisory
+    // must not inflate this finding with sibling packages' labels.
+    let matching_affected: Vec<&Affected> = vulnerability
+        .affected
+        .iter()
+        .filter(|affected| {
+            affected
+                .package
+                .as_ref()
+                .and_then(|package| package.purl.as_deref())
+                .is_none_or(|affected_purl| same_package(affected_purl, purl))
+        })
+        .collect();
     vulnerability
         .severity
         .iter()
         .chain(
-            vulnerability
-                .affected
+            matching_affected
                 .iter()
                 .flat_map(|affected| affected.severity.iter()),
         )
         .filter_map(severity_from_osv)
         .chain(severity_strings(&vulnerability.database_specific))
-        .chain(vulnerability.affected.iter().flat_map(|affected| {
+        .chain(matching_affected.iter().flat_map(|affected| {
             severity_strings(&affected.database_specific)
                 .chain(severity_strings(&affected.ecosystem_specific))
         }))
@@ -859,6 +920,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_fails_closed_when_pagination_exceeds_page_limit() {
+        let server = MockServer::start().await;
+        let purl = "pkg:npm/looped@1.0.0";
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(json!({"queries": [{"package": {"purl": purl}}]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"vulns": [{"id": "OSV-1"}], "next_page_token": "next token"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(json!({"queries": [{
+                "package": {"purl": purl}, "page_token": "next token"
+            }]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"vulns": [], "next_page_token": "next token"}]
+            })))
+            .expect(MAX_PAGES_PER_PURL as u64)
+            .mount(&server)
+            .await;
+
+        let error = OsvClient::new(&server.uri(), 1)
+            .unwrap()
+            .scan(&inventory([component(
+                "component:looped",
+                "looped",
+                "1.0.0",
+                purl,
+            )]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OsvError::PageLimit { purl, maximum }
+                if purl == "pkg:npm/looped@1.0.0" && maximum == MAX_PAGES_PER_PURL
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_response_bodies() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("a".repeat(MAX_RESPONSE_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+
+        let error = OsvClient::new(&server.uri(), 1)
+            .unwrap()
+            .scan(&inventory([component(
+                "component:failure",
+                "failure",
+                "1.0.0",
+                "pkg:cargo/failure@1.0.0",
+            )]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OsvError::TooLarge { actual, maximum, .. }
+                if actual > maximum && maximum == MAX_RESPONSE_BYTES
+        ));
+    }
+
+    #[tokio::test]
     async fn reports_batch_http_body_decode_and_result_count_failures() {
         async fn scan_with(response: ResponseTemplate) -> OsvError {
             let server = MockServer::start().await;
@@ -1043,7 +1176,9 @@ mod tests {
         let finding = findings.values().next().unwrap();
         let remediation = finding.remediation.as_ref().unwrap();
 
-        assert_eq!(finding.severity, Severity::Critical);
+        // Severity must come from demo's own affected entry ("HIGH"); the
+        // sibling pkg:cargo/other "critical" label must not inflate it.
+        assert_eq!(finding.severity, Severity::High);
         assert_eq!(finding.aliases, BTreeSet::from(["CVE-2026-1".into()]));
         assert_eq!(finding.details.as_deref(), Some("observable details"));
         assert_eq!(finding.modified.as_deref(), Some("2026-07-21T12:00:00Z"));
@@ -1137,7 +1272,10 @@ mod tests {
                 "ecosystem_specific": {"severity": "LOW"}
             }]
         })).unwrap();
-        assert_eq!(vulnerability_severity(&vulnerability), Severity::Critical);
+        assert_eq!(
+            vulnerability_severity(&vulnerability, "pkg:cargo/demo@1.0.0"),
+            Severity::Critical
+        );
     }
 
     #[test]

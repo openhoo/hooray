@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::model::{
     ApplicabilityStatus, Component, Confidence, Finding, FindingKind, Inventory, PolicyDecision,
-    PolicyId, PolicyOutcome, PolicySummary, Scope, Severity,
+    PolicyId, PolicyOutcome, PolicySummary, Remediation, Scope, Severity,
 };
 
 pub const POLICY_SCHEMA_VERSION: u32 = 1;
@@ -466,7 +466,7 @@ impl CompiledRule<'_> {
         }
         if selectors
             .fix_available
-            .is_some_and(|required| finding.remediation.is_some() != required)
+            .is_some_and(|required| fix_available(finding.remediation.as_ref()) != required)
         {
             return false;
         }
@@ -493,6 +493,20 @@ impl CompiledRule<'_> {
         }
         true
     }
+}
+
+/// A remediation counts as an available fix only when it carries actionable
+/// guidance: named fixed versions, or inline instructions that are not a bare
+/// deferral to advisory references. OSV emits reference-only remediations for
+/// advisories that have no fixed version yet; treating those as unfixed keeps
+/// `fix_available: false` rules effective and mirrors risk scoring
+/// (`risk::fix_points`). Tradeoff: a remediation mixing inline text with
+/// references but no fixed version also classifies as unavailable.
+fn fix_available(remediation: Option<&Remediation>) -> bool {
+    remediation.is_some_and(|remediation| {
+        !remediation.fixed_versions.is_empty()
+            || (!remediation.description.is_empty() && remediation.references.is_empty())
+    })
 }
 
 fn decision(
@@ -991,20 +1005,43 @@ mod tests {
     }
 
     #[test]
-    fn fix_available_selector_requires_remediation_presence() {
+    fn fix_available_selector_requires_actionable_remediation() {
         let inventory = inventory(Some("MIT"), Scope::Runtime, "pkg:cargo/example@1");
         let mut fixable = rule("fixable", 0, PolicyOutcome::Deny);
         fixable.selectors.fix_available = Some(true);
-        let mut remediated = finding("finding");
-        remediated.remediation = Some(Remediation {
+        let mut upgraded = finding("finding");
+        upgraded.remediation = Some(Remediation {
             description: "upgrade".to_owned(),
             fixed_versions: BTreeSet::from(["2.0.0".to_owned()]),
             references: BTreeSet::new(),
         });
-        assert_eq!(
-            evaluate_one(&policy(vec![fixable.clone()]), remediated, &inventory).outcome,
-            PolicyOutcome::Deny
-        );
+        // Scanner remediations carry inline guidance without versions.
+        let mut guided = finding("finding");
+        guided.remediation = Some(Remediation {
+            description: "rotate the exposed credential".to_owned(),
+            fixed_versions: BTreeSet::new(),
+            references: BTreeSet::new(),
+        });
+        // OSV emits this shape when an advisory has references but no fixed
+        // version yet; it must count as unfixed.
+        let mut reference_only = finding("finding");
+        reference_only.remediation = Some(Remediation {
+            description: "Review the advisory references for remediation guidance".to_owned(),
+            fixed_versions: BTreeSet::new(),
+            references: BTreeSet::from(["https://advisory.example/CVE-2026-1234".to_owned()]),
+        });
+
+        for fixed_finding in [&upgraded, &guided] {
+            assert_eq!(
+                evaluate_one(
+                    &policy(vec![fixable.clone()]),
+                    fixed_finding.clone(),
+                    &inventory
+                )
+                .outcome,
+                PolicyOutcome::Deny
+            );
+        }
         assert_eq!(
             evaluate_one(
                 &policy(vec![fixable.clone()]),
@@ -1014,9 +1051,19 @@ mod tests {
             .outcome,
             PolicyOutcome::Allow
         );
-        fixable.selectors.fix_available = Some(false);
         assert_eq!(
-            evaluate_one(&policy(vec![fixable]), finding("finding"), &inventory).outcome,
+            evaluate_one(&policy(vec![fixable]), reference_only.clone(), &inventory).outcome,
+            PolicyOutcome::Allow
+        );
+
+        let mut unfixed = rule("unfixed", 0, PolicyOutcome::Deny);
+        unfixed.selectors.fix_available = Some(false);
+        assert_eq!(
+            evaluate_one(&policy(vec![unfixed.clone()]), reference_only, &inventory).outcome,
+            PolicyOutcome::Deny
+        );
+        assert_eq!(
+            evaluate_one(&policy(vec![unfixed]), finding("finding"), &inventory).outcome,
             PolicyOutcome::Deny
         );
     }

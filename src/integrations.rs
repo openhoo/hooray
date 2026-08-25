@@ -648,11 +648,17 @@ struct Selection<'a> {
 
 fn report_location<'a>(report: &'a ScanReport, finding: &Finding) -> Option<&'a Location> {
     let location_id = finding.location_id.as_ref()?;
+    // Project scans merge scanner locations solely into inventory.locations,
+    // while lockfile scans attach them to components. Mirror ReportIndex
+    // chaining (components first, then inventory) so every payload resolves
+    // both shapes deterministically instead of degrading project-scan
+    // findings to missing locations.
     report
         .inventory
         .components
         .values()
         .flat_map(|component| component.locations.iter())
+        .chain(report.inventory.locations.iter())
         .find(|location| &location.id == location_id)
 }
 
@@ -1100,6 +1106,30 @@ mod tests {
             check["output"]["annotations"][0]["path"],
             "src/finding:critical.rs"
         );
+    }
+
+    #[test]
+    fn project_scan_locations_resolve_from_inventory() {
+        let mut report = report(vec![finding(
+            "finding:sast",
+            FindingKind::Sast,
+            Severity::High,
+            true,
+        )]);
+        // Project-scan shape: scanner locations live only in inventory.locations.
+        let locations: BTreeSet<Location> = report
+            .inventory
+            .components
+            .values()
+            .flat_map(|component| component.locations.iter().cloned())
+            .collect();
+        report.inventory.locations = locations;
+        for component in report.inventory.components.values_mut() {
+            component.locations.clear();
+        }
+        let finding = report.findings.values().next().unwrap();
+        let location = report_location(&report, finding).expect("location resolves");
+        assert_eq!(location.path, "src/finding:sast.rs");
     }
 
     #[test]

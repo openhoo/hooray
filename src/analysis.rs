@@ -5,6 +5,13 @@ use crate::model::{
     Applicability, ApplicabilityStatus, Component, ComponentId, Evidence, Inventory, Scope,
 };
 
+/// Mirrors the enumeration bounds of graph path collection
+/// (`engine::MAX_DEPENDENCY_PATHS` / `MAX_DEPENDENCY_DEPTH`): graphs with many
+/// chained diamonds have exponentially many equal-length shortest paths, and
+/// consumers of `dependency_paths` only use the count and one representative.
+const MAX_DEPENDENCY_PATHS: usize = 32;
+const MAX_DEPENDENCY_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OsvRangeType {
     Ecosystem,
@@ -44,7 +51,7 @@ impl ApplicabilityAnalyzer {
         let ecosystem = purl_ecosystem(&input.component.purl);
         let evidence = EvidenceView::new(input.evidence);
         let version = version_parts(&input.component.version);
-        let paths = input
+        let (paths, paths_truncated) = input
             .inventory
             .map(|inventory| dependency_paths(inventory, &input.component.identity))
             .unwrap_or_default();
@@ -54,11 +61,12 @@ impl ApplicabilityAnalyzer {
             .or_else(|| evidence.boolean("source.import.reachable"));
 
         rationale.push(format!(
-            "component {} {} ({}) has {} dependency path(s)",
+            "component {} {} ({}) has {} dependency path(s){}",
             input.component.name,
             input.component.version,
             input.component.scope_label(),
-            paths.len()
+            paths.len(),
+            if paths_truncated { " (truncated)" } else { "" }
         ));
         if let Some(path) = paths.first() {
             rationale.push(format!("shortest dependency path: {path}"));
@@ -427,7 +435,7 @@ fn version_parts(version: &str) -> Option<Vec<String>> {
     (!parts.is_empty()).then_some(parts)
 }
 
-fn dependency_paths(inventory: &Inventory, target: &ComponentId) -> Vec<String> {
+fn dependency_paths(inventory: &Inventory, target: &ComponentId) -> (Vec<String>, bool) {
     let incoming: BTreeSet<_> = inventory.dependencies.iter().map(|edge| &edge.to).collect();
     let roots: Vec<_> = inventory
         .components
@@ -442,6 +450,9 @@ fn dependency_paths(inventory: &Inventory, target: &ComponentId) -> Vec<String> 
     let mut shortest: BTreeMap<ComponentId, usize> = BTreeMap::new();
     let mut results = Vec::new();
     while let Some((current, path)) = queue.pop_front() {
+        if results.len() >= MAX_DEPENDENCY_PATHS {
+            break;
+        }
         if shortest
             .get(&current)
             .is_some_and(|length| *length < path.len())
@@ -458,6 +469,9 @@ fn dependency_paths(inventory: &Inventory, target: &ComponentId) -> Vec<String> 
             );
             continue;
         }
+        if path.len() >= MAX_DEPENDENCY_DEPTH {
+            continue;
+        }
         for edge in inventory
             .dependencies
             .iter()
@@ -470,8 +484,12 @@ fn dependency_paths(inventory: &Inventory, target: &ComponentId) -> Vec<String> 
             }
         }
     }
+    // Consumers only use the count and one representative shortest path, so
+    // stopping at the cap keeps chained-diamond graphs linear instead of
+    // exponential; remaining queue entries mean the collection was truncated.
+    let truncated = results.len() >= MAX_DEPENDENCY_PATHS && !queue.is_empty();
     results.sort_by_key(|path| (path.matches(" -> ").count(), path.clone()));
-    results
+    (results, truncated)
 }
 
 #[cfg(test)]
@@ -808,6 +826,108 @@ mod tests {
                 .rationale
                 .unwrap()
                 .contains("component:root -> component:lib")
+        );
+    }
+
+    fn graph_inventory(edges: &[(usize, usize)]) -> (Inventory, Vec<ComponentId>) {
+        let highest = edges
+            .iter()
+            .flat_map(|(from, to)| [*from, *to])
+            .max()
+            .expect("graph has edges");
+        let id = |index: usize| ComponentId::new(format!("component:n{index}")).unwrap();
+        let mut components = BTreeMap::new();
+        for index in 0..=highest {
+            components.insert(
+                id(index),
+                Component {
+                    identity: id(index),
+                    name: format!("n{index}"),
+                    version: "1".to_owned(),
+                    purl: format!("pkg:cargo/n{index}@1"),
+                    scope: Scope::Runtime,
+                    provenance: BTreeSet::new(),
+                    licenses: BTreeSet::new(),
+                    locations: BTreeSet::new(),
+                },
+            );
+        }
+        let inventory = Inventory {
+            asset: Asset {
+                id: AssetId::new("asset:test").unwrap(),
+                name: "test".into(),
+                kind: AssetKind::Repository,
+                version: None,
+                metadata: BTreeMap::<String, Value>::new(),
+            },
+            components,
+            locations: BTreeSet::new(),
+            dependencies: edges
+                .iter()
+                .map(|(from, to)| DependencyEdge {
+                    from: id(*from),
+                    to: id(*to),
+                    scope: Scope::Runtime,
+                    optional: false,
+                })
+                .collect(),
+        };
+        (inventory, (0..=highest).map(id).collect())
+    }
+
+    #[test]
+    fn dependency_paths_caps_chained_diamond_enumeration() {
+        // Each chained diamond doubles the number of equal-length shortest
+        // paths; unbounded enumeration would collect all 2^K of them even
+        // though consumers only use the count and one representative.
+        const DIAMONDS: usize = 18;
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for i in 0..DIAMONDS {
+            let previous = 3 * i;
+            let (top, bottom, sink) = (3 * i + 1, 3 * i + 2, 3 * i + 3);
+            edges.extend([
+                (previous, top),
+                (previous, bottom),
+                (top, sink),
+                (bottom, sink),
+            ]);
+        }
+        let target = 3 * DIAMONDS;
+        let (inventory, ids) = graph_inventory(&edges);
+        let (paths, truncated) = dependency_paths(&inventory, &ids[target]);
+        assert!(truncated);
+        assert_eq!(paths.len(), MAX_DEPENDENCY_PATHS);
+        for path in &paths {
+            assert!(path.starts_with("component:n0 -> "));
+            assert!(path.ends_with(&format!(" -> component:n{target}")));
+            assert_eq!(path.matches(" -> ").count(), 2 * DIAMONDS);
+        }
+        // Enumeration order is deterministic across repeated calls.
+        assert_eq!(
+            dependency_paths(&inventory, &ids[target]),
+            (paths.clone(), truncated)
+        );
+    }
+
+    #[test]
+    fn dependency_paths_preserves_all_shortest_paths_below_cap() {
+        let (inventory, ids) = graph_inventory(&[(0, 1), (0, 2), (1, 3), (2, 3)]);
+        let (paths, truncated) = dependency_paths(&inventory, &ids[3]);
+        assert!(!truncated);
+        assert_eq!(
+            paths,
+            vec![
+                "component:n0 -> component:n1 -> component:n3".to_owned(),
+                "component:n0 -> component:n2 -> component:n3".to_owned(),
+            ]
+        );
+        // Linear chain yields exactly one path.
+        let (inventory, ids) = graph_inventory(&[(0, 1), (1, 2)]);
+        let (paths, truncated) = dependency_paths(&inventory, &ids[2]);
+        assert!(!truncated);
+        assert_eq!(
+            paths,
+            vec!["component:n0 -> component:n1 -> component:n2".to_owned()]
         );
     }
 }

@@ -29,7 +29,7 @@ use crate::{
         OperationalRiskAnalyzer, OperationalRiskConfig, OperationalRiskInput, RiskInput, RiskScorer,
     },
     scanners::{self, MalwareSignatures, ScannerConfig},
-    store::{Store, StoreError},
+    store::{HistoryFilter, Store, StoreError},
 };
 
 pub const REPORT_SCHEMA_VERSION: &str = "1";
@@ -250,11 +250,43 @@ impl<'a> Engine<'a> {
                 }
                 Ok(Some(report))
             }
-            None if required => self
-                .store
-                .latest_run_for_asset(asset_id)?
-                .ok_or(EngineError::MissingBaseline)
-                .map(Some),
+            None if required => {
+                // The implicit baseline must be the newest UNFILTERED report.
+                // A report thinned by --new-findings-only would otherwise
+                // become the next run's baseline, resurrecting previously
+                // seen findings on alternating runs. When only filtered runs
+                // exist, MissingBaseline mirrors the empty-history contract:
+                // take one full run first.
+                const BASELINE_PAGE_SIZE: u32 = 100;
+                const BASELINE_MAX_RUNS: u64 = 10_000;
+                let filter = HistoryFilter {
+                    asset_id: Some(asset_id.to_string()),
+                    ..HistoryFilter::default()
+                };
+                let mut offset = 0_u64;
+                loop {
+                    let page = self
+                        .store
+                        .query_history(&filter, BASELINE_PAGE_SIZE, offset)?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    for report in page {
+                        if matches!(
+                            report.run.metadata.get("new_findings_only"),
+                            Some(Value::Bool(true))
+                        ) {
+                            continue;
+                        }
+                        return Ok(Some(report));
+                    }
+                    offset += u64::from(BASELINE_PAGE_SIZE);
+                    if offset >= BASELINE_MAX_RUNS {
+                        break;
+                    }
+                }
+                Err(EngineError::MissingBaseline)
+            }
             None => Ok(None),
         }
     }
@@ -631,6 +663,49 @@ mod tests {
             finding.last_seen.as_deref(),
             Some("2026-02-01T00:00:00.000Z")
         );
+    }
+
+    #[test]
+    fn implicit_baseline_skips_new_findings_only_runs() {
+        let temp = TempDir::new().unwrap();
+        let config = online_config(&temp);
+        let mut store = Store::open_memory().unwrap();
+        let mut full = minimal_report();
+        let finding_id = FindingId::new("finding:x").unwrap();
+        full.findings
+            .insert(finding_id.clone(), minimal_finding(finding_id));
+        let mut thinned = minimal_report();
+        thinned.run.id = RunId::new("run:thinned").unwrap();
+        thinned.run.started_at = "2026-01-02T00:00:00.000Z".to_owned();
+        thinned
+            .run
+            .metadata
+            .insert("new_findings_only".to_owned(), Value::Bool(true));
+        store.save_report(&full).unwrap();
+        store.save_report(&thinned).unwrap();
+
+        let engine = Engine::new(&config, &mut store, None);
+        let baseline = engine
+            .resolve_baseline(None, true, &full.inventory.asset.id)
+            .unwrap();
+        assert_eq!(baseline.expect("baseline").run.id, full.run.id);
+    }
+
+    #[test]
+    fn implicit_baseline_errors_when_history_is_only_filtered_runs() {
+        let temp = TempDir::new().unwrap();
+        let config = online_config(&temp);
+        let mut store = Store::open_memory().unwrap();
+        let mut thinned = minimal_report();
+        thinned
+            .run
+            .metadata
+            .insert("new_findings_only".to_owned(), Value::Bool(true));
+        store.save_report(&thinned).unwrap();
+
+        let engine = Engine::new(&config, &mut store, None);
+        let result = engine.resolve_baseline(None, true, &thinned.inventory.asset.id);
+        assert!(matches!(result, Err(EngineError::MissingBaseline)));
     }
 
     #[test]

@@ -523,8 +523,15 @@ static SECRET_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
 });
 
 static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b(api[_-]?key|secret|token|password|passwd|client[_-]?secret)\b\s*[:=]\s*["']([^"']{12,256})["']"#)
-        .expect("constant assignment regex")
+    // The optional `["']?` accepts JSON quoted keys ("password": "..."), and
+    // the separator-delimited prefix/suffix segments accept compound names
+    // (SECRET_KEY, DB_PASSWORD, API_SECRET) without lookarounds, which the
+    // regex crate does not support. Unseparated words like "tokenize" or
+    // "tokens" still do not match.
+    Regex::new(
+        r#"(?i)\b(?:[a-z0-9]+[_-])?(api[_-]?key|secret|token|password|passwd|client[_-]?secret)(?:[_-][a-z0-9]+)*\b\s*["']?\s*[:=]\s*["']([^"']{12,256})["']"#,
+    )
+    .expect("constant assignment regex")
 });
 
 fn scan_secrets(text: &str, config: &ScannerConfig, builder: &mut FindingBuilder<'_>) {
@@ -743,6 +750,33 @@ fn secret_variable_name(name: &str) -> bool {
         || normalized.ends_with("_access_key")
 }
 
+/// Redacts userinfo credentials (`scheme://user:password@host`) from a line
+/// before it is rendered as IaC evidence; scheme, host, and path stay intact
+/// for triage. Only this finding embeds arbitrary remote URLs, so the scrub
+/// is scoped here rather than applied to every rendered directive line.
+fn redact_url_credentials(line: &str) -> String {
+    let mut redacted = String::with_capacity(line.len());
+    let mut searched_up_to = 0;
+    while let Some(separator) = line[searched_up_to..].find("://") {
+        let scheme_end = searched_up_to + separator + 3;
+        redacted.push_str(&line[searched_up_to..scheme_end]);
+        let authority_end = line[scheme_end..]
+            .find('/')
+            .map_or(line.len(), |position| scheme_end + position);
+        let authority = &line[scheme_end..authority_end];
+        match authority.rsplit_once('@') {
+            Some((_, host)) => {
+                redacted.push_str("[REDACTED]@");
+                redacted.push_str(host);
+            }
+            None => redacted.push_str(authority),
+        }
+        searched_up_to = authority_end;
+    }
+    redacted.push_str(&line[searched_up_to..]);
+    redacted
+}
+
 fn scan_dockerfile(text: &str, builder: &mut FindingBuilder<'_>) {
     let mut final_stage_line = 1;
     let mut final_user: Option<(u32, String)> = None;
@@ -758,7 +792,7 @@ fn scan_dockerfile(text: &str, builder: &mut FindingBuilder<'_>) {
         if upper.starts_with("ADD ")
             && (trimmed.contains("http://") || trimmed.contains("https://"))
         {
-            builder.add(FindingSpec { kind: FindingKind::Iac, rule: "iac.dockerfile.remote-add", line: index, column: 1, summary: "Dockerfile ADD fetches a remote URL", details: "Remote ADD makes provenance and cache behavior harder to control.", severity: Severity::Medium, confidence: Confidence::High, description: trimmed.to_owned(), references: &["https://docs.docker.com/reference/dockerfile/#add"], properties: BTreeMap::new(), redacted: false, remediation: "Fetch with a pinned, checksum-verified build step, then COPY the verified artifact.", cwe: Some("CWE-494") });
+            builder.add(FindingSpec { kind: FindingKind::Iac, rule: "iac.dockerfile.remote-add", line: index, column: 1, summary: "Dockerfile ADD fetches a remote URL", details: "Remote ADD makes provenance and cache behavior harder to control.", severity: Severity::Medium, confidence: Confidence::High, description: redact_url_credentials(trimmed), references: &["https://docs.docker.com/reference/dockerfile/#add"], properties: BTreeMap::new(), redacted: false, remediation: "Fetch with a pinned, checksum-verified build step, then COPY the verified artifact.", cwe: Some("CWE-494") });
         }
         if (upper.starts_with("ENV ") || upper.starts_with("ARG "))
             && docker_declares_secret(trimmed, &upper)
@@ -1758,7 +1792,7 @@ fn scan_sast(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
     let line_starts = line_starts(text);
     for rule in rules {
         for matched in rule.regex.find_iter(text) {
-            if offset_in_comment_or_string_prefix(text, matched.start(), &extension) {
+            if offset_in_comment_or_string(text, matched.start(), &extension) {
                 continue;
             }
             if matches!(
@@ -1809,8 +1843,10 @@ fn has_single_literal_argument(after_open_paren: &str) -> bool {
     false
 }
 
-static YAML_LOADER_KWARG_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bLoader\s*=").expect("constant YAML Loader kwarg regex"));
+static YAML_RESTRICTED_LOADER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:Loader\s*=|C?SafeLoader|BaseLoader)\b")
+        .expect("constant YAML restricted-loader regex")
+});
 
 fn yaml_call_specifies_loader(after_open_paren: &str) -> bool {
     const MAX_CALL_ARGUMENT_SCAN_BYTES: usize = 16 * 1024;
@@ -1846,41 +1882,108 @@ fn yaml_call_specifies_loader(after_open_paren: &str) -> bool {
             _ => {}
         }
     }
-    YAML_LOADER_KWARG_REGEX.is_match(&after_open_paren[..end])
+    // The byte cap can stop inside a multi-byte UTF-8 character; fall back to
+    // the nearest char boundary so slicing can never panic on crafted input.
+    while end > 0 && !after_open_paren.is_char_boundary(end) {
+        end -= 1;
+    }
+    YAML_RESTRICTED_LOADER_REGEX.is_match(&after_open_paren[..end])
 }
 
-fn offset_in_comment_or_string_prefix(text: &str, offset: usize, extension: &str) -> bool {
-    let line_start = text[..offset]
-        .rfind('\n')
-        .map_or(0, |position| position + 1);
-    let prefix = &text[line_start..offset];
-    let trimmed = prefix.trim_start();
-    if trimmed.starts_with("//") || trimmed.starts_with('#') {
-        return true;
+fn offset_in_comment_or_string(text: &str, offset: usize, extension: &str) -> bool {
+    // Lexical scan of everything before the match: reports whether the match
+    // offset sits inside a comment or string literal. Line comments and
+    // single-line strings reset at '\n'; block comments, JavaScript template
+    // literals, Go raw strings, and Python triple-quoted strings span lines.
+    // JavaScript division-vs-regex-literal ambiguity is resolved as code, so
+    // a regex literal containing a quote may leave tracking unopened and the
+    // match reported — suppression errs toward reporting, never hiding state.
+    enum State {
+        Code,
+        LineComment,
+        BlockComment,
+        Quoted {
+            quote: u8,
+            spans_lines: bool,
+            triple: bool,
+        },
     }
-    if extension == "py" {
-        return false;
-    }
-    let mut quote = None;
-    let mut escaped = false;
-    for character in prefix.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            escaped = true;
-            continue;
-        }
-        if matches!(character, '\'' | '"' | '`') {
-            if quote == Some(character) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(character);
+    let bytes = &text.as_bytes()[..offset];
+    let python = extension == "py";
+    let backtick_spans_lines = matches!(extension, "js" | "jsx" | "ts" | "tsx" | "go");
+    let mut state = State::Code;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match state {
+            State::Code => {
+                let rest = &bytes[index..];
+                if python && byte == b'#' {
+                    state = State::LineComment;
+                    index += 1;
+                } else if !python && byte == b'/' && rest.get(1) == Some(&b'/') {
+                    state = State::LineComment;
+                    index += 2;
+                } else if !python && byte == b'/' && rest.get(1) == Some(&b'*') {
+                    state = State::BlockComment;
+                    index += 2;
+                } else if matches!(byte, b'\'' | b'"' | b'`') {
+                    let triple = python && rest.starts_with(&[byte, byte, byte]);
+                    let spans_lines = triple || (byte == b'`' && backtick_spans_lines);
+                    state = State::Quoted {
+                        quote: byte,
+                        spans_lines,
+                        triple,
+                    };
+                    index += if triple { 3 } else { 1 };
+                } else {
+                    index += 1;
+                }
+            }
+            State::LineComment => {
+                if byte == b'\n' {
+                    state = State::Code;
+                }
+                index += 1;
+            }
+            State::BlockComment => {
+                if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    state = State::Code;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            State::Quoted {
+                quote,
+                spans_lines,
+                triple,
+            } => {
+                if !spans_lines && byte == b'\n' {
+                    state = State::Code;
+                    index += 1;
+                    continue;
+                }
+                if quote != b'`' && byte == b'\\' {
+                    // Skip the escaped byte; overshooting `offset` is fine.
+                    index += 2;
+                    continue;
+                }
+                if triple && bytes[index..].starts_with(&[quote, quote, quote]) {
+                    state = State::Code;
+                    index += 3;
+                    continue;
+                }
+                // Triple-quoted strings close only on their full
+                // terminator; a lone quote inside must not flip state.
+                if !triple && byte == quote {
+                    state = State::Code;
+                }
+                index += 1;
             }
         }
     }
-    quote.is_some()
+    !matches!(state, State::Code)
 }
 
 fn scan_malware(
@@ -1924,11 +2027,15 @@ fn detected_formats(bytes: &[u8]) -> Vec<&'static str> {
     if bytes.starts_with(b"%PDF-") {
         formats.push("pdf");
     }
+    // An embedded signature identical to the container's own format is the
+    // same format twice, not an independently meaningful second signature;
+    // counting it would flag ordinary single-format executables as polyglots.
     if bytes
         .windows(2)
         .skip(2)
         .take(4096)
         .any(|window| window == b"MZ")
+        && !formats.contains(&"pe")
     {
         formats.push("embedded-pe");
     }
@@ -1937,6 +2044,7 @@ fn detected_formats(bytes: &[u8]) -> Vec<&'static str> {
         .skip(4)
         .take(4096)
         .any(|window| window == b"\x7fELF")
+        && !formats.contains(&"elf")
     {
         formats.push("embedded-elf");
     }
@@ -2131,6 +2239,38 @@ mod tests {
     }
 
     #[test]
+    fn high_entropy_assignment_matches_json_quoted_keys_and_compound_names() {
+        for line in [
+            r#"{"password": "B7kP9vQ2mX8cR4tN6zW3"}"#,
+            r#"{"api_key": "B7kP9vQ2mX8cR4tN6zW3"}"#,
+            r#""client_secret": "B7kP9vQ2mX8cR4tN6zW3""#,
+            r#"SECRET_KEY = "B7kP9vQ2mX8cR4tN6zW3""#,
+            r#"DB_PASSWORD: "B7kP9vQ2mX8cR4tN6zW3""#,
+            r#"AUTH_TOKEN = "B7kP9vQ2mX8cR4tN6zW3""#,
+        ] {
+            assert!(
+                has(
+                    &analyze("settings.json", line),
+                    "secret.high-entropy-assignment"
+                ),
+                "missed credential assignment: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_entropy_assignment_still_ignores_keyword_prefixed_identifiers() {
+        assert!(!has(
+            &analyze("x.js", "tokenize = \"B7kP9vQ2mX8cR4tN6zW3\""),
+            "secret.high-entropy-assignment"
+        ));
+        assert!(!has(
+            &analyze("x", "tokens = \"B7kP9vQ2mX8cR4tN6zW3\""),
+            "secret.high-entropy-assignment"
+        ));
+    }
+
+    #[test]
     fn terraform_rules_detect_concrete_assignments_only() {
         let output = analyze(
             "main.tf",
@@ -2219,6 +2359,36 @@ mod tests {
     }
 
     #[test]
+    fn dockerfile_remote_add_evidence_never_carries_url_credentials() {
+        let output = analyze(
+            "Dockerfile",
+            "FROM alpine\nADD https://alice:hunter2@example.invalid/pkg.tgz /pkg.tgz\nUSER 10001\n",
+        );
+        let finding = output
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id.as_str() == "iac.dockerfile.remote-add")
+            .unwrap();
+        let serialized = serde_json::to_string(finding).unwrap();
+        assert!(!serialized.contains("hunter2"));
+        assert!(!serialized.contains("alice"));
+        assert!(serialized.contains("example.invalid/pkg.tgz"));
+        let plain = analyze(
+            "Dockerfile",
+            "FROM alpine\nADD https://example.invalid/tool /tool\nUSER 10001\n",
+        );
+        let finding = plain
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id.as_str() == "iac.dockerfile.remote-add")
+            .unwrap();
+        assert_eq!(
+            finding.evidence.iter().next().unwrap().description,
+            "ADD https://example.invalid/tool /tool"
+        );
+    }
+
+    #[test]
     fn dockerfile_root_user_is_determined_by_final_stage() {
         assert!(has(
             &analyze(
@@ -2297,6 +2467,89 @@ mod tests {
     }
 
     #[test]
+    fn yaml_load_positional_restricted_loaders_are_not_reported() {
+        for source in [
+            "cfg = yaml.load(doc, yaml.SafeLoader)",
+            "cfg = yaml.load(doc, yaml.CSafeLoader)",
+            "cfg = yaml.load(doc, yaml.BaseLoader)",
+            "cfg = yaml.load(doc, SafeLoader)",
+        ] {
+            assert!(
+                !has(&analyze("x.py", source), "sast.python.yaml-unsafe-load"),
+                "flagged safe call: {source}"
+            );
+        }
+        assert!(has(
+            &analyze("x.py", "cfg = yaml.load(doc)"),
+            "sast.python.yaml-unsafe-load"
+        ));
+        assert!(has(
+            &analyze("x.py", "cfg = yaml.load(doc, custom_loader)"),
+            "sast.python.yaml-unsafe-load"
+        ));
+    }
+
+    #[test]
+    fn yaml_loader_scan_tolerates_multibyte_arguments_past_the_byte_cap() {
+        let wide = "\u{20ac}".repeat(20_000);
+        assert!(!yaml_call_specifies_loader(&wide));
+        assert!(!yaml_call_specifies_loader(&format!("{})", wide)));
+        let output = analyze(
+            "x.py",
+            &format!("cfg = yaml.load(\"{}\")", "\u{20ac}".repeat(9_000)),
+        );
+
+        assert!(has(&output, "sast.python.yaml-unsafe-load"));
+    }
+    #[test]
+    fn python_triple_quoted_docstring_survives_lone_apostrophes() {
+        let source = "'''don't eval(user_input)'''\nvalue = eval(user_input)\n";
+        let output = analyze("x.py", source);
+        let findings = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.python.eval-dynamic")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            findings.len(),
+            1,
+            "docstring eval suppressed, live eval kept"
+        );
+    }
+
+    #[test]
+    fn sast_suppression_extends_across_inline_block_and_multiline_contexts() {
+        assert!(!has(
+            &analyze("x.js", "foo(); // eval(user_input)\n"),
+            "sast.javascript.eval-dynamic"
+        ));
+        assert!(!has(
+            &analyze("x.js", "/* eval(user_input) */\n"),
+            "sast.javascript.eval-dynamic"
+        ));
+        assert!(!has(
+            &analyze("x.rs", "/* Md5::new() */\n"),
+            "sast.rust.weak-hash-md5"
+        ));
+        assert!(!has(
+            &analyze("x.js", "const t = `first\neval(user_input)\nafter`;\n"),
+            "sast.javascript.eval-dynamic"
+        ));
+        assert!(!has(
+            &analyze("x.py", "\"\"\"\ndocstring eval(user_input)\n\"\"\"\n"),
+            "sast.python.eval-dynamic"
+        ));
+        assert!(has(
+            &analyze("x.js", "const y = eval(user_input);\n"),
+            "sast.javascript.eval-dynamic"
+        ));
+        assert!(has(
+            &analyze("x.py", "value = eval(user_input)\n"),
+            "sast.python.eval-dynamic"
+        ));
+    }
+
+    #[test]
     fn sast_evidence_is_redacted_and_omits_credentials() {
         let credential = "postgres://admin:hunter2@example.invalid/database";
         let source = format!("eval(credential + \"{credential}\")");
@@ -2356,6 +2609,29 @@ mod tests {
             .find(|finding| finding.rule_id.as_str() == "malware.executable-script-polyglot")
             .unwrap();
         assert_eq!(finding.confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn monomorphic_pe_is_not_flagged_as_polyglot() {
+        let mut bytes = b"MZ".to_vec();
+        bytes.resize(300, 0);
+        bytes.extend_from_slice(b"MZ");
+        bytes.resize(4096, 0);
+        assert_eq!(detected_formats(&bytes), vec!["pe"]);
+        assert!(!has(
+            &analyze_bytes(
+                "app.bin",
+                &bytes,
+                &asset(),
+                &ScannerConfig::default(),
+                &MalwareSignatures::default(),
+            ),
+            "malware.executable-script-polyglot"
+        ));
+        // A genuinely distinct second format still raises the indicator.
+        let mut polyglot = b"#!/bin/sh\n".to_vec();
+        polyglot.extend_from_slice(b"MZ padding");
+        assert_eq!(detected_formats(&polyglot), vec!["embedded-pe", "script"]);
     }
 
     #[test]

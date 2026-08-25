@@ -848,7 +848,14 @@ impl Store {
     pub fn update_monitor_event(&mut self, e: &MonitorEvent) -> Result<bool, StoreError> {
         let payload = serde_json::to_string(&e.payload)?;
         let attempts = i64::try_from(e.attempts).map_err(|_| StoreError::VersionOverflow)?;
-        Ok(self.connection.execute("UPDATE monitor_events SET target_id=?2,dedupe_key=?3,kind=?4,payload_json=?5,created_at=?6,attempts=?7,next_attempt_at=?8,delivered_at=?9,dead_lettered_at=?10,last_error=?11 WHERE event_id=?1",params![e.event_id,e.target_id,e.dedupe_key,e.kind,payload,e.created_at,attempts,e.next_attempt_at,e.delivered_at,e.dead_lettered_at,e.last_error])?==1)
+        // claim_monitor_events leases rows only via next_attempt_at (no token), so a
+        // worker whose delivery outlives its lease can race a re-claim. A writer that
+        // observed no terminal state must not overwrite a terminal state recorded by a
+        // newer claim owner; returning false lets the caller surface the lost claim.
+        // Tradeoff: non-terminal bookkeeping (attempts/backoff/last_error) may still
+        // interleave between concurrently failing workers, which at-least-once
+        // delivery tolerates.
+        Ok(self.connection.execute("UPDATE monitor_events SET target_id=?2,dedupe_key=?3,kind=?4,payload_json=?5,created_at=?6,attempts=?7,next_attempt_at=?8,delivered_at=?9,dead_lettered_at=?10,last_error=?11 WHERE event_id=?1 AND (?9 IS NOT NULL OR delivered_at IS NULL) AND (?10 IS NOT NULL OR dead_lettered_at IS NULL)",params![e.event_id,e.target_id,e.dedupe_key,e.kind,payload,e.created_at,attempts,e.next_attempt_at,e.delivered_at,e.dead_lettered_at,e.last_error])?==1)
     }
     pub fn prune_monitor_before(&mut self, timestamp: &str) -> Result<usize, StoreError> {
         Ok(self.connection.execute("DELETE FROM monitor_events WHERE created_at<?1 AND (delivered_at IS NOT NULL OR dead_lettered_at IS NOT NULL)",[timestamp])?)
@@ -1892,6 +1899,50 @@ mod tests {
                 .sum::<usize>(),
             1
         );
+    }
+
+    #[test]
+    fn stale_expired_lease_write_back_cannot_erase_newer_delivery() {
+        let mut s = Store::open_memory().unwrap();
+        s.upsert_monitor_target(&target("target", "2026-01-01Z"))
+            .unwrap();
+        s.append_monitor_event(&event("event", "target", Some("2026-01-01Z")))
+            .unwrap();
+        // Worker A claims the event with a lease that expires before it finishes.
+        let claimed_a = s
+            .claim_monitor_events("2026-01-01Z", "2026-01-02Z", 1)
+            .unwrap();
+        assert_eq!(claimed_a.len(), 1);
+        // After that lease expires, worker B re-claims and records delivery.
+        let claimed_b = s
+            .claim_monitor_events("2026-01-03Z", "2026-01-04Z", 1)
+            .unwrap();
+        assert_eq!(claimed_b.len(), 1);
+        let mut delivered = claimed_b[0].clone();
+        delivered.delivered_at = Some("2026-01-03Z".into());
+        delivered.next_attempt_at = Some("2026-01-03Z".into());
+        assert!(s.update_monitor_event(&delivered).unwrap());
+        // Stale worker A writes back its pre-delivery snapshot: this must not
+        // erase the newer delivery record or reschedule duplicate delivery.
+        let mut stale = claimed_a[0].clone();
+        stale.attempts = 1;
+        stale.last_error = Some("temporary".into());
+        stale.next_attempt_at = Some("2026-01-05Z".into());
+        assert!(!s.update_monitor_event(&stale).unwrap());
+        let events = s
+            .list_monitor_events(
+                &MonitorEventFilter {
+                    include_delivered: true,
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].delivered_at.as_deref(), Some("2026-01-03Z"));
+        assert_eq!(events[0].attempts, 0);
+        assert_eq!(events[0].last_error, None);
     }
 
     #[test]

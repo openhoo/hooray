@@ -465,8 +465,9 @@ Security and resource defaults:
   model-invariant violations fail closed; and
 - maximum accepted configuration values are validated before execution.
 
-The OSV URL must use HTTP or HTTPS, include a host, and must not contain embedded
-credentials, a query, or a fragment. Prefer the default HTTPS endpoint.
+The OSV URL must use HTTPS unless the host is a loopback address, include a
+host, and must not contain embedded credentials, a query, or a fragment. The
+default endpoint is HTTPS.
 
 The timeout and `monitor_interval_secs` fields are validated configuration
 values, but the current CLI OSV client uses reqwest's client defaults and the
@@ -525,8 +526,8 @@ cargo llvm-cov --locked --all-targets --all-features --fail-under-lines 90
 cargo deny check advisories bans licenses sources
 ```
 
-The implemented test suite currently contains 234 tests and the current measured
-line coverage is 93.52%. CI enforces a 90% line-coverage floor. Commit messages
+The implemented test suite contains 376 tests and the current measured line
+coverage is 93.14%. CI enforces a 90% line-coverage floor. Commit messages
 are linted as Conventional Commits, and dependency advisories, bans, licenses,
 and sources are checked on every pull request and push to `main`.
 

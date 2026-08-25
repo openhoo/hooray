@@ -411,6 +411,7 @@ fn parse_cargo_lock(
         .get("package")
         .and_then(toml::Value::as_array)
         .ok_or_else(|| malformed_msg(path, "Cargo.lock", "missing package array"))?;
+    entry_bound(packages.len(), path, "Cargo.lock")?;
     let declared_license = manifest
         .and_then(|b| toml::from_str::<toml::Value>(std::str::from_utf8(b).ok()?).ok())
         .and_then(|v| {
@@ -515,6 +516,7 @@ fn parse_package_lock(
     let lock: NpmLock =
         serde_json::from_slice(bytes).map_err(|e| malformed(path, "package-lock.json", e))?;
     if !lock.packages.is_empty() {
+        entry_bound(lock.packages.len(), path, "package-lock.json")?;
         let mut ids = BTreeMap::new();
         for (key, package) in &lock.packages {
             if key.is_empty() {
@@ -594,6 +596,7 @@ fn parse_package_lock(
             } else {
                 Scope::Runtime
             };
+            entry_bound(out.components.len() + 1, path, "package-lock.json")?;
             let id = out.add("npm", name, version, scope, path, BTreeSet::new())?;
             if let Some(parent) = parent {
                 out.edge(&parent, &id, scope, dependency.optional);
@@ -662,9 +665,10 @@ fn parse_requirements(
                     "empty package name or version",
                 ));
             }
+            entry_bound(out.components.len() + 1, path, "requirements.txt")?;
             out.add(
                 "pypi",
-                name.trim(),
+                &normalize_pypi_name(name),
                 version,
                 Scope::Runtime,
                 path,
@@ -710,6 +714,7 @@ fn parse_go_mod(path: &str, bytes: &[u8], out: &mut InventoryBuilder) -> Result<
         let (Some(name), Some(version), None) = (parts.next(), parts.next(), parts.next()) else {
             return Err(malformed_msg(path, "go.mod", "invalid require directive"));
         };
+        entry_bound(out.components.len() + 1, path, "go.mod")?;
         out.add(
             "golang",
             name,
@@ -756,7 +761,14 @@ fn parse_nuget_lock(
             };
             ids.insert(
                 (name.to_ascii_lowercase(), version.to_owned()),
-                out.add("nuget", name, version, scope, path, BTreeSet::new())?,
+                out.add(
+                    "nuget",
+                    &name.to_ascii_lowercase(),
+                    version,
+                    scope,
+                    path,
+                    BTreeSet::new(),
+                )?,
             );
         }
     }
@@ -922,14 +934,25 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
             continue;
         }
         let Some(version) = value.get("version").and_then(Yaml::as_str) else {
-            continue;
+            // README promises malformed lockfiles fail rather than skip
+            // entries; this is the same condition the classic parser
+            // hard-errors on, so Berry must not silently drop the entry.
+            return Err(malformed_msg(
+                path,
+                "yarn.lock",
+                format!("entry {key} has no version"),
+            ));
         };
         let descriptor = value
             .get("resolution")
             .and_then(Yaml::as_str)
             .unwrap_or(key);
         let Some((name, locator)) = split_descriptor(descriptor) else {
-            continue;
+            return Err(malformed_msg(
+                path,
+                "yarn.lock",
+                format!("entry {key} has invalid resolution {descriptor:?}"),
+            ));
         };
         if locator.starts_with("workspace:")
             || locator.starts_with("link:")
@@ -1158,7 +1181,14 @@ fn parse_poetry_lock(
         } else {
             Scope::Runtime
         };
-        let id = out.add("pypi", name, version, scope, path, BTreeSet::new())?;
+        let id = out.add(
+            "pypi",
+            &normalize_pypi_name(name),
+            version,
+            scope,
+            path,
+            BTreeSet::new(),
+        )?;
         ids.insert(name.to_ascii_lowercase(), id);
     }
     for package in packages {
@@ -1210,7 +1240,14 @@ fn parse_pipfile_lock(
             if version.is_empty() {
                 continue;
             }
-            out.add("pypi", name, version, scope, path, BTreeSet::new())?;
+            out.add(
+                "pypi",
+                &normalize_pypi_name(name),
+                version,
+                scope,
+                path,
+                BTreeSet::new(),
+            )?;
         }
     }
     Ok(())
@@ -1930,7 +1967,17 @@ fn is_inventory_file(path: &Path) -> bool {
 }
 fn is_oci_files(files: &BTreeMap<String, Vec<u8>>) -> bool {
     (files.contains_key("oci-layout") && files.contains_key("index.json"))
-        || files.contains_key("manifest.json")
+        || files.get("manifest.json").is_some_and(|bytes| {
+            // Only an array-shaped manifest.json marks a docker-save archive.
+            // Object-shaped manifests are web app manifests (PWA); routing
+            // project tarballs that carry one into the image parser rejected
+            // valid archives with Malformed instead of scanning their
+            // lockfiles. The bytes are already fully in memory, so parsing
+            // adds no new cap pressure.
+            serde_json::from_slice::<Value>(bytes)
+                .map(|value| value.is_array())
+                .unwrap_or(false)
+        })
 }
 fn looks_like_cyclonedx(path: &Path) -> Result<bool, InputError> {
     let bytes = read_prefix(path, 4096)?;
@@ -2083,11 +2130,75 @@ fn base_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 fn package_url(ecosystem: &str, name: &str, version: &str) -> String {
+    // Name keeps `/` (composer/golang namespace paths) and escapes only the
+    // bytes the purl grammar reserves or that parsers leak into names.
     let encoded = name
         .replace('%', "%25")
         .replace('@', "%40")
-        .replace(' ', "%20");
-    format!("pkg:{ecosystem}/{encoded}@{version}")
+        .replace(' ', "%20")
+        .replace('[', "%5B")
+        .replace(']', "%5D");
+    match purl_version(version) {
+        // Range constraints (^8.1, 1.24.*, >=2) are specifiers, not versions:
+        // baking them in produced purls the spec rejects that could never
+        // match an OSV advisory. A versionless purl keeps the component
+        // honest (raw specifier stays on Component.version) and lets OSV
+        // match the package across its versions.
+        Some(version) => format!("pkg:{ecosystem}/{encoded}@{}", percent_encode(&version)),
+        None => format!("pkg:{ecosystem}/{encoded}"),
+    }
+}
+
+/// Returns the concrete purl version for a specifier, stripping pnpm-style
+/// `1.2.3(integrity)` annotations, or `None` for empty values and range
+/// constraints (`^1.2`, `~1.2`, `>=1`, `1.*`, `a || b`, `git+https://…`).
+fn purl_version(version: &str) -> Option<String> {
+    let trimmed = version.trim();
+    let concrete = trimmed.split('(').next().unwrap_or(trimmed).trim_end();
+    if concrete.is_empty()
+        || concrete.chars().any(|c| {
+            matches!(c, '^' | '~' | '>' | '<' | '*' | ',' | '|' | '!' | '=' | ':')
+                || c.is_whitespace()
+        })
+    {
+        return None;
+    }
+    Some(concrete.to_owned())
+}
+
+/// Percent-encodes a purl version: keeps RFC 3986 unreserved bytes plus `+`
+/// and escapes everything else (including `%` and `@`) uppercase-hex.
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' | b'-' | b'+' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+/// PEP 503 PyPI name normalization plus extras stripping (`Requests[security]`),
+/// so one package cannot split into several component identities or purls.
+fn normalize_pypi_name(name: &str) -> String {
+    let base = name.split('[').next().unwrap_or(name).trim();
+    let mut normalized = String::with_capacity(base.len());
+    let mut separator = false;
+    for ch in base.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !separator {
+                normalized.push('-');
+            }
+            separator = true;
+        } else {
+            separator = false;
+            normalized.extend(ch.to_lowercase());
+        }
+    }
+    normalized
 }
 fn stable_asset(locator: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<AssetId, InputError> {
     let mut hash = Sha256::new();
@@ -2767,7 +2878,6 @@ mod tests {
         let dir = tempdir().unwrap();
         type TarEntries<'a> = Vec<(&'a str, &'a [u8])>;
         let cases: Vec<(&str, TarEntries<'_>)> = vec![
-            ("malformed.tar", vec![("manifest.json", b"{")]),
             ("empty.tar", vec![("manifest.json", b"[]")]),
             (
                 "missing-layer.tar",
@@ -2795,6 +2905,17 @@ mod tests {
                     | InputError::DigestMismatch(_))
             ));
         }
+
+        // An object-shaped (or unparseable) manifest.json is a web app
+        // manifest or garbage, not a docker-save archive: detection falls
+        // back to archive scanning, which rejects the tar as unsupported
+        // instead of the image parser's Malformed.
+        let path = dir.path().join("web-manifest.tar");
+        write_tar(&path, &[("manifest.json", br#"{"name":"app"}"#)]);
+        assert!(matches!(
+            scan_path(&path, &config()),
+            Err(InputError::UnsupportedFormat(_))
+        ));
 
         let claimed = digest(8);
         let index = format!(r#"{{"manifests":[{{"digest":"{claimed}"}}]}}"#);
@@ -3455,5 +3576,168 @@ mod tests {
             )
         );
         assert!(entry_bound(MAX_LOCKFILE_ENTRIES, "yarn.lock", "yarn.lock").is_ok());
+    }
+    #[test]
+    fn package_url_omits_range_constraints_and_encodes_versions() {
+        // Range constraints are specifiers, not versions: they must not be
+        // baked into purls (silent OSV misses).
+        assert_eq!(
+            package_url("composer", "symfony/console", "^6.3"),
+            "pkg:composer/symfony/console"
+        );
+        assert_eq!(package_url("conda", "numpy", "1.24.*"), "pkg:conda/numpy");
+        assert_eq!(package_url("npm", "a", ">=1.0 <2"), "pkg:npm/a");
+        // pnpm annotates resolved versions with an integrity hash.
+        assert_eq!(
+            package_url("npm", "a", "1.2.3(integrity)"),
+            "pkg:npm/a@1.2.3"
+        );
+        // Concrete versions keep their separator and gain spec encoding.
+        assert_eq!(
+            package_url("pypi", "requests[security]", "2.32.0"),
+            "pkg:pypi/requests%5Bsecurity%5D@2.32.0"
+        );
+        assert_eq!(
+            package_url("npm", "a", "1.0.0-beta.1+exp.sha.5114f85"),
+            "pkg:npm/a@1.0.0-beta.1+exp.sha.5114f85"
+        );
+        assert_eq!(package_url("npm", "a", "50%"), "pkg:npm/a@50%25");
+    }
+
+    #[test]
+    fn pypi_and_nuget_names_normalize_to_canonical_purls() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("requirements.txt"),
+            "Django==5.0\ndjangO==5.0\nrequests[security]==2.32.0\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Pipfile.lock"),
+            r#"{"default":{"Foo_Bar":{"version":"==1.0"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("packages.lock.json"),
+            r#"{"dependencies":{"net8.0":{"Newtonsoft.Json":{"type":"Direct","resolved":"13.0.1"}}}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let purl_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.purl.clone())
+        };
+        // Case variants collapse into one identity; extras are stripped.
+        assert_eq!(purl_of("django").as_deref(), Some("pkg:pypi/django@5.0"));
+        assert_eq!(
+            purl_of("requests").as_deref(),
+            Some("pkg:pypi/requests@2.32.0")
+        );
+        assert_eq!(purl_of("foo-bar").as_deref(), Some("pkg:pypi/foo-bar@1.0"));
+        assert_eq!(
+            purl_of("newtonsoft.json").as_deref(),
+            Some("pkg:nuget/newtonsoft.json@13.0.1")
+        );
+        assert_eq!(inventory.components.len(), 4);
+    }
+
+    #[test]
+    fn project_tar_with_web_manifest_is_scanned_as_archive() {
+        let dir = tempdir().unwrap();
+        let tar_path = dir.path().join("project.tar");
+        write_tar(
+            &tar_path,
+            &[
+                (
+                    "manifest.json",
+                    br#"{"name":"app","start_url":"/","icons":[]}"#,
+                ),
+                (
+                    "package-lock.json",
+                    br#"{"name":"app","packages":{"":{"version":"1"},"node_modules/a":{"version":"1.0"}}}"#,
+                ),
+            ],
+        );
+        let inventory = scan_path(&tar_path, &config()).unwrap();
+        assert_eq!(inventory.asset.kind, AssetKind::Filesystem);
+        assert!(inventory.components.values().any(|c| c.name == "a"));
+    }
+
+    #[test]
+    fn yarn_berry_malformed_entries_fail_closed() {
+        let missing_version =
+            "__metadata:\n  version: 8\n\"a@npm:1.0\":\n  resolution: \"a@npm:1.0\"\n";
+        let bad_resolution = "__metadata:\n  version: 8\n\"broken\":\n  version: 1.0\n";
+        for text in [missing_version, bad_resolution] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("yarn.lock"), text).unwrap();
+            let error = scan_path(dir.path(), &config()).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    InputError::Malformed { format, .. } if format == "yarn.lock"
+                ),
+                "expected malformed yarn.lock for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn previously_unbounded_parsers_reject_oversized_lockfiles() {
+        let config = Config {
+            max_input_bytes: 1 << 30,
+            ..Config::default()
+        };
+
+        let requirements: String = (0..MAX_LOCKFILE_ENTRIES + 1)
+            .map(|i| format!("p{i}==1.0.0\n"))
+            .collect();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("requirements.txt"), requirements).unwrap();
+        assert!(matches!(
+            scan_path(dir.path(), &config),
+            Err(InputError::Malformed { format, .. }) if format == "requirements.txt"
+        ));
+
+        let cargo: String = (0..MAX_LOCKFILE_ENTRIES + 1)
+            .map(|i| format!("[[package]]\nname = 'p{i}'\nversion = '1.0.0'\n"))
+            .collect();
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.lock"),
+            format!("version = 3\n{cargo}"),
+        )
+        .unwrap();
+        assert!(matches!(
+            scan_path(dir.path(), &config),
+            Err(InputError::Malformed { format, .. }) if format == "Cargo.lock"
+        ));
+
+        let go_mod: String = (0..MAX_LOCKFILE_ENTRIES + 1)
+            .map(|i| format!("require g.org/p{i} v1.0.0\n"))
+            .collect();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("go.mod"), go_mod).unwrap();
+        assert!(matches!(
+            scan_path(dir.path(), &config),
+            Err(InputError::Malformed { format, .. }) if format == "go.mod"
+        ));
+
+        let entries: Vec<String> = (0..MAX_LOCKFILE_ENTRIES + 1)
+            .map(|i| format!(r#""node_modules/p{i}":{{"name":"p{i}","version":"1.0.0"}}"#))
+            .collect();
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            format!(r#"{{"name":"app","packages":{{{}}}}}"#, entries.join(",")),
+        )
+        .unwrap();
+        assert!(matches!(
+            scan_path(dir.path(), &config),
+            Err(InputError::Malformed { format, .. }) if format == "package-lock.json"
+        ));
     }
 }

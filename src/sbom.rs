@@ -334,14 +334,17 @@ fn required_value<'a>(
         })
 }
 
-fn is_versioned_purl(purl: &str) -> bool {
-    let Some(package) = purl.strip_prefix("pkg:") else {
-        return false;
-    };
+fn purl_version(purl: &str) -> Option<&str> {
+    let package = purl.strip_prefix("pkg:")?;
     let package = package.split(['?', '#']).next().unwrap_or(package);
     package
         .rsplit_once('@')
-        .is_some_and(|(name, version)| !name.is_empty() && !version.is_empty())
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+        .map(|(_, version)| version)
+}
+
+fn is_versioned_purl(purl: &str) -> bool {
+    purl_version(purl).is_some()
 }
 
 fn parse_scope(scope: Option<&str>) -> Scope {
@@ -524,16 +527,27 @@ fn collect_spdx_packages(
         let package_path = format!("packages[{index}]");
         let spdx_id = required(&package.spdx_id, "SPDXID", &package_path)?;
         let name = required(&package.name, "name", &package_path)?;
-        let version = required(&package.version_info, "versionInfo", &package_path)?;
-        let purl = match spdx_package_purl(package) {
+        let referenced_purl = spdx_package_purl(package);
+        // SPDX 2.x marks versionInfo optional (0:1). Recover the version from
+        // a versioned externalRefs purl before failing closed; the tradeoff is
+        // that the raw (possibly percent-encoded) purl version is accepted
+        // where a literal versionInfo field is absent.
+        let version = match required(&package.version_info, "versionInfo", &package_path) {
+            Ok(version) => version,
+            Err(error) => referenced_purl
+                .as_deref()
+                .and_then(purl_version)
+                .ok_or(error)?,
+        };
+        let purl = match referenced_purl.as_deref() {
             Some(purl) => {
-                if !is_versioned_purl(&purl) {
+                if !is_versioned_purl(purl) {
                     return Err(SbomError::InvalidComponent {
                         path: package_path.clone(),
                         field: "purl",
                     });
                 }
-                purl
+                purl.to_owned()
             }
             None => format!("{name}@{version}"),
         };
@@ -1122,6 +1136,16 @@ mod tests {
             component.identity,
             stable_component_id("openssl@3.2.1").unwrap()
         );
+        inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn recovers_spdx_version_from_versioned_purl_when_version_info_missing() {
+        let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","externalRefs":[{"referenceType":"purl","referenceLocator":"pkg:cargo/a@1.2.3"}]}]}"#;
+        let inventory = parse_cyclonedx(input).unwrap();
+        let component = inventory.components.values().next().unwrap();
+        assert_eq!(component.purl, "pkg:cargo/a@1.2.3");
+        assert_eq!(component.version, "1.2.3");
         inventory.validate().unwrap();
     }
 

@@ -306,7 +306,7 @@ fn parse_generic(ecosystem: PackageEcosystem, value: &str) -> Option<VersionKey>
     Some(VersionKey {
         epoch: 0,
         release,
-        suffix: VersionSuffix::Generic(tokenize(pre)),
+        suffix: VersionSuffix::Generic(tokenize(pre)?),
     })
 }
 
@@ -329,7 +329,7 @@ fn parse_pep440(value: &str) -> Option<VersionKey> {
         .unwrap_or(value.len());
     let release = parse_numeric_release(value[..release_end].trim_end_matches('.'))?;
     let suffix_text = value[release_end..].trim_matches(['.', '-', '_']);
-    let parts = tokenize(suffix_text);
+    let parts = tokenize(suffix_text)?;
     let mut pre = None;
     let mut post = None;
     let mut dev = None;
@@ -374,7 +374,7 @@ fn parse_maven(value: &str) -> Option<VersionKey> {
         })
         .unwrap_or(value.len());
     let release = parse_numeric_release(value[..release_end].trim_end_matches('.'))?;
-    let mut suffix = tokenize(value[release_end..].trim_matches(['.', '-', '_']));
+    let mut suffix = tokenize(value[release_end..].trim_matches(['.', '-', '_']))?;
     suffix.retain(|part| {
         !matches!(part, VersionPart::Text(value) if matches!(value.as_str(), "final" | "ga" | "release"))
     });
@@ -447,7 +447,7 @@ fn compare_prerelease(left: &[VersionPart], right: &[VersionPart]) -> Ordering {
     match (left.is_empty(), right.is_empty()) {
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
-        _ => compare_parts(left, right),
+        _ => compare_parts(left, right, false),
     }
 }
 
@@ -458,19 +458,27 @@ fn compare_maven_parts(left: &[VersionPart], right: &[VersionPart]) -> Ordering 
         (Some(VersionPart::Text(value)), None) => maven_qualifier_rank(value).cmp(&5),
         (None, Some(VersionPart::Number(_))) => Ordering::Less,
         (Some(VersionPart::Number(_)), None) => Ordering::Greater,
-        _ => compare_parts(left, right),
+        _ => compare_parts(left, right, true),
     }
 }
 
-fn compare_parts(left: &[VersionPart], right: &[VersionPart]) -> Ordering {
+fn compare_parts(left: &[VersionPart], right: &[VersionPart], maven_ranks: bool) -> Ordering {
     for (left, right) in left.iter().zip(right) {
         let ordering = match (left, right) {
             (VersionPart::Number(a), VersionPart::Number(b)) => a.cmp(b),
             (VersionPart::Number(_), VersionPart::Text(_)) => Ordering::Less,
             (VersionPart::Text(_), VersionPart::Number(_)) => Ordering::Greater,
-            (VersionPart::Text(a), VersionPart::Text(b)) => maven_qualifier_rank(a)
-                .cmp(&maven_qualifier_rank(b))
-                .then_with(|| a.cmp(b)),
+            (VersionPart::Text(a), VersionPart::Text(b)) => {
+                if maven_ranks {
+                    maven_qualifier_rank(a)
+                        .cmp(&maven_qualifier_rank(b))
+                        .then_with(|| a.cmp(b))
+                } else {
+                    // Semver ecosystems order prerelease identifiers lexically; ranked
+                    // qualifier words are Maven-only vocabulary.
+                    a.cmp(b)
+                }
+            }
         };
         if !ordering.is_eq() {
             return ordering;
@@ -492,7 +500,7 @@ fn maven_qualifier_rank(value: &str) -> u8 {
     }
 }
 
-fn tokenize(value: &str) -> Vec<VersionPart> {
+fn tokenize(value: &str) -> Option<Vec<VersionPart>> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut numeric = None;
@@ -502,31 +510,39 @@ fn tokenize(value: &str) -> Vec<VersionPart> {
     {
         if !character.is_ascii_alphanumeric() {
             if !current.is_empty() {
-                push_part(&mut parts, &mut current, numeric);
+                push_part(&mut parts, &mut current, numeric)?;
             }
             numeric = None;
             continue;
         }
         let is_numeric = character.is_ascii_digit();
         if numeric.is_some_and(|kind| kind != is_numeric) {
-            push_part(&mut parts, &mut current, numeric);
+            push_part(&mut parts, &mut current, numeric)?;
         }
         numeric = Some(is_numeric);
         current.push(character);
     }
     if !current.is_empty() {
-        push_part(&mut parts, &mut current, numeric);
+        push_part(&mut parts, &mut current, numeric)?;
     }
-    parts
+    Some(parts)
 }
 
-fn push_part(parts: &mut Vec<VersionPart>, current: &mut String, numeric: Option<bool>) {
+fn push_part(
+    parts: &mut Vec<VersionPart>,
+    current: &mut String,
+    numeric: Option<bool>,
+) -> Option<()> {
     let value = std::mem::take(current);
     if numeric == Some(true) {
-        parts.push(VersionPart::Number(value.parse().unwrap()));
+        // Digit runs beyond u64 are unrepresentable; mirror parse_numeric_release and
+        // reject the whole version instead of panicking on attacker-controlled suffixes.
+        let number = value.parse().ok()?;
+        parts.push(VersionPart::Number(number));
     } else {
         parts.push(VersionPart::Text(value));
     }
+    Some(())
 }
 
 #[cfg(test)]
@@ -539,7 +555,7 @@ mod tests {
         PackageEcosystem, Remediation, RuleId, Scope, Severity,
     };
 
-    use super::{RemediationError, nearest_fixed_version, plan_upgrade};
+    use super::{RemediationError, VersionKey, nearest_fixed_version, plan_upgrade};
 
     fn component(purl: &str, version: &str) -> Component {
         Component {
@@ -856,5 +872,56 @@ mod tests {
             ),
             Err(RemediationError::UnsupportedPackageUrl(_))
         ));
+    }
+
+    #[test]
+    fn oversized_suffix_digit_run_fails_parse_instead_of_panicking() {
+        let max = u64::MAX.to_string();
+        assert!(
+            VersionKey::parse(PackageEcosystem::Npm, &format!("1.0.0-{max}")).is_some(),
+            "a u64::MAX digit run stays representable"
+        );
+        assert!(VersionKey::parse(PackageEcosystem::Npm, &format!("1.0.0-{max}0")).is_none());
+        assert!(VersionKey::parse(PackageEcosystem::Pypi, &format!("1.0.post{max}0")).is_none());
+        assert!(VersionKey::parse(PackageEcosystem::Maven, &format!("1.0.0-{max}0")).is_none());
+    }
+
+    #[test]
+    fn nearest_fixed_version_skips_oversized_unparsable_candidates() {
+        assert_eq!(
+            nearest_fixed_version(
+                PackageEcosystem::Cargo,
+                "1.0.0",
+                ["1.0.0-99999999999999999999"],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn generic_prerelease_text_compares_lexically_not_by_maven_rank() {
+        // Semver orders prerelease identifiers lexically ("lz" < "m"), so "1.0.0-lz"
+        // must not be offered as a fix for "1.0.0-m".
+        assert_eq!(
+            nearest_fixed_version(PackageEcosystem::Npm, "1.0.0-m", ["1.0.0-lz"]),
+            None
+        );
+        // "az" < "beta" lexically, so the available fix must be selected.
+        assert_eq!(
+            nearest_fixed_version(PackageEcosystem::Npm, "1.0.0-az", ["1.0.0-beta"]),
+            Some("1.0.0-beta".to_owned())
+        );
+    }
+
+    #[test]
+    fn maven_qualifier_ranking_still_applies_to_maven_versions() {
+        assert_eq!(
+            nearest_fixed_version(PackageEcosystem::Maven, "1.0.0-m", ["1.0.0-lz"]),
+            Some("1.0.0-lz".to_owned())
+        );
+        assert_eq!(
+            nearest_fixed_version(PackageEcosystem::Maven, "1.0.0-beta", ["1.0.0-alpha"]),
+            None
+        );
     }
 }

@@ -29,13 +29,17 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::{
+    analysis::{ApplicabilityAnalyzer, ApplicabilityInput},
     config::Config,
+    graph::DependencyGraph,
     model::{
-        Finding, FindingKind, Inventory, PolicySummary, RunId, RunMetadata, ScanReport, Severity,
+        ApplicabilityStatus, DependencyKind, Finding, FindingId, FindingKind, Inventory,
+        PolicySummary, RunId, RunMetadata, ScanReport, Severity,
     },
-    osv::OsvClient,
+    osv::{OsvClient, OsvError},
     policy::{Policy, PolicyException},
     report::{sanitize_report, sanitize_value},
+    risk::{RiskInput, RiskScorer},
     store::{FindingFilter, InventoryFilter, MAX_PAGE_SIZE, ReportDiff, Store, StoreError},
 };
 
@@ -150,6 +154,18 @@ async fn create_scan(
     State(state): State<ApiState>,
     payload: Result<Json<ScanRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    scan_with_deadline(state, payload, REQUEST_TIMEOUT).await
+}
+
+/// POST /v1/scans must complete its authoritative store write once started, so
+/// the timeout middleware never aborts this route; the upstream vulnerability
+/// fetch is bounded here instead so a stalled OSV connection cannot pin scan
+/// slots indefinitely.
+async fn scan_with_deadline(
+    state: ApiState,
+    payload: Result<Json<ScanRequest>, JsonRejection>,
+    fetch_bound: Duration,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Json(request) = payload.map_err(ApiError::from_json_rejection)?;
     request
         .inventory
@@ -172,13 +188,21 @@ async fn create_scan(
     let started_at = timestamp();
     let client = OsvClient::new(&state.config.osv_url, state.config.max_concurrency)
         .map_err(|error| ApiError::internal("scanner_initialization_failed", error.to_string()))?;
-    let findings = client.scan(&request.inventory).await.map_err(|error| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "vulnerability_service_failed",
-            error.to_string(),
-        )
-    })?;
+    let mut findings =
+        match tokio::time::timeout(fetch_bound, client.scan(&request.inventory)).await {
+            Ok(result) => result.map_err(|error| vulnerability_service_error(&error))?,
+            Err(_) => {
+                return Err(ApiError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "vulnerability_service_timeout",
+                    "vulnerability service processing exceeded the time limit",
+                ));
+            }
+        };
+    // Score findings exactly like the CLI engine path (engine.rs
+    // `contextualize_and_score`) before policy evaluation; unscored findings
+    // would silently disable every risk-selector rule on this route.
+    score_findings(&request.inventory, &mut findings, Utc::now())?;
     let (policy_decisions, policy_summary) = match request.policy {
         Some(policy) => {
             let evaluation = policy
@@ -220,6 +244,89 @@ async fn create_scan(
             "status": "completed"
         })),
     ))
+}
+
+/// Maps upstream OSV failures onto the error envelope without echoing the
+/// configured endpoint URL, upstream response bodies, or transport details:
+/// upstream internals are never rendered to API callers (redaction contract).
+fn vulnerability_service_error(error: &OsvError) -> ApiError {
+    let message = match error {
+        OsvError::Http { .. } => "the vulnerability service returned an error response",
+        OsvError::Request { .. } => "the vulnerability service could not be reached",
+        OsvError::Decode { .. } => "the vulnerability service returned an unreadable response",
+        OsvError::ResultCount { .. } => {
+            "the vulnerability service returned a malformed batch result"
+        }
+        OsvError::InvalidVulnerabilityId => {
+            "the vulnerability service returned a malformed advisory"
+        }
+        OsvError::PageLimit { .. } => "the vulnerability service returned too many results",
+        OsvError::TooLarge { .. } => {
+            "the vulnerability service response exceeds the supported size"
+        }
+        OsvError::InvalidBaseUrl(_) => "the vulnerability service location is invalid",
+    };
+    ApiError::new(
+        StatusCode::BAD_GATEWAY,
+        "vulnerability_service_failed",
+        message,
+    )
+}
+
+/// Mirror of the CLI scoring pass (engine.rs `contextualize_and_score`); the
+/// two must stay in lockstep so policy selectors observe identical risk values
+/// on the API route and in `hooray scan`.
+fn score_findings(
+    inventory: &Inventory,
+    findings: &mut BTreeMap<FindingId, Finding>,
+    as_of: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let graph = DependencyGraph::from_inventory(inventory)
+        .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
+    for finding in findings.values_mut() {
+        let Some(component_id) = finding.component_id.as_ref() else {
+            continue;
+        };
+        let Some(component) = inventory.components.get(component_id) else {
+            continue;
+        };
+        let evidence = finding.evidence.clone();
+        if finding.applicability.is_none() {
+            finding.applicability = Some(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
+                component,
+                inventory: Some(inventory),
+                evidence: &evidence,
+                affected_ranges: &[],
+            }));
+        }
+        let applicability = finding
+            .applicability
+            .as_ref()
+            .map(|value| value.status)
+            .unwrap_or(ApplicabilityStatus::Unknown);
+        let direct = match graph.classify(component_id) {
+            Ok(DependencyKind::Direct) => Some(true),
+            Ok(DependencyKind::Transitive) => Some(false),
+            Ok(DependencyKind::Disconnected) => None,
+            Err(error) => {
+                return Err(ApiError::internal(
+                    "finding_scoring_failed",
+                    error.to_string(),
+                ));
+            }
+        };
+        finding.risk = Some(RiskScorer::score(RiskInput {
+            severity: finding.severity,
+            confidence: finding.confidence,
+            applicability,
+            component,
+            direct,
+            remediation: finding.remediation.as_ref(),
+            evidence: &evidence,
+            as_of: as_of.date_naive(),
+        }));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -729,6 +836,10 @@ async fn timeout_middleware_with_duration(
     timeout: Duration,
 ) -> Response {
     let request_id = request.extensions().get::<RequestId>().cloned();
+    // POST /v1/scans must complete its authoritative store write once started,
+    // so this route is never aborted here; its upstream vulnerability fetch is
+    // bounded inside create_scan instead, so a stalled OSV connection cannot
+    // pin scan slots indefinitely.
     let write_outcome_must_complete =
         request.method() == Method::POST && request.uri().path() == "/v1/scans";
     if write_outcome_must_complete {
@@ -884,9 +995,9 @@ mod tests {
 
     use super::*;
     use crate::model::{
-        Asset, AssetId, AssetKind, Component, ComponentId, Confidence, Evidence, FindingId,
-        FindingStatus, Location, LocationId, PolicyDecision, PolicyId, PolicyOutcome,
-        PolicySummary, Position, RuleId, RunMetadata, Scope,
+        Asset, AssetId, AssetKind, Component, Confidence, Evidence, FindingId, FindingStatus,
+        Location, LocationId, PolicyDecision, PolicyId, PolicyOutcome, PolicySummary, Position,
+        RuleId, RunMetadata, Scope,
     };
 
     fn report(id: &str) -> ScanReport {
@@ -922,9 +1033,10 @@ mod tests {
             policy_summary: PolicySummary::default(),
         }
     }
-    fn component(id: &str, name: &str, purl: &str, scope: Scope) -> Component {
+    fn component(_id: &str, name: &str, purl: &str, scope: Scope) -> Component {
+        // Inventory::validate now requires identities derived from the purl.
         Component {
-            identity: ComponentId::new(id).unwrap(),
+            identity: crate::model::stable_component_id(purl).unwrap(),
             name: name.to_owned(),
             version: "1.0.0".to_owned(),
             purl: purl.to_owned(),
@@ -1289,11 +1401,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["components"].as_object().unwrap().len(), 2);
 
+        let runtime_id = crate::model::stable_component_id("pkg:cargo/runtime-lib@1.0.0").unwrap();
         let (status, body) = response(
             application.clone(),
-            Request::get("/v1/inventory?asset_id=asset:test&component_id=component:runtime&name=runtime-lib&purl=pkg:cargo/runtime-lib@1.0.0&scope=runtime")
-                .body(Body::empty()).unwrap(),
-        ).await;
+            Request::get(format!(
+                "/v1/inventory?asset_id=asset:test&component_id={}&name=runtime-lib&purl=pkg:cargo/runtime-lib@1.0.0&scope=runtime",
+                runtime_id.as_str()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["count"], 1);
         assert_eq!(body["components"][0]["component"]["name"], "runtime-lib");
@@ -1751,6 +1869,156 @@ mod tests {
         assert_eq!(
             json_body(response).await["error"]["code"],
             "invalid_exception"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_failure_envelope_never_leaks_upstream_details() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+            .mount(&server)
+            .await;
+        let (status, body) = response(
+            app(Config {
+                osv_url: server.uri(),
+                ..Config::default()
+            }),
+            Request::post("/v1/scans")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"inventory": rich_report("template", &[]).inventory}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "vulnerability_service_failed");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            !message.contains(&server.uri()),
+            "leaked endpoint: {message}"
+        );
+        assert!(
+            !message.contains("temporarily unavailable"),
+            "leaked upstream body: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_policy_enforces_risk_selectors_on_scored_findings() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"vulns": [{"id": "OSV-1"}]}, {"vulns": []}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/vulns/OSV-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "OSV-1",
+                "summary": "high severity advisory",
+                "severity": [{"type": "CVSS_V3", "score": 7.2}]
+            })))
+            .mount(&server)
+            .await;
+        let policy = json!({
+            "version": 1,
+            "default_outcome": "allow",
+            "rules": [{
+                "id": "deny-high-risk",
+                "outcome": "deny",
+                "reason": "scored risk findings are denied",
+                "selectors": {"risk": {"minimum": 1}}
+            }],
+            "exceptions": []
+        });
+        let application = app(Config {
+            osv_url: server.uri(),
+            ..Config::default()
+        });
+        let (status, body) = response(
+            application.clone(),
+            Request::post("/v1/scans")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "inventory": rich_report("template", &[]).inventory,
+                        "policy": policy
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let run_id = body["run_id"].as_str().unwrap();
+        let (status, saved) = response(
+            application,
+            Request::get(format!("/v1/runs/{run_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let findings = saved["findings"].as_object().unwrap();
+        assert!(!findings.is_empty(), "the OSV stub must produce a finding");
+        for (id, finding) in findings {
+            assert!(
+                finding["risk"] != Value::Null,
+                "finding {id} must be scored before policy evaluation"
+            );
+        }
+        assert_eq!(
+            saved["policy_summary"],
+            json!({"allowed": 0, "warned": 0, "denied": 1})
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_fetch_is_bounded_so_stalled_vulnerability_service_cannot_pin_slots() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"results": [{"vulns": []}, {"vulns": []}]}))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let state = ApiState::new(
+            Store::open_memory().unwrap(),
+            Config {
+                osv_url: server.uri(),
+                max_concurrency: 1,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let slots = Arc::clone(&state.scan_slots);
+        let payload = Ok(Json(ScanRequest {
+            inventory: rich_report("template", &[]).inventory,
+            policy: None,
+            metadata: BTreeMap::new(),
+        }));
+        let started = std::time::Instant::now();
+        let error = scan_with_deadline(state, payload, Duration::from_millis(100))
+            .await
+            .expect_err("stalled vulnerability service must exceed the fetch bound");
+        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(error.code, "vulnerability_service_timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the fetch bound must fire well before the delayed response"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "a timed-out scan must release its slot"
         );
     }
 }

@@ -575,7 +575,17 @@ where
             (left.next_due_at, &left.id).cmp(&(right.next_due_at, &right.id))
         });
         for mut target in targets {
-            target.validate()?;
+            if target.validate().is_err() {
+                // A stored target that no longer validates (for example an
+                // out-of-range interval registered before ingress validation
+                // existed) must not abort the whole cycle: reschedule it like
+                // other per-target failures so remaining targets, delivery,
+                // and pruning still proceed instead of starving forever.
+                target.next_due_at = now.saturating_add(self.config.retry.initial_backoff_seconds);
+                target.updated_at = now;
+                self.repository.save_target(&target)?;
+                continue;
+            }
             summary.targets_considered += 1;
             let fingerprint = match self.runner.source_fingerprint(&target).await {
                 Ok(fingerprint) => fingerprint,
@@ -1180,6 +1190,34 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!(service.repository().targets["target"].next_due_at, 115);
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_target_reschedules_without_aborting_the_cycle() {
+        let mut repository = MemoryRepository::default();
+        let mut poisoned = target(100);
+        poisoned.id = "poisoned".into();
+        poisoned.interval_seconds = MAX_BACKOFF_SECONDS + 1;
+        let mut healthy = target(100);
+        healthy.id = "healthy".into();
+        repository.targets.insert(poisoned.id.clone(), poisoned);
+        repository.targets.insert(healthy.id.clone(), healthy);
+        let clock = Arc::new(FakeClock::new(100));
+        let runner = Arc::new(FakeRunner::new());
+        let notifier = Arc::new(FakeNotifier::succeeding());
+        let mut service = service(
+            repository,
+            clock,
+            runner.clone(),
+            notifier,
+            RetryPolicy::default(),
+        );
+        let summary = service.run_once().await.unwrap();
+        assert_eq!(summary.targets_considered, 1);
+        assert_eq!(runner.evaluations.load(Ordering::SeqCst), 1);
+        let targets = &service.repository().targets;
+        assert_eq!(targets["healthy"].next_due_at, 110);
+        assert!(targets["poisoned"].next_due_at > 100);
     }
     #[tokio::test]
     async fn daemon_survives_transient_cycle_failures_and_retries() {

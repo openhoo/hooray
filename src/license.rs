@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::model::{
     Confidence, Evidence, Finding, FindingKind, FindingStatus, Inventory, License, RuleId,
-    Severity, stable_finding_id,
+    Severity, salted_finding_id, stable_finding_id,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,8 +104,11 @@ pub fn analyze_with_files(
                         &detected_rule,
                         component,
                         license.as_ref(),
-                        Severity::Low,
-                        detection.confidence,
+                        LicenseFindingShape {
+                            salt: None,
+                            severity: Severity::Low,
+                            confidence: detection.confidence,
+                        },
                         &format!(
                             "License file suggests {}",
                             detection
@@ -118,21 +121,40 @@ pub fn analyze_with_files(
                     ));
                 }
             } else {
-                findings.push(finding(&unknown_rule, component, None, Severity::Medium, Confidence::High,
+                findings.push(finding(&unknown_rule, component, None, LicenseFindingShape { salt: None, severity: Severity::Medium, confidence: Confidence::High },
                     "No license metadata or attributable license file was found",
                     Evidence { description: "Component has no declared licenses and no recognized LICENSE/COPYING text can be attributed to it".into(), locations: component.locations.iter().map(|v| v.id.clone()).collect(), references: BTreeSet::new(), properties: BTreeMap::from([("classification".into(), "unknown".into())]), redacted: false }));
             }
             continue;
         }
         for license in &component.licenses {
+            // Multiple declared licenses previously collided on one finding id and were
+            // silently fused downstream; when a component declares more than one, bind the
+            // license identity into the id. Single-license ids remain byte-for-byte stable.
+            let salt = if component.licenses.len() > 1 {
+                Some(
+                    license
+                        .expression
+                        .as_deref()
+                        .or(license.name.as_deref())
+                        .or(license.url.as_deref())
+                        .unwrap_or("")
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
             match license.expression.as_deref() {
                 Some(expression) if spdx::Expression::parse(expression).is_ok() => {
                     findings.push(finding(
                         &detected_rule,
                         component,
                         Some(license),
-                        Severity::Low,
-                        Confidence::High,
+                        LicenseFindingShape {
+                            salt: salt.as_deref(),
+                            severity: Severity::Low,
+                            confidence: Confidence::High,
+                        },
                         &format!("Valid SPDX license expression: {expression}"),
                         declared_evidence(component, license, true),
                     ));
@@ -142,8 +164,11 @@ pub fn analyze_with_files(
                         &invalid_rule,
                         component,
                         Some(license),
-                        Severity::High,
-                        Confidence::High,
+                        LicenseFindingShape {
+                            salt: salt.as_deref(),
+                            severity: Severity::High,
+                            confidence: Confidence::High,
+                        },
                         &format!("Invalid SPDX license expression: {expression}"),
                         declared_evidence(component, license, false),
                     ));
@@ -157,8 +182,11 @@ pub fn analyze_with_files(
                         &detected_rule,
                         component,
                         Some(license),
-                        Severity::Low,
-                        Confidence::Medium,
+                        LicenseFindingShape {
+                            salt: salt.as_deref(),
+                            severity: Severity::Low,
+                            confidence: Confidence::Medium,
+                        },
                         &format!(
                             "License name is a valid SPDX expression: {}",
                             license.name.as_deref().unwrap()
@@ -171,8 +199,11 @@ pub fn analyze_with_files(
                         &unknown_rule,
                         component,
                         Some(license),
-                        Severity::Medium,
-                        Confidence::High,
+                        LicenseFindingShape {
+                            salt: salt.as_deref(),
+                            severity: Severity::Medium,
+                            confidence: Confidence::High,
+                        },
                         "License metadata does not contain an SPDX expression",
                         declared_evidence(component, license, false),
                     ));
@@ -371,21 +402,40 @@ fn declared_evidence(
     }
 }
 
+struct LicenseFindingShape<'a> {
+    salt: Option<&'a str>,
+    severity: Severity,
+    confidence: Confidence,
+}
+
 fn finding(
     rule: &RuleId,
     component: &crate::model::Component,
     license: Option<&License>,
-    severity: Severity,
-    confidence: Confidence,
+    shape: LicenseFindingShape<'_>,
     summary: &str,
     evidence: Evidence,
 ) -> Finding {
+    let LicenseFindingShape {
+        salt: license_salt,
+        severity,
+        confidence,
+    } = shape;
     let mut aliases = BTreeSet::new();
     if let Some(expression) = license.and_then(|v| v.expression.as_ref()) {
         aliases.insert(expression.clone());
     }
     Finding {
-        id: stable_finding_id(FindingKind::License, rule, Some(&component.identity), None),
+        id: match license_salt {
+            Some(salt) => salted_finding_id(
+                FindingKind::License,
+                rule,
+                Some(&component.identity),
+                None,
+                salt,
+            ),
+            None => stable_finding_id(FindingKind::License, rule, Some(&component.identity), None),
+        },
         kind: FindingKind::License,
         rule_id: rule.clone(),
         advisory_id: None,
@@ -919,5 +969,29 @@ mod tests {
             normalize_relative(&path),
             Err(LicenseError::PathTraversal(_))
         ));
+    }
+
+    #[test]
+    fn multiple_declared_licenses_get_distinct_finding_ids() {
+        let analysis = analyze_with_files(
+            &inventory(BTreeSet::from([
+                License {
+                    expression: Some("MIT OR Apache-2.0".into()),
+                    name: None,
+                    url: None,
+                },
+                License {
+                    expression: None,
+                    name: Some("Apache-2.0".into()),
+                    url: None,
+                },
+            ])),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(analysis.findings.len(), 2);
+        // Without a per-license discriminator both entries collapsed onto one id.
+        assert_ne!(analysis.findings[0].id, analysis.findings[1].id);
+        assert_ne!(analysis.findings[0].summary, analysis.findings[1].summary);
     }
 }

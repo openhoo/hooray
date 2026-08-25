@@ -216,7 +216,13 @@ struct MonitorTargetAddArgs {
     target_id: String,
     #[arg(long, value_name = "SOURCE")]
     source: String,
-    #[arg(long, value_name = "SECONDS")]
+    // Mirrors MonitorTarget::validate so out-of-range intervals are rejected
+    // at registration time instead of poisoning every later monitor cycle.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..=hooray::monitor::MAX_BACKOFF_SECONDS as u64)
+    )]
     interval_seconds: u64,
 }
 
@@ -673,7 +679,7 @@ impl MonitorRunner for CliMonitorRunner {
     }
 
     fn policy_digest(&self) -> Result<String, MonitorError> {
-        let bytes = std::fs::read(&self.config.policy_path)
+        let bytes = read_bounded(&self.config.policy_path, self.config.max_input_bytes)
             .map_err(|error| MonitorError::Runner(error.to_string()))?;
         if bytes.len() as u64 > self.config.max_input_bytes {
             return Err(MonitorError::Runner(
@@ -713,7 +719,9 @@ impl MonitorRunner for CliMonitorRunner {
             for path in paths {
                 let relative = path.strip_prefix(root).unwrap_or(&path);
                 digest.update(relative.as_os_str().as_encoded_bytes());
-                let bytes = std::fs::read(&path)
+                // Bound enforced during the read (mirrors StdinFile::take) so
+                // an oversized file never allocates fully before rejection.
+                let bytes = read_bounded(&path, self.config.max_input_bytes)
                     .map_err(|error| MonitorError::Runner(error.to_string()))?;
                 total = total.saturating_add(bytes.len() as u64);
                 if total > self.config.max_input_bytes {
@@ -777,6 +785,22 @@ struct WebhookNotifier {
 
 impl WebhookNotifier {
     fn new(config: &Config, url: &str, secret: Vec<u8>) -> Result<Self> {
+        // integrations.rs enforces these rules only inside signed_webhook at
+        // delivery time; enforcing them here keeps undeliverable
+        // configurations from starting and silently dead-lettering every
+        // alert. The integration constants and validate_https_url helper are
+        // private, so the rules (secret 16..=4096 bytes; https URL of at most
+        // 2048 bytes with a host, no credentials, no fragment) are mirrored
+        // here.
+        if !(16..=4_096).contains(&secret.len()) {
+            bail!(
+                "--webhook-secret must be between 16 and 4096 bytes (got {})",
+                secret.len()
+            );
+        }
+        if url.len() > 2_048 {
+            bail!("--webhook-url must not exceed 2048 bytes");
+        }
         let parsed = reqwest::Url::parse(url)
             .map_err(|error| anyhow!("invalid --webhook-url '{url}': {error}"))?;
         if parsed.scheme() != "https" {
@@ -784,6 +808,16 @@ impl WebhookNotifier {
                 "--webhook-url must use the https scheme (got '{}')",
                 parsed.scheme()
             );
+        }
+        if parsed.host_str().is_none() {
+            bail!("--webhook-url requires a host");
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            // Deliberately not echoed: the URL embeds credentials.
+            bail!("--webhook-url must not contain credentials");
+        }
+        if parsed.fragment().is_some() {
+            bail!("--webhook-url must not contain a fragment");
         }
         let generator = IntegrationGenerator::new(IntegrationLimits::default())
             .context("invalid webhook integration limits")?;
@@ -841,6 +875,16 @@ impl Notifier for WebhookNotifier {
 fn stable_digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Reads at most `cap + 1` bytes so callers can enforce an input bound
+/// without ever allocating the whole file. The extra byte lets the caller
+/// distinguish "at cap" from "over cap".
+fn read_bounded(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?.take(cap.saturating_add(1));
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn run_integrations(args: IntegrationsArgs) -> Result<CommandOutcome> {
@@ -1528,6 +1572,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_inputs_enforce_input_bound_during_read() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("policy.yaml"), vec![b'p'; 2048]).unwrap();
+        let source = temp.path().join("project");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("blob.bin"), vec![b'a'; 4096]).unwrap();
+        let runner = CliMonitorRunner {
+            config: Config {
+                max_input_bytes: 1024,
+                ..config(&temp)
+            },
+        };
+        let policy_error = runner.policy_digest().unwrap_err().to_string();
+        assert!(
+            policy_error.contains("policy exceeds configured input bound"),
+            "{policy_error}"
+        );
+        let target = hooray::monitor::MonitorTarget {
+            id: "bound-test".into(),
+            source: source.display().to_string(),
+            interval_seconds: 60,
+            next_due_at: 0,
+            source_fingerprint: None,
+            inventory: None,
+            advisory_digest: None,
+            policy_digest: None,
+            finding_ids: BTreeSet::new(),
+            updated_at: 0,
+        };
+        let fingerprint_error = runner
+            .source_fingerprint(&target)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            fingerprint_error.contains("source fingerprint exceeds configured input bound"),
+            "{fingerprint_error}"
+        );
+    }
+
+    #[test]
+    fn read_bounded_never_reads_past_the_cap() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("blob.bin");
+        std::fs::write(&path, vec![b'a'; 4096]).unwrap();
+        let capped = read_bounded(&path, 1024).unwrap();
+        assert_eq!(capped.len(), 1025, "read must stop at cap + 1 bytes");
+        let exact = read_bounded(&path, 4096).unwrap();
+        assert_eq!(exact.len(), 4096);
+        assert!(read_bounded(&temp.path().join("missing"), 16).is_err());
+    }
+
+    #[tokio::test]
     async fn monitor_advisory_refresh_uses_conservative_periodic_state_tokens() {
         let temp = TempDir::new().unwrap();
         let runner = CliMonitorRunner {
@@ -1637,6 +1734,39 @@ mod tests {
     }
 
     #[test]
+    fn clap_rejects_monitor_intervals_outside_validated_range() {
+        for seconds in ["0", "86401", "100000000000"] {
+            let parsed = Cli::try_parse_from([
+                "hooray",
+                "monitor",
+                "targets",
+                "add",
+                "x",
+                "--source",
+                "repo",
+                "--interval-seconds",
+                seconds,
+            ]);
+            assert!(
+                parsed.is_err(),
+                "--interval-seconds {seconds} must be rejected"
+            );
+        }
+        Cli::try_parse_from([
+            "hooray",
+            "monitor",
+            "targets",
+            "add",
+            "x",
+            "--source",
+            "repo",
+            "--interval-seconds",
+            "86400",
+        ])
+        .unwrap();
+    }
+
+    #[test]
     fn clap_monitor_webhook_flags_parse_together() {
         let parsed = Cli::try_parse_from([
             "hooray",
@@ -1733,6 +1863,60 @@ mod tests {
             error.contains("HOORAY_DEFINITELY_UNSET_SECRET_VAR_XYZ"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn webhook_notifier_rejects_undeliverable_secrets_eagerly() {
+        let temp = TempDir::new().unwrap();
+        let short = WebhookNotifier::new(
+            &config(&temp),
+            "https://hooks.example/hooray",
+            b"short".to_vec(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(short.contains("16"), "{short}");
+        assert!(!short.contains("short"), "{short}");
+        let oversized = WebhookNotifier::new(
+            &config(&temp),
+            "https://hooks.example/hooray",
+            vec![b'x'; 4097],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(oversized.contains("4096"), "{oversized}");
+    }
+
+    #[test]
+    fn webhook_notifier_rejects_urls_signed_webhook_would_refuse() {
+        let temp = TempDir::new().unwrap();
+        let secret = b"0123456789abcdef".to_vec();
+        let cases: Vec<(String, &str, &str)> = vec![
+            (
+                "https://user:pass@hooks.example/hooray".into(),
+                "credentials",
+                "user:pass",
+            ),
+            (
+                "https://hooks.example/hooray#section".into(),
+                "fragment",
+                "#section",
+            ),
+            (
+                format!("https://hooks.example/{}", "a".repeat(2100)),
+                "2048",
+                "",
+            ),
+        ];
+        for (url, needle, forbidden) in cases {
+            let error = WebhookNotifier::new(&config(&temp), &url, secret.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{url}: {error}");
+            if !forbidden.is_empty() {
+                assert!(!error.contains(forbidden), "{error}");
+            }
+        }
     }
 
     #[test]

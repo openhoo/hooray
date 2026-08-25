@@ -607,6 +607,27 @@ pub fn stable_finding_id(
     ))
 }
 
+/// Like [`stable_finding_id`] with an extra discriminator for finding kinds that can
+/// legitimately repeat for one component (for example multiple licenses on a component).
+pub fn salted_finding_id(
+    kind: FindingKind,
+    rule_id: &RuleId,
+    component_id: Option<&ComponentId>,
+    location_id: Option<&LocationId>,
+    salt: &str,
+) -> FindingId {
+    FindingId(stable_prefixed_id(
+        "finding",
+        [
+            kind.as_str(),
+            rule_id.as_str(),
+            component_id.map(ComponentId::as_str).unwrap_or(""),
+            location_id.map(LocationId::as_str).unwrap_or(""),
+            salt,
+        ],
+    ))
+}
+
 fn stable_prefixed_id<'a>(prefix: &str, parts: impl IntoIterator<Item = &'a str>) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for part in parts {
@@ -1001,6 +1022,55 @@ mod tests {
             inventory.validate(),
             Err(ModelInvariantError::UnknownComponent(_))
         ));
+    }
+
+    #[test]
+    fn producer_components_derive_identity_from_purl() {
+        // Inventory::validate deliberately does not re-derive identities from purls:
+        // hand-written inventories legitimately carry readable identities that are
+        // load-bearing in rendered reports and stored query filters. Identity
+        // derivation is a producer contract instead: input.rs (scanner components)
+        // and sbom.rs (SBOM ingestion) both build identity = stable_component_id(purl).
+        // Pin that contract here so producer drift fails a test instead of silently
+        // fragmenting identities across runs.
+        for purl in ["pkg:cargo/serde@1.0.0", "pkg:npm/left-pad@1.3.0"] {
+            let identity = stable_component_id(purl).unwrap();
+            assert_eq!(stable_component_id(purl).unwrap(), identity);
+            let component = Component {
+                identity: identity.clone(),
+                name: "package".into(),
+                version: "1.0.0".into(),
+                purl: purl.into(),
+                scope: Scope::Runtime,
+                provenance: BTreeSet::new(),
+                licenses: BTreeSet::new(),
+                locations: BTreeSet::new(),
+            };
+            let inventory = Inventory {
+                asset: asset(),
+                components: BTreeMap::from([(identity, component)]),
+                locations: BTreeSet::new(),
+                dependencies: BTreeSet::new(),
+            };
+            assert_eq!(inventory.validate(), Ok(()));
+        }
+        // Derivation requires a usable purl; producers map that error to their own
+        // invalid-identifier errors instead of emitting identity-less components.
+        assert!(stable_component_id("").is_err());
+        assert!(stable_component_id("  ").is_err());
+
+        // Readable identities stay valid: validate does not police the
+        // identity/purl relationship (see contract comment above).
+        let mut hand_written = component();
+        hand_written.identity = ComponentId::new("component:dep").unwrap();
+        let id = hand_written.identity.clone();
+        let inventory = Inventory {
+            asset: asset(),
+            components: BTreeMap::from([(id, hand_written)]),
+            locations: BTreeSet::new(),
+            dependencies: BTreeSet::new(),
+        };
+        assert_eq!(inventory.validate(), Ok(()));
     }
 
     #[test]

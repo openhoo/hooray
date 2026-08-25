@@ -47,8 +47,11 @@ jobs:
           restore-keys: |
             rust-${{ runner.os }}-
 
-      - name: Install cargo-deny when uncached
-        run: command -v cargo-deny >/dev/null || cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+      - name: Install cargo-deny when uncached or stale
+        run: |
+          if ! command -v cargo-deny >/dev/null || [ "$(cargo-deny --version)" != "cargo-deny $CARGO_DENY_VERSION" ]; then
+            cargo install cargo-deny --locked --force --version "$CARGO_DENY_VERSION"
+          fi
 
       - name: Install cargo-llvm-cov 0.8.7 when needed
         run: |
