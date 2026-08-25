@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 (2026-08-25)
+
+### Bug Fixes
+
+- harden scanner after full-project agent review (a169b1f)
+
 ## 0.5.0 (2026-08-25)
 
 ### Features
