@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0 (2026-08-25)
+
+### Features
+
+- close JFrog Xray capability gaps (39c65ff)
+
 ## 0.4.0 (2026-07-22)
 
 ### Features
