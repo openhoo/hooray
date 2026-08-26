@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0 (2026-08-26)
+
+### Other Changes
+
+- replace rot-prone test counts with stable coverage wording (e4277c6)
+- cut duplication and complexity hotspots (b70ddcf)
+
+### Features
+
+- restructure parsers, add parity harness, land review hardening (f7a0b09)
+
+### Bug Fixes
+
+- bound save-only bench by accumulated window (ece60ae)
+
 ## Unreleased
 
 ### Major Features
