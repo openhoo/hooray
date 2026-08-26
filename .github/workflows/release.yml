@@ -122,7 +122,7 @@ jobs:
       - name: Run Hooversion
         id: release
         if: steps.current.outputs.current == 'true' || steps.manual_current.outputs.current == 'true'
-        uses: openhoo/hooversion/actions/release@f5ee7eef255519b4ef33f4a93c7223805113c3a2 # v0.1.1
+        uses: openhoo/hooversion/actions/release@799ecf4a9c29e8ce4d5ad7055a6030adf665cf82 # v0.2.0
         with:
           version: ${{ env.HOOVERSION_VERSION }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
