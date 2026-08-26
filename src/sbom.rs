@@ -9,7 +9,7 @@ use crate::model::{
     Location, ModelInvariantError, Scope, Source, SourceKind, stable_component_id,
     stable_location_id,
 };
-use crate::util::sha256_hex;
+use crate::util::{parse_purl_body, sha256_hex};
 
 const MAX_SBOM_BYTES: usize = 100 * 1024 * 1024;
 const MAX_COMPONENTS: usize = 1_000_000;
@@ -354,13 +354,10 @@ fn required_value<'a>(
         })
 }
 
+/// Version embedded in a purl, parsed by the shared strict grammar so that
+/// scoped names (`pkg:npm/@babel/core`) are never mistaken for `name@version`.
 fn purl_version(purl: &str) -> Option<&str> {
-    let package = purl.strip_prefix("pkg:")?;
-    let package = package.split(['?', '#']).next().unwrap_or(package);
-    package
-        .rsplit_once('@')
-        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
-        .map(|(_, version)| version)
+    parse_purl_body(purl)?.version()
 }
 
 fn is_versioned_purl(purl: &str) -> bool {
@@ -611,26 +608,50 @@ fn collect_spdx_relationships(
     output: &mut BTreeSet<DependencyEdge>,
 ) -> Result<(), SbomError> {
     for relationship in relationships {
-        if relationship.relationship_type.trim() != "DEPENDS_ON" {
-            continue;
-        }
-        let Some(from) = refs.get(&relationship.spdx_element_id) else {
+        // Only dependency-carrying relationship types become edges. CONTAINS
+        // is deliberately left unmapped: containment is packaging structure,
+        // not a dependency, and edges derived from it would distort graph
+        // classify/reachability results.
+        let (source, target, scope) = match relationship.relationship_type.trim() {
+            "DEPENDS_ON" => (
+                relationship.spdx_element_id.as_str(),
+                relationship.related_spdx_element.as_str(),
+                Scope::Unknown,
+            ),
+            // "A DEPENDENCY_OF B" states that B depends on A; invert the pair
+            // so edges keep pointing from the dependent side to its dependency.
+            "DEPENDENCY_OF" => (
+                relationship.related_spdx_element.as_str(),
+                relationship.spdx_element_id.as_str(),
+                Scope::Unknown,
+            ),
+            // "A BUILD_DEPENDENCY_OF B" states that A is a build dependency
+            // of B, i.e. B builds against A; keep the forward pair and tag
+            // the edge with build scope.
+            "BUILD_DEPENDENCY_OF" => (
+                relationship.spdx_element_id.as_str(),
+                relationship.related_spdx_element.as_str(),
+                Scope::Build,
+            ),
+            _ => continue,
+        };
+        let Some(from) = refs.get(source) else {
             return Err(SbomError::UnknownDependency {
-                from: relationship.spdx_element_id.clone(),
-                to: relationship.spdx_element_id.clone(),
+                from: source.to_owned(),
+                to: target.to_owned(),
             });
         };
-        let Some(to) = refs.get(&relationship.related_spdx_element) else {
+        let Some(to) = refs.get(target) else {
             return Err(SbomError::UnknownDependency {
-                from: relationship.spdx_element_id.clone(),
-                to: relationship.related_spdx_element.clone(),
+                from: source.to_owned(),
+                to: target.to_owned(),
             });
         };
         if from != to {
             output.insert(DependencyEdge {
                 from: from.clone(),
                 to: to.clone(),
-                scope: Scope::Unknown,
+                scope,
                 optional: false,
             });
         }
@@ -1115,13 +1136,54 @@ mod tests {
     #[test]
     fn routes_spdx_by_key_shape_and_keeps_cyclonedx_flow_unchanged() {
         let spdx = br#"{"spdxVersion":"SPDX-2.2","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"}]}"#;
-        assert!(parse_cyclonedx(spdx).is_ok());
+        let spdx_inventory = parse_cyclonedx(spdx).unwrap();
+        assert_eq!(spdx_inventory.components.len(), 1);
+        let spdx_component = spdx_inventory.components.values().next().unwrap();
+        assert_eq!(spdx_component.name, "a");
         let cyclonedx = br#"{"bomFormat":"CycloneDX","components":[{"name":"a","version":"1","purl":"pkg:cargo/a@1","licenses":[{"expression":"mentions \"spdxVersion\" handling"}]}]}"#;
         let inventory = parse_cyclonedx(cyclonedx).unwrap();
         assert_eq!(inventory.components.len(), 1);
         assert!(matches!(
             parse_cyclonedx(br#"{}"#),
             Err(SbomError::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn classifies_scoped_purls_strictly_instead_of_misparsing_namespaces() {
+        // A naive rsplit_once('@') reads pkg:npm/@scope/pkg as name "npm/"
+        // with version "scope/pkg", bypassing the versioned-purl gates and
+        // fabricating SPDX versionInfo. The strict grammar must classify
+        // these unversioned.
+        assert!(!is_versioned_purl("pkg:npm/@scope/pkg"));
+        assert_eq!(purl_version("pkg:npm/@scope/pkg"), None);
+        assert_eq!(purl_version("pkg:npm/@scope/pkg@1.0.0"), Some("1.0.0"));
+        assert_eq!(purl_version("pkg:npm/@babel/core@7.0.0"), Some("7.0.0"));
+        assert_eq!(
+            purl_version("pkg:golang/github.com/foo/bar@v1.2.3"),
+            Some("v1.2.3")
+        );
+    }
+
+    #[test]
+    fn unversioned_scoped_purls_fail_closed_at_both_gates() {
+        // CycloneDX gate: only fully versioned purls may enter.
+        assert!(matches!(
+            parse_cyclonedx(
+                br#"{"bomFormat":"CycloneDX","components":[{"name":"s","version":"1","purl":"pkg:npm/@scope/pkg"}]}"#
+            ),
+            Err(SbomError::InvalidComponent { field: "purl", .. })
+        ));
+        // SPDX recovery: a scoped unversioned purl must not be misread as a
+        // version substitute for a missing versionInfo.
+        assert!(matches!(
+            parse_cyclonedx(
+                br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-s","name":"s","externalRefs":[{"referenceType":"purl","referenceLocator":"pkg:npm/@scope/pkg"}]}]}"#
+            ),
+            Err(SbomError::InvalidComponent {
+                field: "versionInfo",
+                ..
+            })
         ));
     }
 
@@ -1186,6 +1248,55 @@ mod tests {
         let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"}],"relationships":[{"spdxElementId":"SPDXRef-a","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-a"},{"spdxElementId":"SPDXRef-a","relationshipType":"CONTAINS","relatedSpdxElement":"SPDXRef-a"}]}"#;
         let inventory = parse_cyclonedx(input).unwrap();
         assert!(inventory.dependencies.is_empty());
+    }
+
+    #[test]
+    fn inverts_spdx_dependency_of_edge_direction() {
+        let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-lib","name":"lib","versionInfo":"1"},{"SPDXID":"SPDXRef-app","name":"app","versionInfo":"2"}],"relationships":[{"spdxElementId":"SPDXRef-lib","relationshipType":"DEPENDENCY_OF","relatedSpdxElement":"SPDXRef-app"}]}"#;
+        let inventory = parse_cyclonedx(input).unwrap();
+        let lib = stable_component_id("lib@1").unwrap();
+        let app = stable_component_id("app@2").unwrap();
+        assert_eq!(inventory.dependencies.len(), 1);
+        let edge = inventory.dependencies.iter().next().unwrap();
+        assert_eq!(edge.from, app, "the dependent package must own the edge");
+        assert_eq!(edge.to, lib);
+        assert_eq!(edge.scope, Scope::Unknown);
+    }
+
+    #[test]
+    fn maps_spdx_build_dependency_of_forward_with_build_scope() {
+        let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-tool","name":"tool","versionInfo":"1"},{"SPDXID":"SPDXRef-lib","name":"lib","versionInfo":"2"}],"relationships":[{"spdxElementId":"SPDXRef-tool","relationshipType":"BUILD_DEPENDENCY_OF","relatedSpdxElement":"SPDXRef-lib"}]}"#;
+        let inventory = parse_cyclonedx(input).unwrap();
+        let tool = stable_component_id("tool@1").unwrap();
+        let lib = stable_component_id("lib@2").unwrap();
+        assert_eq!(inventory.dependencies.len(), 1);
+        let edge = inventory.dependencies.iter().next().unwrap();
+        // "tool BUILD_DEPENDENCY_OF lib" means tool builds against lib.
+        assert_eq!(edge.from, tool);
+        assert_eq!(edge.to, lib);
+        assert_eq!(edge.scope, Scope::Build);
+    }
+
+    #[test]
+    fn leaves_spdx_contains_relationships_unmapped() {
+        let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"},{"SPDXID":"SPDXRef-b","name":"b","versionInfo":"2"}],"relationships":[{"spdxElementId":"SPDXRef-a","relationshipType":"CONTAINS","relatedSpdxElement":"SPDXRef-b"}]}"#;
+        let inventory = parse_cyclonedx(input).unwrap();
+        assert!(inventory.dependencies.is_empty());
+    }
+
+    #[test]
+    fn names_related_element_when_spdx_dependency_source_is_unknown() {
+        let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-b","name":"b","versionInfo":"1"}],"relationships":[{"spdxElementId":"SPDXRef-missing","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-b"}]}"#;
+        let error = parse_cyclonedx(input).expect_err("unknown element must fail closed");
+        let message = error.to_string();
+        assert!(matches!(
+            error,
+            SbomError::UnknownDependency { from, to } if from == "SPDXRef-missing" && to == "SPDXRef-b"
+        ));
+        assert!(
+            message.contains("SPDXRef-b"),
+            "error must name the related element, got: {message}"
+        );
     }
 
     #[test]

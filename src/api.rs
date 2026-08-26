@@ -1,7 +1,7 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     future::Future,
-    net::SocketAddr,
     str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -24,21 +24,21 @@ use axum::{
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use thiserror::Error;
 use tokio::{net::TcpListener, sync::Semaphore};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::{
     config::Config,
-    engine::{REPORT_SCHEMA_VERSION, contextualize_and_score},
+    engine::{FinalizeError, ScanParts, contextualize_and_score, finalize_scan},
     graph::DependencyGraph,
-    model::{
-        Finding, FindingKind, Inventory, PolicySummary, RunId, RunMetadata, ScanReport, Severity,
-    },
+    model::{Finding, FindingKind, Inventory, RunId, ScanReport, Severity},
+    monitor::FindingDiff,
     osv::{OsvClient, OsvError},
     policy::{Policy, PolicyException},
     report::{sanitize_report, sanitize_value},
-    store::{FindingFilter, InventoryFilter, MAX_PAGE_SIZE, ReportDiff, Store, StoreError},
+    store::{FindingFilter, InventoryFilter, MAX_PAGE_SIZE, Store, StoreError},
 };
 
 const API_VERSION: &str = "v1";
@@ -51,19 +51,32 @@ const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 /// timeout middleware exempts exactly this route via `is_write_completing`.
 const SCAN_SUBMIT_PATH: &str = "/v1/scans";
 
+#[derive(Debug, Error)]
+pub enum ApiStateError {
+    #[error("invalid configuration: {0}")]
+    Config(#[from] crate::config::ConfigError),
+    #[error("invalid vulnerability service endpoint: {0}")]
+    Osv(#[from] OsvError),
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<Mutex<Store>>,
     config: Arc<Config>,
+    osv: Arc<OsvClient>,
     scan_slots: Arc<Semaphore>,
 }
 
 impl ApiState {
-    pub fn new(store: Store, config: Config) -> Result<Self, crate::config::ConfigError> {
+    pub fn new(store: Store, config: Config) -> Result<Self, ApiStateError> {
         config.validate()?;
+        // One shared OSV client per API process: endpoint validation happens
+        // once at state construction instead of on every scan request.
+        let osv = Arc::new(OsvClient::new(&config.osv_url, config.max_concurrency)?);
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             scan_slots: Arc::new(Semaphore::new(config.max_concurrency)),
+            osv,
             config: Arc::new(config),
         })
     }
@@ -98,30 +111,39 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-pub async fn serve<F>(bind: SocketAddr, state: ApiState, shutdown: F) -> Result<(), std::io::Error>
+/// Serves the router on an already-bound listener; readiness is therefore
+/// bind-and-listen completion in the caller, and graceful shutdown drains
+/// in-flight requests before returning.
+pub async fn serve<F>(
+    listener: TcpListener,
+    state: ApiState,
+    shutdown: F,
+) -> Result<(), std::io::Error>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let listener = TcpListener::bind(bind).await?;
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
         .await
 }
 
-pub async fn shutdown_signal() {
+pub fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, std::io::Error> {
     #[cfg(unix)]
     {
         let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler registration must succeed");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = terminate.recv() => {},
-        }
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        Ok(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        Ok(async move {
+            let _ = tokio::signal::ctrl_c().await;
+        })
     }
 }
 
@@ -188,10 +210,8 @@ async fn scan_with_deadline(
         )
     })?;
     let started_at = timestamp();
-    let client = OsvClient::new(&state.config.osv_url, state.config.max_concurrency)
-        .map_err(|error| ApiError::internal("scanner_initialization_failed", error.to_string()))?;
     let mut findings =
-        match tokio::time::timeout(fetch_bound, client.scan(&request.inventory)).await {
+        match tokio::time::timeout(fetch_bound, state.osv.scan(&request.inventory)).await {
             Ok(result) => result.map_err(|error| vulnerability_service_error(&error))?,
             Err(_) => {
                 return Err(ApiError::new(
@@ -208,33 +228,28 @@ async fn scan_with_deadline(
         .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
     contextualize_and_score(&request.inventory, &graph, &mut findings, Utc::now())
         .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
-    let (policy_decisions, policy_summary) = match request.policy {
-        Some(policy) => {
-            let evaluation = policy
-                .evaluate(&findings, &request.inventory, Utc::now().fixed_offset())
-                .map_err(|error| ApiError::unprocessable("invalid_policy", error.to_string()))?;
-            (evaluation.decisions, evaluation.summary)
-        }
-        None => (Default::default(), PolicySummary::default()),
-    };
-    let report = ScanReport {
-        schema_version: REPORT_SCHEMA_VERSION.to_owned(),
-        run: RunMetadata {
-            id: RunId::new(format!("run:{}", Uuid::new_v4()))
+    let report = finalize_scan(
+        request.policy.as_ref(),
+        ScanParts {
+            inventory: request.inventory,
+            findings,
+            run_id: RunId::new(format!("run:{}", Uuid::new_v4()))
                 .expect("generated UUID run identifier is non-empty"),
             started_at,
-            completed_at: Some(timestamp()),
+            completed_at: timestamp(),
             scanner_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             metadata: request.metadata,
         },
-        inventory: request.inventory,
-        findings,
-        policy_decisions,
-        policy_summary,
-    };
-    report
-        .validate()
-        .map_err(|error| ApiError::internal("invalid_generated_report", error.to_string()))?;
+        Utc::now(),
+    )
+    .map_err(|error| match error {
+        FinalizeError::Policy(error) => {
+            ApiError::unprocessable("invalid_policy", error.to_string())
+        }
+        FinalizeError::Invariant(error) => {
+            ApiError::internal("invalid_generated_report", error.to_string())
+        }
+    })?;
     let run_id = report.run.id.clone();
     store_call(&state, move |store| {
         let _permit = permit;
@@ -270,6 +285,7 @@ fn vulnerability_service_error(error: &OsvError) -> ApiError {
             "the vulnerability service response exceeds the supported size"
         }
         OsvError::InvalidBaseUrl(_) => "the vulnerability service location is invalid",
+        OsvError::Client(_) => "the vulnerability service client could not be initialized",
     };
     ApiError::new(
         StatusCode::BAD_GATEWAY,
@@ -368,7 +384,7 @@ struct DiffResponse {
 }
 
 impl DiffResponse {
-    fn new(baseline_run_id: RunId, run_id: RunId, diff: ReportDiff) -> Self {
+    fn new(baseline_run_id: RunId, run_id: RunId, diff: FindingDiff) -> Self {
         Self {
             version: API_VERSION,
             baseline_run_id,
@@ -617,10 +633,15 @@ async fn load_report(state: &ApiState, raw_id: String) -> Result<ScanReport, Api
         .ok_or_else(|| {
             ApiError::not_found("run_not_found", format!("run '{run_id}' was not found"))
         })?;
-    sanitize_api_report(&report)
+    match sanitize_api_report(&report)? {
+        // Clean reports stay zero-copy: the freshly loaded owned value is
+        // returned as-is instead of cloning the borrowed view.
+        Cow::Borrowed(_) => Ok(report),
+        Cow::Owned(sanitized) => Ok(sanitized),
+    }
 }
 
-fn sanitize_api_report(report: &ScanReport) -> Result<ScanReport, ApiError> {
+fn sanitize_api_report(report: &ScanReport) -> Result<Cow<'_, ScanReport>, ApiError> {
     sanitize_report(report)
         .map_err(|error| ApiError::internal("report_sanitization_failed", error.to_string()))
 }
@@ -662,22 +683,15 @@ fn parse_finding_kind(value: &str) -> Result<FindingKind, ApiError> {
 }
 
 fn negotiate_report(headers: &HeaderMap, report: &ScanReport) -> Result<Response, ApiError> {
-    let accepts = headers
-        .get(ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/json");
-    if accepts.split(',').any(|value| {
-        let media = value.trim().split(';').next().unwrap_or_default().trim();
-        media == "application/json" || media == "*/*"
-    }) {
+    if accepts_media(headers, &["application/json"]) {
         let bytes = serde_json::to_vec(report)
             .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))?;
         return Ok(([(CONTENT_TYPE, "application/json")], bytes).into_response());
     }
-    if accepts.split(',').any(|value| {
-        let media = value.trim().split(';').next().unwrap_or_default().trim();
-        media == "application/yaml" || media == "application/x-yaml" || media == "text/yaml"
-    }) {
+    if accepts_media(
+        headers,
+        &["application/yaml", "application/x-yaml", "text/yaml"],
+    ) {
         let bytes = serde_yaml::to_string(report)
             .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))?;
         return Ok(([(CONTENT_TYPE, "application/yaml")], bytes).into_response());
@@ -687,6 +701,20 @@ fn negotiate_report(headers: &HeaderMap, report: &ScanReport) -> Result<Response
         "unsupported_report_format",
         "supported report formats are application/json and application/yaml",
     ))
+}
+
+/// Returns whether the Accept header lists any of `media_types` (or the
+/// wildcard `*/*`), ignoring parameters such as `;q=`. A missing or
+/// non-UTF-8 header defaults to `application/json` compatibility.
+fn accepts_media(headers: &HeaderMap, media_types: &[&str]) -> bool {
+    let accepts = headers
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json");
+    accepts.split(',').any(|value| {
+        let media = value.trim().split(';').next().unwrap_or_default().trim();
+        media == "*/*" || media_types.contains(&media)
+    })
 }
 
 async fn store_call<T, F>(state: &ApiState, operation: F) -> Result<T, ApiError>
@@ -930,7 +958,11 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use sha2::{Digest, Sha256};
-    use tokio::sync::oneshot;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        sync::oneshot,
+    };
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -1461,16 +1493,31 @@ mod tests {
     async fn serve_honors_graceful_shutdown_and_auth_protects_health_routes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        drop(listener);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(serve(
-            address,
-            ApiState::new(Store::open_memory().unwrap(), Config::default()).unwrap(),
+            listener,
+            ApiState::new(Store::open_memory().unwrap(), token_config("top-secret")).unwrap(),
             async move {
                 let _ = shutdown_rx.await;
             },
         ));
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // The caller-bound listener is already listening, so the connection
+        // queues in the accept backlog and readiness needs no sleeping.
+        let mut connection = TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "GET /health HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer top-secret\r\nConnection: close\r\n\r\n"
+        );
+        connection.write_all(request.as_bytes()).await.unwrap();
+        let mut served = String::new();
+        connection.read_to_string(&mut served).await.unwrap();
+        assert!(
+            served.starts_with("HTTP/1.1 200"),
+            "the authorized health request must be served before draining: {served}"
+        );
+        assert!(served.contains("\"status\":\"ok\""));
+        // The served response finished, so graceful shutdown drains and the
+        // server task returns Ok instead of being aborted mid-request.
+        drop(connection);
         shutdown_tx.send(()).unwrap();
         assert!(task.await.unwrap().is_ok());
 
@@ -1684,6 +1731,35 @@ mod tests {
         assert!(!body.contains("run-secret"));
         assert!(!body.contains("asset-secret"));
         assert!(body.contains("'[REDACTED]'"));
+    }
+
+    #[test]
+    fn sanitize_api_report_borrows_clean_reports() {
+        let clean = report("run:clean");
+        assert!(matches!(
+            sanitize_api_report(&clean).unwrap(),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn sanitize_api_report_redacts_sensitive_carriers_into_owned_cow() {
+        let mut sensitive = report("run:sensitive");
+        sensitive.run.metadata = BTreeMap::from([
+            ("api_token".to_owned(), json!("run-secret")),
+            ("branch".to_owned(), json!("main")),
+        ]);
+        sensitive.inventory.asset.metadata = BTreeMap::from([(
+            "deployment".to_owned(),
+            json!({"clientSecret":"asset-secret","region":"eu"}),
+        )]);
+        let sanitized = sanitize_api_report(&sensitive).unwrap();
+        assert!(matches!(sanitized, Cow::Owned(_)));
+        let body = serde_json::to_string(&*sanitized).unwrap();
+        assert!(body.contains("[REDACTED]"));
+        assert!(!body.contains("run-secret"));
+        assert!(!body.contains("asset-secret"));
+        assert!(body.contains("main"));
     }
 
     async fn delayed_blocking_write(State(commits): State<Arc<AtomicUsize>>) -> StatusCode {
@@ -1922,7 +1998,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    // Virtual time: the paused clock auto-advances past the fetch bound as
+    // soon as the stalled upstream leaves the task idle, so no wall-clock
+    // elapsed assertion is needed.
+    #[tokio::test(start_paused = true)]
     async fn scan_fetch_is_bounded_so_stalled_vulnerability_service_cannot_pin_slots() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1949,16 +2028,11 @@ mod tests {
             policy: None,
             metadata: BTreeMap::new(),
         }));
-        let started = std::time::Instant::now();
         let error = scan_with_deadline(state, payload, Duration::from_millis(100))
             .await
             .expect_err("stalled vulnerability service must exceed the fetch bound");
         assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(error.code, "vulnerability_service_timeout");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the fetch bound must fire well before the delayed response"
-        );
         assert_eq!(
             slots.available_permits(),
             1,

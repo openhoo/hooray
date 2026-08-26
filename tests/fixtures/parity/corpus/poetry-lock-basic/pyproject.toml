@@ -1,0 +1,13 @@
+[tool.poetry]
+name = "demo-poetry-service"
+version = "1.0.0"
+description = "Demo Poetry project with legacy pinned dependencies"
+authors = ["Demo Corporation <dev@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+django = "3.0"
+markupsafe = "^2.0.1"
+
+[tool.poetry.dev-dependencies]
+pytest = "^6.2"

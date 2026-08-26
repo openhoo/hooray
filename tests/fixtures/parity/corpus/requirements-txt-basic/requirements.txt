@@ -1,0 +1,9 @@
+# Demo web service requirements, pinned to legacy releases.
+django==3.0
+requests==2.19.0
+urllib3==1.24.2
+chardet==3.0.4
+certifi==2019.11.28
+idna==2.8
+pytz==2019.3
+sqlparse==0.3.0

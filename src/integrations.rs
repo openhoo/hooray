@@ -10,8 +10,8 @@ use crate::{
     model::{
         Finding, FindingId, FindingKind, Location, LocationId, PolicyOutcome, ScanReport, Severity,
     },
+    monitor::FindingDiff,
     report::{ReportIndex, gitlab_code_quality_entry, gitlab_finding_location, sarif_level},
-    store::ReportDiff,
 };
 
 const SARIF_SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
@@ -21,7 +21,7 @@ const MIN_WEBHOOK_SECRET_BYTES: usize = 16;
 const MAX_WEBHOOK_SECRET_BYTES: usize = 4_096;
 const MAX_URL_BYTES: usize = 2_048;
 const MAX_EVENT_BYTES: usize = 128;
-const JIRA_MAX_LISTED_FINDINGS: usize = 10;
+const MAX_LISTED_FINDINGS: usize = 10;
 const JIRA_MAX_SUMMARY_CHARS: usize = 255;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +105,7 @@ pub enum IntegrationError {
     InvalidWebhookEvent,
     #[error("generated payload exceeds {maximum} bytes")]
     PayloadTooLarge { maximum: usize },
-    #[error("JSON serialization failed: {0}")]
+    #[error("JSON serialization failed")]
     Serialization(#[from] serde_json::Error),
 }
 
@@ -236,7 +236,7 @@ impl IntegrationGenerator {
                     bounded.details = Some(self.finding_message(finding));
                     bounded.evidence.clear();
                     bounded.remediation = None;
-                    let mut entry = gitlab_code_quality_entry(report, &index, &bounded, &location);
+                    let mut entry = gitlab_code_quality_entry(&index, &bounded, &location);
                     entry
                         .as_object_mut()
                         .expect("Code Quality entry is an object")
@@ -303,7 +303,7 @@ impl IntegrationGenerator {
         let top: Vec<Value> = selected
             .items
             .iter()
-            .take(10)
+            .take(MAX_LISTED_FINDINGS)
             .map(|finding| {
                 json!({
                     "type": "mrkdwn",
@@ -345,7 +345,7 @@ impl IntegrationGenerator {
 
     /// Builds a Jira REST create-issue payload summarizing a scan report.
     /// Pure function: deterministic ordering, deny findings before warnings,
-    /// capped at JIRA_MAX_LISTED_FINDINGS entries like the Slack summary.
+    /// capped at MAX_LISTED_FINDINGS entries like the Slack summary.
     pub fn jira_issue(&self, report: &ScanReport) -> Value {
         let selected = self.selected_findings(report);
         let mut outcomes_by_finding: BTreeMap<&FindingId, (bool, bool)> = BTreeMap::new();
@@ -379,8 +379,8 @@ impl IntegrationGenerator {
                 warned_lines.push(line);
             }
         }
-        denied_lines.truncate(JIRA_MAX_LISTED_FINDINGS);
-        let warn_budget = JIRA_MAX_LISTED_FINDINGS - denied_lines.len();
+        denied_lines.truncate(MAX_LISTED_FINDINGS);
+        let warn_budget = MAX_LISTED_FINDINGS - denied_lines.len();
         let warn_omitted = warned_lines.len().saturating_sub(warn_budget);
         warned_lines.truncate(warn_budget);
 
@@ -484,8 +484,12 @@ impl IntegrationGenerator {
             .items
             .iter()
             .filter(|finding| {
-                report_location(&locations, finding)
-                    .is_none_or(|location| uri.ends_with(&percent_encode_path(&location.path)))
+                report_location(&locations, finding).is_none_or(|location| {
+                    uri.ends_with(&crate::util::percent_encode(
+                        &location.path,
+                        crate::util::is_path_uri_byte,
+                    ))
+                })
             })
             .map(|finding| lsp_diagnostic(&locations, finding, self))
             .collect();
@@ -504,22 +508,21 @@ impl IntegrationGenerator {
         )
     }
 
-    pub fn pull_request_gate(&self, diff: &ReportDiff, current: &ScanReport) -> PullRequestGate {
+    pub fn pull_request_gate(&self, diff: &FindingDiff, current: &ScanReport) -> PullRequestGate {
         let introduced: BTreeSet<&FindingId> = diff.introduced.iter().collect();
         let mut denied: Vec<DeniedDecision> = current
             .policy_decisions
             .iter()
-            .filter(|decision| {
-                decision.outcome == PolicyOutcome::Deny
-                    && decision
-                        .finding_id
-                        .as_ref()
-                        .is_some_and(|finding_id| introduced.contains(finding_id))
-            })
-            .map(|decision| DeniedDecision {
-                policy_id: decision.policy_id.to_string(),
-                finding_id: decision.finding_id.as_ref().unwrap().to_string(),
-                reason: self.clean_text(&decision.reason),
+            .filter_map(|decision| {
+                let finding_id = decision.finding_id.as_ref()?;
+                if decision.outcome != PolicyOutcome::Deny || !introduced.contains(finding_id) {
+                    return None;
+                }
+                Some(DeniedDecision {
+                    policy_id: decision.policy_id.to_string(),
+                    finding_id: finding_id.to_string(),
+                    reason: self.clean_text(&decision.reason),
+                })
             })
             .collect();
         denied.sort();
@@ -657,7 +660,9 @@ fn sarif_location(location: &Location) -> Value {
     let end = location.end.or(start);
     json!({
         "physicalLocation": {
-            "artifactLocation": { "uri": percent_encode_path(&location.path) },
+            "artifactLocation": {
+                "uri": crate::util::percent_encode(&location.path, crate::util::is_path_uri_byte)
+            },
             "region": {
                 "startLine": start.map_or(1, |value| value.line.max(1)),
                 "startColumn": start.map_or(1, |value| value.column.max(1)),
@@ -675,7 +680,15 @@ fn vscode_diagnostic(
 ) -> Value {
     let location = report_location(locations, finding);
     json!({
-        "uri": location.map(|value| format!("file:///{}", percent_encode_path(value.path.trim_start_matches('/')))),
+        "uri": location.map(|value| {
+            format!(
+                "file:///{}",
+                crate::util::percent_encode(
+                    value.path.trim_start_matches('/'),
+                    crate::util::is_path_uri_byte
+                )
+            )
+        }),
         "range": lsp_range(location),
         "severity": lsp_severity(finding.severity),
         "code": finding.rule_id.as_str(),
@@ -958,11 +971,20 @@ fn truncate_utf8(value: &str, maximum: usize) -> String {
     format!("{}{NOTE}", &value[..end])
 }
 
+/// Escapes untrusted text for Slack mrkdwn. Unlike Jira wiki markup, mrkdwn
+/// has no backslash escaping, so metacharacters cannot be quoted; they are
+/// instead deterministically substituted with visually similar Unicode
+/// look-alikes so titles cannot inject bold, italic, code, or strikethrough
+/// formatting.
 fn escape_slack(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('*', "\u{FF0A}") // FULLWIDTH ASTERISK
+        .replace('_', "\u{FF3F}") // FULLWIDTH LOW LINE
+        .replace('`', "\u{02CB}") // MODIFIER LETTER GRAVE
+        .replace('~', "\u{223C}") // TILDE OPERATOR
 }
 
 /// Flattens whitespace and backslash-escapes Jira wiki markup metacharacters
@@ -977,19 +999,6 @@ fn escape_jira_wiki(value: &str) -> String {
         escaped.push(character);
     }
     escaped
-}
-
-fn percent_encode_path(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
-            output.push(char::from(byte));
-        } else {
-            output.push('%');
-            output.push_str(&format!("{byte:02X}"));
-        }
-    }
-    output
 }
 
 fn severity_rank(severity: Severity) -> u8 {
@@ -1498,6 +1507,31 @@ mod tests {
     }
 
     #[test]
+    fn slack_summary_neutralizes_mrkdwn_metacharacters() {
+        let mut finding = finding("finding:hostile", FindingKind::Sast, Severity::High, false);
+        finding.summary = Some("a*b_c`d~e&f<g>h".into());
+        finding.details = None;
+        let report = report(vec![finding]);
+        let slack = json_artifact(generator(10).slack_summary(&report, None).unwrap());
+        // The substituted grave accent never appears in Hooray's own template
+        // strings, so it uniquely locates the escaped finding row.
+        let text = slack["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["fields"].as_array())
+            .flatten()
+            .find_map(|field| {
+                let candidate = field["text"].as_str()?;
+                candidate.contains('\u{02CB}').then(|| candidate.to_owned())
+            })
+            .expect("escaped finding row");
+        // Title and message both fall back to the same hostile summary.
+        let escaped = "a\u{FF0A}b\u{FF3F}c\u{02CB}d\u{223C}e&amp;f&lt;g&gt;h";
+        assert_eq!(text, format!("*{escaped}* — {escaped}"));
+    }
+
+    #[test]
     fn generated_ci_and_pre_commit_artifacts_use_runnable_cli_and_supported_reports() {
         let generator = generator(10);
         let pre_commit = generator.pre_commit_config().unwrap();
@@ -1591,7 +1625,7 @@ mod tests {
                 exception_id: None,
             },
         ]);
-        let diff = ReportDiff {
+        let diff = FindingDiff {
             introduced: vec![FindingId::new("finding:new").unwrap()],
             resolved: vec![],
             unchanged: vec![FindingId::new("finding:old").unwrap()],
@@ -1601,7 +1635,7 @@ mod tests {
         assert_eq!(gate.introduced_findings, 1);
         assert_eq!(gate.new_denied_decisions.len(), 1);
         assert_eq!(gate.new_denied_decisions[0].policy_id, "policy:new");
-        let clean = ReportDiff {
+        let clean = FindingDiff {
             introduced: vec![],
             resolved: vec![],
             unchanged: diff.unchanged,

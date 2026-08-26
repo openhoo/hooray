@@ -1,0 +1,24 @@
+PODS:
+  - AFNetworking (3.2.1)
+  - FLAnimatedImage (1.2.0)
+  - SDWebImage (4.4.8):
+    - FLAnimatedImage (>= 1.0)
+
+DEPENDENCIES:
+  - AFNetworking (~> 3.2)
+  - SDWebImage (~> 4.4)
+
+SPEC REPOS:
+  trunk:
+    - AFNetworking
+    - FLAnimatedImage
+    - SDWebImage
+
+SPEC CHECKSUMS:
+  AFNetworking: 2131b0ba90aaf11c65565ba6c2738066f767d80b
+  FLAnimatedImage: 5eb1176fca51eacb7efe98d410dce91ff20b3205
+  SDWebImage: 6faf0c187b4218ee6a70e0a8d946b2bf755b08f3
+
+PODFILE CHECKSUM: 2c66abdf69df3814e8dbc1a814600de3ed039bc3
+
+COCOAPODS: 1.10.1

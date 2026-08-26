@@ -29,6 +29,12 @@ pub struct Policy {
     pub exceptions: Vec<PolicyException>,
 }
 
+/// Opt-in fail-closed handling of incomplete evidence: when enabled,
+/// `unknown_applicability` denies findings with absent or `Unknown`
+/// applicability and `unknown_licenses` denies findings whose component has
+/// no known license expression, both before ordinary rule matching runs.
+/// Both flags default to `false` (permissive); see [`Policy::evaluate`] for
+/// the full decision precedence.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FailClosed {
@@ -132,9 +138,9 @@ pub struct PolicyEvaluation {
 
 #[derive(Debug, Error)]
 pub enum PolicyError {
-    #[error("invalid YAML policy: {0}")]
+    #[error("invalid YAML policy")]
     Yaml(#[from] serde_yaml::Error),
-    #[error("invalid TOML policy: {0}")]
+    #[error("invalid TOML policy")]
     Toml(#[from] toml::de::Error),
     #[error("unsupported policy schema version {0}; expected 1")]
     UnsupportedVersion(u32),
@@ -146,11 +152,12 @@ pub enum PolicyError {
     EmptyField { field: String },
     #[error("rule '{rule_id}' has an invalid risk range")]
     InvalidRiskRange { rule_id: String },
-    #[error("rule '{rule_id}' has invalid {selector} glob '{pattern}': {source}")]
+    #[error("rule '{rule_id}' has invalid {selector} glob '{pattern}'")]
     InvalidGlob {
         rule_id: String,
         selector: &'static str,
         pattern: String,
+        #[source]
         source: globset::Error,
     },
     #[error("exception '{0}' must contain at least one exact selector")]
@@ -260,6 +267,27 @@ impl Policy {
         Ok(())
     }
 
+    /// Evaluates every finding against this policy and aggregates the
+    /// resulting decisions into a summary. This is hooray's fail-closed
+    /// contract: an invalid or unsupported policy aborts with
+    /// [`PolicyError`] instead of degrading toward allows.
+    ///
+    /// Each finding resolves through fixed precedence:
+    ///
+    /// 1. Fail-closed pre-checks ([`FailClosed`], when opted into) deny
+    ///    findings with unknown applicability or unknown component licenses
+    ///    via the `fail-closed-applicability` / `fail-closed-license`
+    ///    pseudo rules before any rule matching happens.
+    /// 2. The highest-priority matching rule wins; equal priorities break by
+    ///    rule ID, so declaration order never changes an outcome.
+    /// 3. Otherwise `default_outcome` applies.
+    ///
+    /// Exceptions can only turn a decision into [`PolicyOutcome::Allow`]
+    /// and apply solely on explicit selector matches; selector-less
+    /// exceptions are rejected at compile time. Fail-closed denials are
+    /// additionally overridable only by exceptions whose selectors name that
+    /// exact fail-closed policy ID, so generic selectors can never widen
+    /// them into allows.
     pub fn evaluate(
         &self,
         findings: &BTreeMap<crate::model::FindingId, Finding>,
@@ -396,9 +424,18 @@ impl<'a> CompiledPolicy<'a> {
             )
         };
 
+        // Fail-closed denials are only overridable by exceptions whose
+        // selectors explicitly name the failing fail-closed policy id;
+        // generic selectors must not widen such denials into allows.
+        let fail_closed_id = match decision.policy_id.as_str() {
+            id @ ("fail-closed-applicability" | "fail-closed-license") => Some(id),
+            _ => None,
+        };
         if let Some(exception) = self.exceptions.iter().copied().find(|exception| {
             self.expiries[exception.id.as_str()] > now
                 && exception_matches(&exception.selectors, &decision, finding, component)
+                && fail_closed_id
+                    .is_none_or(|id| exception.selectors.policy_id.as_deref() == Some(id))
         }) {
             decision.outcome = PolicyOutcome::Allow;
             decision.reason = format!(
@@ -917,6 +954,51 @@ mod tests {
         let selected = evaluate_one(&policy, finding, &inventory);
         assert_eq!(selected.outcome, PolicyOutcome::Deny);
         assert_eq!(selected.policy_id.as_str(), "fail-closed-applicability");
+    }
+
+    #[test]
+    fn generic_exception_does_not_flip_fail_closed_license_deny() {
+        let inventory = inventory(None, Scope::Runtime, "pkg:cargo/example@1");
+        let mut policy = policy(Vec::new());
+        policy.fail_closed.unknown_licenses = true;
+        policy.exceptions.push(PolicyException {
+            id: "exception-1".to_owned(),
+            owner: "security".to_owned(),
+            reason: "temporary acceptance".to_owned(),
+            ticket: "SEC-1".to_owned(),
+            expires_at: "2026-07-22T12:00:00Z".to_owned(),
+            compensating_controls: BTreeSet::new(),
+            selectors: ExceptionSelectors {
+                finding_id: Some("finding".to_owned()),
+                ..ExceptionSelectors::default()
+            },
+        });
+        let selected = evaluate_one(&policy, finding("finding"), &inventory);
+        assert_eq!(selected.outcome, PolicyOutcome::Deny);
+        assert_eq!(selected.policy_id.as_str(), "fail-closed-license");
+        assert_eq!(selected.exception_id, None);
+    }
+
+    #[test]
+    fn explicit_policy_id_exception_flips_fail_closed_license_deny() {
+        let inventory = inventory(None, Scope::Runtime, "pkg:cargo/example@1");
+        let mut policy = policy(Vec::new());
+        policy.fail_closed.unknown_licenses = true;
+        policy.exceptions.push(PolicyException {
+            id: "exception-1".to_owned(),
+            owner: "security".to_owned(),
+            reason: "temporary acceptance".to_owned(),
+            ticket: "SEC-1".to_owned(),
+            expires_at: "2026-07-22T12:00:00Z".to_owned(),
+            compensating_controls: BTreeSet::new(),
+            selectors: ExceptionSelectors {
+                policy_id: Some("fail-closed-license".to_owned()),
+                ..ExceptionSelectors::default()
+            },
+        });
+        let selected = evaluate_one(&policy, finding("finding"), &inventory);
+        assert_eq!(selected.outcome, PolicyOutcome::Allow);
+        assert_eq!(selected.exception_id.as_deref(), Some("exception-1"));
     }
 
     #[test]

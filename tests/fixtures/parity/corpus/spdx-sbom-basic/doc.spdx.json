@@ -1,0 +1,79 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "demo-root-sbom",
+  "documentNamespace": "https://example.com/spdx/demo-root-sbom-2024",
+  "creationInfo": {
+    "created": "2024-01-15T08:00:00Z",
+    "creators": [
+      "Tool: demo-sbom-generator-1.0.0"
+    ],
+    "licenseListVersion": "3.21"
+  },
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-demo-root",
+      "name": "demo-root",
+      "versionInfo": "1.0.0",
+      "downloadLocation": "NOASSERTION",
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:npm/demo-root@1.0.0"
+        }
+      ]
+    },
+    {
+      "SPDXID": "SPDXRef-Package-lodash",
+      "name": "lodash",
+      "versionInfo": "4.17.15",
+      "downloadLocation": "NOASSERTION",
+      "licenseConcluded": "MIT",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:npm/lodash@4.17.15"
+        }
+      ]
+    },
+    {
+      "SPDXID": "SPDXRef-Package-minimist",
+      "name": "minimist",
+      "versionInfo": "1.2.0",
+      "downloadLocation": "NOASSERTION",
+      "licenseConcluded": "MIT",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:npm/minimist@1.2.0"
+        }
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-demo-root"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-demo-root",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-lodash"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-lodash",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-minimist"
+    }
+  ]
+}

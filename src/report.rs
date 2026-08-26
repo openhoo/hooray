@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fmt::{self, Write as FmtWrite},
     fs::{self, File, OpenOptions},
@@ -18,7 +19,7 @@ use crate::model::{
     ApplicabilityStatus, AssetKind, Component, ComponentId, Finding, FindingId, FindingStatus,
     Location, LocationId, PolicyDecision, PolicyOutcome, ScanReport, Scope, Severity, SourceKind,
 };
-use crate::util::sha256_hex;
+use crate::util::{is_path_uri_byte, percent_encode, sanitize_cell_text, sha256_hex};
 
 pub const CANONICAL_REPORT_VERSION: &str = "1.0.0";
 pub const MAX_REPORT_BYTES: usize = 64 * 1024 * 1024;
@@ -144,15 +145,15 @@ pub struct ParseReportFormatError(String);
 
 #[derive(Debug, Error)]
 pub enum ReportError {
-    #[error("report model is invalid: {0}")]
+    #[error("report model is invalid")]
     InvalidModel(#[from] crate::model::ModelInvariantError),
     #[error("report exceeds safety limit: {0}")]
     Limit(String),
-    #[error("could not serialize report: {0}")]
+    #[error("could not serialize report")]
     Json(#[from] serde_json::Error),
-    #[error("could not serialize YAML report: {0}")]
+    #[error("could not serialize YAML report")]
     Yaml(#[from] serde_yaml::Error),
-    #[error("could not write report: {0}")]
+    #[error("could not write report")]
     Io(#[from] io::Error),
     #[error("invalid GitLab artifact destination '{path}': {reason}")]
     InvalidDestination { path: PathBuf, reason: String },
@@ -160,26 +161,38 @@ pub enum ReportError {
     DestinationExists(PathBuf),
     #[error("atomic no-clobber publication is unsupported on this platform for '{0}'")]
     UnsupportedAtomicPublication(PathBuf),
-    #[error("could not create GitLab artifact staging directory '{path}': {source}")]
-    StagingCreate { path: PathBuf, source: io::Error },
-    #[error("could not write GitLab artifact '{path}': {source}")]
-    StagingWrite { path: PathBuf, source: io::Error },
-    #[error("could not synchronize GitLab artifact staging directory '{path}': {source}")]
-    StagingSync { path: PathBuf, source: io::Error },
-    #[error(
-        "could not atomically publish GitLab artifacts from '{staging}' to '{destination}': {source}"
-    )]
+    #[error("could not create GitLab artifact staging directory '{path}'")]
+    StagingCreate {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not write GitLab artifact '{path}'")]
+    StagingWrite {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not synchronize GitLab artifact staging directory '{path}'")]
+    StagingSync {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not atomically publish GitLab artifacts from '{staging}' to '{destination}'")]
     Publish {
         staging: PathBuf,
         destination: PathBuf,
+        #[source]
         source: io::Error,
     },
     #[error(
-        "GitLab artifacts were fully published at '{destination}', but synchronizing parent '{parent}' failed: {source}; do not delete or overwrite the completed bundle"
+        "GitLab artifacts were fully published at '{destination}', but synchronizing parent '{parent}' failed; do not delete or overwrite the completed bundle"
     )]
     PublishedNotDurable {
         destination: PathBuf,
         parent: PathBuf,
+        #[source]
         source: io::Error,
     },
     #[error("{primary}; additionally could not clean staging directory '{path}': {cleanup}")]
@@ -220,21 +233,22 @@ fn render_with_limit(
     report.validate()?;
     validate_limits(report)?;
     let sanitized = sanitize_report(report)?;
-    let index = ReportIndex::new(&sanitized);
+    let report = &*sanitized;
+    let index = ReportIndex::new(report);
     match format {
-        ReportFormat::Json => render_json(&sanitized, limit),
-        ReportFormat::Yaml => render_yaml(&sanitized, limit),
-        ReportFormat::Table => render_table(&sanitized, limit, &index),
-        ReportFormat::Sarif => render_sarif(&sanitized, limit, &index),
-        ReportFormat::GitLabSarif => render_gitlab_sarif(&sanitized, limit, &index),
-        ReportFormat::Junit => render_junit(&sanitized, limit, &index),
-        ReportFormat::Html => render_html(&sanitized, limit, &index),
-        ReportFormat::CycloneDxVex => render_cyclonedx_vex(&sanitized, limit, &index),
-        ReportFormat::GitLabCycloneDx => render_gitlab_cyclonedx(&sanitized, limit),
-        ReportFormat::Spdx => render_spdx(&sanitized, limit, &index),
-        ReportFormat::GitLabCodeQuality => render_gitlab(&sanitized, limit, &index),
-        ReportFormat::JsonLines => render_json_lines(&sanitized, limit, &index),
-        ReportFormat::Csv => render_csv(&sanitized, limit, &index),
+        ReportFormat::Json => render_json(report, limit),
+        ReportFormat::Yaml => render_yaml(report, limit),
+        ReportFormat::Table => render_table(report, limit, &index),
+        ReportFormat::Sarif => render_sarif(report, limit, &index),
+        ReportFormat::GitLabSarif => render_gitlab_sarif(report, limit, &index),
+        ReportFormat::Junit => render_junit(report, limit, &index),
+        ReportFormat::Html => render_html(report, limit, &index),
+        ReportFormat::CycloneDxVex => render_cyclonedx_vex(report, limit, &index),
+        ReportFormat::GitLabCycloneDx => render_gitlab_cyclonedx(report, limit),
+        ReportFormat::Spdx => render_spdx(report, limit, &index),
+        ReportFormat::GitLabCodeQuality => render_gitlab(report, limit, &index),
+        ReportFormat::JsonLines => render_json_lines(report, limit, &index),
+        ReportFormat::Csv => render_csv(report, limit, &index),
     }
 }
 
@@ -356,8 +370,43 @@ pub fn write_gitlab_artifacts(
 ) -> Result<(), ReportError> {
     report.validate()?;
     validate_limits(report)?;
-    let report = sanitize_report(report)?;
+    let sanitized = sanitize_report(report)?;
+    let report = &*sanitized;
     let destination = output_dir.as_ref();
+    let parent = validate_bundle_destination(destination)?;
+    let index = ReportIndex::new(report);
+    let denied = report.policy_summary.denied;
+    let files = [
+        (
+            "gl-code-quality-report.json",
+            render_gitlab(report, MAX_REPORT_BYTES, &index)?,
+        ),
+        (
+            "gl-sarif-report.sarif",
+            render_gitlab_sarif(report, MAX_REPORT_BYTES, &index)?,
+        ),
+        (
+            "gl-sbom-hooray.cdx.json",
+            render_gitlab_cyclonedx(report, MAX_REPORT_BYTES)?,
+        ),
+        (
+            "gl-junit-report.xml",
+            render_junit(report, MAX_REPORT_BYTES, &index)?,
+        ),
+        (
+            "hooray.env",
+            format!(
+                "HOORAY_POLICY_DENIED={}\nHOORAY_POLICY_DENIED_COUNT={}\n",
+                denied > 0,
+                denied
+            )
+            .into_bytes(),
+        ),
+    ];
+    stage_and_publish(parent, files, destination)
+}
+
+fn validate_bundle_destination(destination: &Path) -> Result<&Path, ReportError> {
     if destination.as_os_str().is_empty()
         || destination == Path::new("-")
         || destination.file_name().is_none_or(|name| name.is_empty())
@@ -380,35 +429,14 @@ pub fn write_gitlab_artifacts(
     if destination.exists() {
         return Err(ReportError::DestinationExists(destination.to_path_buf()));
     }
-    let index = ReportIndex::new(&report);
-    let denied = report.policy_summary.denied;
-    let files = [
-        (
-            "gl-code-quality-report.json",
-            render_gitlab(&report, MAX_REPORT_BYTES, &index)?,
-        ),
-        (
-            "gl-sarif-report.sarif",
-            render_gitlab_sarif(&report, MAX_REPORT_BYTES, &index)?,
-        ),
-        (
-            "gl-sbom-hooray.cdx.json",
-            render_gitlab_cyclonedx(&report, MAX_REPORT_BYTES)?,
-        ),
-        (
-            "gl-junit-report.xml",
-            render_junit(&report, MAX_REPORT_BYTES, &index)?,
-        ),
-        (
-            "hooray.env",
-            format!(
-                "HOORAY_POLICY_DENIED={}\nHOORAY_POLICY_DENIED_COUNT={}\n",
-                denied > 0,
-                denied
-            )
-            .into_bytes(),
-        ),
-    ];
+    Ok(parent)
+}
+
+fn stage_and_publish(
+    parent: &Path,
+    files: [(&'static str, Vec<u8>); 5],
+    destination: &Path,
+) -> Result<(), ReportError> {
     let counter = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
     let staging = parent.join(format!(".hooray-gitlab-{}-{counter}", std::process::id()));
     fs::create_dir(&staging).map_err(|source| ReportError::StagingCreate {
@@ -822,7 +850,6 @@ pub(crate) fn gitlab_component_input_file(component: &Component) -> Option<Strin
 }
 
 pub(crate) fn gitlab_code_quality_entry(
-    _report: &ScanReport,
     index: &ReportIndex<'_>,
     finding: &Finding,
     location: &GitLabFindingLocation,
@@ -1496,7 +1523,7 @@ fn render_gitlab(
         .filter(|finding| finding.status != FindingStatus::Resolved)
         .filter_map(|finding| {
             let location = gitlab_finding_location(report, index, finding)?;
-            Some(gitlab_code_quality_entry(report, index, finding, &location))
+            Some(gitlab_code_quality_entry(index, finding, &location))
         })
         .collect();
     pretty_json(&findings, limit)
@@ -1607,10 +1634,11 @@ fn render_csv(
     output.finish()
 }
 
-/// Locations of a finding in deterministic display order: the direct finding
-/// location first, then evidence locations in their sorted set order,
-/// deduplicated, mirroring the SARIF location selection convention.
-fn csv_finding_locations<'a>(index: &ReportIndex<'a>, finding: &Finding) -> Vec<&'a Location> {
+/// Deduplicated candidate locations of a finding in selection order: the
+/// direct finding location first, then evidence locations in their sorted
+/// set order, first occurrence winning. Callers impose the final ordering:
+/// CSV keeps this selection order, SARIF sorts the ids ascending.
+fn selected_location_ids(finding: &Finding) -> Vec<&LocationId> {
     let mut location_ids: Vec<&LocationId> = Vec::new();
     if let Some(id) = &finding.location_id {
         location_ids.push(id);
@@ -1623,6 +1651,10 @@ fn csv_finding_locations<'a>(index: &ReportIndex<'a>, finding: &Finding) -> Vec<
         }
     }
     location_ids
+}
+
+fn csv_finding_locations<'a>(index: &ReportIndex<'a>, finding: &Finding) -> Vec<&'a Location> {
+    selected_location_ids(finding)
         .into_iter()
         .filter_map(|id| index.locations.get(id).copied())
         .collect()
@@ -1755,13 +1787,70 @@ fn check_text(label: &str, value: &str) -> Result<(), ReportError> {
     }
 }
 
-pub(crate) fn sanitize_report(report: &ScanReport) -> Result<ScanReport, ReportError> {
+/// Returns the redacted form of `report`: borrowed verbatim when the closed
+/// free-form-key carrier set is clean (see [`contains_sensitive_key`]),
+/// otherwise rebuilt through the redacting JSON roundtrip.
+pub(crate) fn sanitize_report(report: &ScanReport) -> Result<Cow<'_, ScanReport>, ReportError> {
+    if !contains_sensitive_key(report) {
+        return Ok(Cow::Borrowed(report));
+    }
     let mut value = serde_json::to_value(report)?;
     redact_sensitive_values(&mut value, None);
-    Ok(serde_json::from_value(value)?)
+    Ok(Cow::Owned(serde_json::from_value(value)?))
 }
 pub(crate) fn sanitize_value(value: &mut Value) {
     redact_sensitive_values(value, None);
+}
+
+/// Zero-allocation prescan deciding whether [`sanitize_report`] may borrow.
+///
+/// # Closed carrier set
+///
+/// These are ALL the free-form string-keyed maps in `ScanReport`'s serde
+/// graph:
+///
+/// - `RunMetadata.metadata` and the root `Asset.metadata`,
+///   both `BTreeMap<String, Value>`; nested JSON objects/arrays inside the
+///   values are recursed exactly like [`redact_sensitive_values`] walks
+///   them;
+/// - `Evidence.properties` (`BTreeMap<String, String>`);
+/// - `Risk.factors` (`BTreeMap<String, i32>`).
+///
+/// Every other string-keyed collection carries validated identifier keys
+/// (finding/component/location/policy id maps) or enum keys
+/// (`UpgradePlan.commands: BTreeMap<ManifestTool, String>`), so neither can
+/// smuggle attacker-chosen key names. Pinned end-to-end by the test
+/// `sanitize_report_fast_path_carrier_set`.
+fn contains_sensitive_key(report: &ScanReport) -> bool {
+    fn metadata_carries(metadata: &BTreeMap<String, Value>) -> bool {
+        metadata.keys().any(|key| is_sensitive_key(key))
+            || metadata.values().any(value_contains_sensitive_key)
+    }
+
+    if metadata_carries(&report.run.metadata) || metadata_carries(&report.inventory.asset.metadata)
+    {
+        return true;
+    }
+    report.findings.values().any(|finding| {
+        finding
+            .evidence
+            .iter()
+            .any(|evidence| evidence.properties.keys().any(|key| is_sensitive_key(key)))
+            || finding
+                .risk
+                .as_ref()
+                .is_some_and(|risk| risk.factors.keys().any(|key| is_sensitive_key(key)))
+    })
+}
+
+fn value_contains_sensitive_key(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, child)| is_sensitive_key(key) || value_contains_sensitive_key(child)),
+        Value::Array(values) => values.iter().any(value_contains_sensitive_key),
+        _ => false,
+    }
 }
 
 fn redact_sensitive_values(value: &mut Value, key: Option<&str>) {
@@ -1784,36 +1873,55 @@ fn redact_sensitive_values(value: &mut Value, key: Option<&str>) {
     }
 }
 
+/// Lowercase ASCII-alphanumeric needles. Invariant: keys normalize to their
+/// lowercased ASCII-alphanumeric bytes, so every needle must itself be
+/// lowercase ASCII-alphanumeric for the comparison to stay exact.
+const SENSITIVE_KEY_NEEDLES: [&[u8]; 10] = [
+    b"secret",
+    b"token",
+    b"password",
+    b"credential",
+    b"authorization",
+    b"apikey",
+    b"privatekey",
+    b"clientsecret",
+    b"accesskey",
+    b"sessioncookie",
+];
+
 fn is_sensitive_key(key: &str) -> bool {
-    let normalized: String = key
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    [
-        "secret",
-        "token",
-        "password",
-        "credential",
-        "authorization",
-        "apikey",
-        "privatekey",
-        "clientsecret",
-        "accesskey",
-        "sessioncookie",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
+    // Allocation-free equivalent of collecting the normalized key
+    // (lowercased ASCII-alphanumeric bytes) and running `str::contains` per
+    // needle: each alphanumeric anchor restarts the needle scan over the key
+    // bytes, separators are skipped, and bytes compare lowercased. Non-ASCII
+    // bytes fail the filter, so byte-wise handling equals char-wise handling.
+    let key = key.as_bytes();
+    SENSITIVE_KEY_NEEDLES.iter().any(|&needle| {
+        'anchors: for (start, &anchor) in key.iter().enumerate() {
+            if !anchor.is_ascii_alphanumeric() {
+                continue;
+            }
+            let mut cursor = 0;
+            for &byte in &key[start..] {
+                if !byte.is_ascii_alphanumeric() {
+                    continue;
+                }
+                if byte.to_ascii_lowercase() != needle[cursor] {
+                    continue 'anchors;
+                }
+                cursor += 1;
+                if cursor == needle.len() {
+                    return true;
+                }
+            }
+        }
+        false
+    })
 }
 
 fn sarif_locations(index: &ReportIndex<'_>, finding: &Finding) -> Vec<Value> {
-    let mut ids = BTreeSet::new();
-    if let Some(id) = &finding.location_id {
-        ids.insert(id);
-    }
-    for evidence in &finding.evidence {
-        ids.extend(&evidence.locations);
-    }
+    let mut ids = selected_location_ids(finding);
+    ids.sort_unstable();
     ids.into_iter().filter_map(|id| {
         let location = index.locations.get(id)?;
         let mut region = serde_json::Map::new();
@@ -1953,10 +2061,16 @@ fn policy_outcome(outcome: PolicyOutcome) -> &'static str {
 }
 
 fn clean_cell(value: &str) -> String {
-    value.replace(['\r', '\n', '\t'], " ").replace('|', "\\|")
+    sanitize_cell_text(value).replace('|', "\\|")
 }
+// Escape after truncation: cutting an already-escaped `\|` pair would strand
+// a dangling backslash at the cell boundary.
 fn truncate_cell(value: &str, limit: usize) -> String {
-    clean_cell(value).chars().take(limit).collect()
+    sanitize_cell_text(value)
+        .chars()
+        .take(limit)
+        .collect::<String>()
+        .replace('|', "\\|")
 }
 
 fn xml_text(value: &str) -> String {
@@ -1986,27 +2100,13 @@ fn is_valid_xml_char(character: char) -> bool {
         || matches!(character as u32, 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)
 }
 
-fn percent_encode(value: &str, keep: fn(u8) -> bool) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if keep(byte) {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-
-fn is_path_uri_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~')
-}
-
 fn path_uri(path: &str) -> String {
     percent_encode(path, is_path_uri_byte)
 }
 
 fn url_segment(value: &str) -> String {
+    // Byte-exact legacy keep-set: path-uri bytes minus `/`. Deliberately not
+    // `is_purl_byte`, which additionally keeps `+` (legacy escaped it %2B).
     percent_encode(value, |byte| is_path_uri_byte(byte) && byte != b'/')
 }
 
@@ -2333,6 +2433,16 @@ mod tests {
         assert!(text.contains("component:root -> component:dep"));
         assert!(text.contains("remediation: upgrade & verify [fixed: 2.0.0]"));
         assert!(text.contains("policy: policy:enterprise=deny"));
+
+        let mut hostile = fixture();
+        let hostile_id = FindingId::new("finding:stable-1").unwrap();
+        hostile.findings.get_mut(&hostile_id).unwrap().summary =
+            Some("\x1b[31mred\x1b[0m\x07\x1b]8;;url\x1b\\".into());
+        let hostile_text = render_to_string(&hostile, ReportFormat::Table).unwrap();
+        assert!(!hostile_text.contains('\x1b'));
+        assert!(!hostile_text.contains('\x07'));
+        assert!(hostile_text.contains("[31mred"));
+        assert!(hostile_text.contains("]8;;url"));
     }
 
     #[test]
@@ -2848,5 +2958,220 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".hooray-gitlab-")
         }));
+    }
+
+    #[test]
+    fn sanitize_report_borrows_clean_reports_and_preserves_serialized_bytes() {
+        let mut clean = fixture();
+        clean.run.metadata.clear();
+        clean.inventory.asset.metadata.clear();
+        let raw = serde_json::to_vec(&clean).unwrap();
+        let sanitized = sanitize_report(&clean).unwrap();
+        assert!(matches!(sanitized, Cow::Borrowed(_)));
+        assert_eq!(serde_json::to_vec(&*sanitized).unwrap(), raw);
+    }
+
+    /// Pins the closed carrier set documented on `contains_sensitive_key`:
+    /// each free-form carrier independently forces the owned path.
+    #[test]
+    fn sanitize_report_fast_path_carrier_set() {
+        let isolated = || {
+            let mut report = fixture();
+            report.run.metadata.clear();
+            report.inventory.asset.metadata.clear();
+            report
+        };
+
+        // Carrier: RunMetadata.metadata top-level key.
+        let mut report = isolated();
+        report.run.metadata.insert("api_key".into(), json!("k"));
+        let sanitized = sanitize_report(&report).unwrap();
+        assert!(matches!(sanitized, Cow::Owned(_)));
+        assert_eq!(
+            sanitized.run.metadata.get("api_key").unwrap(),
+            &json!(REDACTED)
+        );
+
+        // Carrier: Asset.metadata nested value.
+        let mut report = isolated();
+        report.inventory.asset.metadata =
+            BTreeMap::from([("deployment".into(), json!({"clientSecret": "s"}))]);
+        let sanitized = sanitize_report(&report).unwrap();
+        assert!(matches!(sanitized, Cow::Owned(_)));
+        assert_eq!(
+            sanitized.inventory.asset.metadata["deployment"]
+                .get("clientSecret")
+                .unwrap(),
+            &json!(REDACTED)
+        );
+
+        // Carrier: Evidence.properties key.
+        let mut report = isolated();
+        let finding = report.findings.values_mut().next().unwrap();
+        let mut evidence = finding.evidence.iter().next().unwrap().clone();
+        evidence.properties.insert("password".into(), "p".into());
+        finding.evidence = BTreeSet::from([evidence]);
+        let sanitized = sanitize_report(&report).unwrap();
+        assert!(matches!(sanitized, Cow::Owned(_)));
+        let redacted = sanitized
+            .findings
+            .values()
+            .next()
+            .unwrap()
+            .evidence
+            .iter()
+            .find(|candidate| candidate.properties.contains_key("password"))
+            .unwrap();
+        assert_eq!(redacted.properties.get("password").unwrap(), REDACTED);
+
+        // Carrier: Risk.factors key. The prescan routes this
+        // to the slow path, where the `[REDACTED]` sentinel cannot
+        // deserialize into i32 - the same terminal state the pre-fast-path
+        // implementation reached, so the contract is the error itself.
+        let mut report = isolated();
+        report
+            .findings
+            .values_mut()
+            .next()
+            .unwrap()
+            .risk
+            .as_mut()
+            .unwrap()
+            .factors
+            .insert("access_token".into(), 1);
+        assert!(contains_sensitive_key(&report));
+        assert!(sanitize_report(&report).is_err());
+    }
+
+    /// Pins the zero-allocation scanner against the retired collect-based
+    /// reference across separators, casing mixes, unicode, empty and wrapped
+    /// shapes, and restart traps where an aborted anchor must be retried at a
+    /// later position.
+    #[test]
+    fn is_sensitive_key_matches_retired_collect_reference() {
+        // Deliberate duplicate of the retired inline needles: the reference
+        // must not share fate with `SENSITIVE_KEY_NEEDLES`.
+        const LEGACY_NEEDLES: [&str; 10] = [
+            "secret",
+            "token",
+            "password",
+            "credential",
+            "authorization",
+            "apikey",
+            "privatekey",
+            "clientsecret",
+            "accesskey",
+            "sessioncookie",
+        ];
+
+        fn legacy_is_sensitive_key(key: &str) -> bool {
+            let normalized: String = key
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect();
+            LEGACY_NEEDLES
+                .iter()
+                .any(|needle| normalized.contains(needle))
+        }
+
+        let needles = [
+            "secret",
+            "token",
+            "password",
+            "credential",
+            "authorization",
+            "apikey",
+            "privatekey",
+            "clientsecret",
+            "accesskey",
+            "sessioncookie",
+        ];
+        let separators = ["", "-", "_", ".", " ", "/", "--__", "\t", "é"];
+        let mut corpus: Vec<String> = vec![
+            String::new(),
+            "ssecret".into(),
+            "ttoken".into(),
+            "ssesecret".into(),
+            "secrsecret".into(),
+            "xsecretx".into(),
+            "secret123".into(),
+            "123secret".into(),
+            "CLIENT-SECRET".into(),
+            "Client_Secret_Value".into(),
+            "apiKey".into(),
+            "API_KEY".into(),
+            "private.key".into(),
+            "session cookie".into(),
+            "café_token".into(),
+            "ключ".into(),
+            "🔑secret".into(),
+            "no-match-here".into(),
+            "accesskeytoken".into(),
+            "clientsecretkey".into(),
+        ];
+        for needle in needles {
+            for separator in separators {
+                let split: String = needle
+                    .chars()
+                    .enumerate()
+                    .map(|(index, character)| {
+                        if index == 0 {
+                            character.to_string()
+                        } else {
+                            format!("{separator}{character}")
+                        }
+                    })
+                    .collect();
+                corpus.push(split.clone());
+                corpus.push(format!("pre{separator}{split}post"));
+                let mixed: String = split
+                    .chars()
+                    .enumerate()
+                    .map(|(index, character)| {
+                        if index % 2 == 0 {
+                            character.to_ascii_uppercase()
+                        } else {
+                            character
+                        }
+                    })
+                    .collect();
+                corpus.push(mixed);
+            }
+        }
+        assert!(
+            corpus.iter().any(|key| is_sensitive_key(key)),
+            "corpus lost its positive cases"
+        );
+        assert!(
+            corpus.iter().any(|key| !legacy_is_sensitive_key(key)),
+            "corpus lost its negative cases"
+        );
+        for key in &corpus {
+            assert_eq!(
+                is_sensitive_key(key),
+                legacy_is_sensitive_key(key),
+                "parity drift for key {key:?}"
+            );
+        }
+    }
+
+    /// Pins truncate-before-escape ordering: escaping after the character cut
+    /// keeps every pipe paired with its backslash instead of stranding a
+    /// dangling backslash at the truncation boundary.
+    #[test]
+    fn truncate_cell_escapes_after_truncation() {
+        // The old escape-first order produced "a\" here (cut inside the `\|`
+        // pair); the fixed order emits the fully escaped pair.
+        assert_eq!(truncate_cell("a|b", 2), "a\\|");
+        assert_eq!(truncate_cell("é|x", 2), "é\\|");
+        assert_eq!(truncate_cell("plain", 24), "plain");
+        for (value, limit) in [("a|b|c|d", 1), ("x||y", 3), ("p|q", 0), ("|lead", 4)] {
+            let cell = truncate_cell(value, limit);
+            assert!(
+                !cell.replace("\\|", "").contains(['\\', '|']),
+                "unpaired escape or bare pipe in {cell:?} from {value:?}"
+            );
+        }
     }
 }

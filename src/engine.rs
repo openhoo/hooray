@@ -20,7 +20,7 @@ use crate::{
     license,
     model::{
         ApplicabilityStatus, ComponentId, DependencyKind, Evidence, Finding, FindingId,
-        FindingKind, Inventory, RunId, RunMetadata, ScanReport,
+        FindingKind, Inventory, PolicySummary, RunId, RunMetadata, ScanReport,
     },
     osv::{OsvClient, OsvError},
     policy::{Policy, PolicyError},
@@ -32,6 +32,12 @@ use crate::{
     store::{HistoryFilter, Store, StoreError},
 };
 
+/// Schema version stamped onto every [`ScanReport`] this engine produces and
+/// persisted alongside it in `scan_runs.schema_version`. Store read paths
+/// reject rows carrying any other value with
+/// [`StoreError::UnsupportedReportSchema`], so reports written by an
+/// incompatible scanner generation fail loudly instead of deserializing into
+/// a structurally valid but semantically wrong report.
 pub const REPORT_SCHEMA_VERSION: &str = "1";
 const MAX_POLICY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DEPENDENCY_PATHS: usize = 32;
@@ -51,7 +57,22 @@ impl VulnerabilityProvider for OsvClient {
     }
 }
 
-#[derive(Debug, Clone)]
+/// One scan execution request: what to scan, which policy applies, and how
+/// the run relates to prior history.
+///
+/// * `input` - detected scan input (directory, archive, image, SBOM, ...)
+///   inventoried and scanned.
+/// * `policy_path` - policy file evaluated against the finished finding set.
+/// * `baseline` - optional prior run used to stamp finding history
+///   (`first_seen`/`last_seen`/`modified`); must exist and belong to the same
+///   asset as the scanned input.
+/// * `new_findings_only` - drops findings already present in the resolved
+///   baseline from the report. Requires an explicit `baseline` or at least
+///   one prior run for the same asset ([`EngineError::MissingBaseline`]).
+/// * `run_id` - explicit run identity; a fresh `run:<uuid>` is generated when
+///   `None`.
+/// * `as_of` - evaluation instant for deterministic replay (timestamps,
+///   risk windows, policy decisions); defaults to the current time.
 pub struct ScanRequest {
     pub input: ScanInput,
     pub policy_path: PathBuf,
@@ -62,6 +83,10 @@ pub struct ScanRequest {
 }
 
 impl ScanRequest {
+    /// Creates a request scanning `input` against the policy at
+    /// `policy_path` with no baseline, no run-id override, and evaluation at
+    /// the current time; assign the remaining fields directly for
+    /// history-aware or deterministically replayed scans.
     pub fn new(input: ScanInput, policy_path: PathBuf) -> Self {
         Self {
             input,
@@ -76,23 +101,23 @@ impl ScanRequest {
 
 #[derive(Debug, Error)]
 pub enum EngineError {
-    #[error("input failed: {0}")]
+    #[error("input failed")]
     Input(#[from] crate::input::InputError),
-    #[error("vulnerability provider failed: {0}")]
+    #[error("vulnerability provider failed")]
     Osv(#[from] OsvError),
-    #[error("license analysis failed: {0}")]
+    #[error("license analysis failed")]
     License(#[from] license::LicenseError),
-    #[error("filesystem analysis failed: {0}")]
+    #[error("filesystem analysis failed")]
     Scanner(#[from] scanners::ScanError),
-    #[error("dependency analysis failed: {0}")]
+    #[error("dependency analysis failed")]
     Graph(#[from] crate::graph::GraphError),
-    #[error("policy evaluation failed: {0}")]
+    #[error("policy evaluation failed")]
     Policy(#[from] PolicyError),
-    #[error("store operation failed: {0}")]
+    #[error("store operation failed")]
     Store(#[from] StoreError),
-    #[error("generated report is invalid: {0}")]
+    #[error("generated report is invalid")]
     Model(#[from] crate::model::ModelInvariantError),
-    #[error("failed to read policy {path}: {source}")]
+    #[error("failed to read policy {path}")]
     PolicyRead {
         path: PathBuf,
         source: std::io::Error,
@@ -117,6 +142,23 @@ pub enum EngineError {
     },
     #[error("new-findings-only requires an explicit baseline or an existing run for this asset")]
     MissingBaseline,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum FinalizeError {
+    #[error("policy evaluation failed")]
+    Policy(#[from] PolicyError),
+    #[error("generated report is invalid")]
+    Invariant(#[from] crate::model::ModelInvariantError),
+}
+
+impl From<FinalizeError> for EngineError {
+    fn from(error: FinalizeError) -> Self {
+        match error {
+            FinalizeError::Policy(error) => Self::Policy(error),
+            FinalizeError::Invariant(error) => Self::Model(error),
+        }
+    }
 }
 
 pub struct Engine<'a> {
@@ -178,7 +220,7 @@ impl<'a> Engine<'a> {
             filesystem_findings(&request.input, &mut inventory, self.config)?,
         );
         attach_dependency_remediation(&inventory, &graph, &mut findings)?;
-        merge_operational_risk(&inventory, &mut findings, as_of);
+        merge_operational_risk(&inventory, &graph, &mut findings, as_of);
         contextualize_and_score(&inventory, &graph, &mut findings, as_of)?;
 
         if let Some(baseline) = baseline.as_ref() {
@@ -190,17 +232,17 @@ impl<'a> Engine<'a> {
             mark_first_seen(&mut findings, &started_at);
         }
 
-        let evaluation = policy.evaluate(&findings, &inventory, as_of.fixed_offset())?;
-        let completed_at = timestamp(as_of);
-        let report = ScanReport {
-            schema_version: REPORT_SCHEMA_VERSION.to_owned(),
-            run: RunMetadata {
-                id: request.run_id.unwrap_or_else(|| {
+        let report = finalize_scan(
+            Some(&policy),
+            ScanParts {
+                inventory,
+                findings,
+                run_id: request.run_id.unwrap_or_else(|| {
                     RunId::new(format!("run:{}", Uuid::new_v4()))
                         .expect("generated run identifier is non-empty")
                 }),
                 started_at,
-                completed_at: Some(completed_at),
+                completed_at: timestamp(as_of),
                 scanner_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                 metadata: BTreeMap::from([
                     (
@@ -225,12 +267,8 @@ impl<'a> Engine<'a> {
                     ),
                 ]),
             },
-            inventory,
-            findings,
-            policy_decisions: evaluation.decisions,
-            policy_summary: evaluation.summary,
-        };
-        report.validate()?;
+            as_of,
+        )?;
         self.store.save_report(&report)?;
         Ok(report)
     }
@@ -324,6 +362,51 @@ pub fn load_policy(path: &Path) -> Result<Policy, EngineError> {
         Some("toml") => Ok(Policy::from_toml(&contents)?),
         _ => Err(EngineError::UnsupportedPolicyFormat(path.to_owned())),
     }
+}
+
+/// Inputs for the shared post-scan tail behind `Engine::scan` and the POST
+/// /v1/scans API route: optional policy evaluation, canonical [`ScanReport`]
+/// assembly, and inventory/report invariant validation. Graph-dependent
+/// scoring stages stay with each caller on purpose.
+pub(crate) struct ScanParts {
+    pub inventory: Inventory,
+    pub findings: BTreeMap<FindingId, Finding>,
+    pub run_id: RunId,
+    pub started_at: String,
+    pub completed_at: String,
+    pub scanner_version: Option<String>,
+    pub metadata: BTreeMap<String, Value>,
+}
+
+pub(crate) fn finalize_scan(
+    policy: Option<&Policy>,
+    parts: ScanParts,
+    as_of: DateTime<Utc>,
+) -> Result<ScanReport, FinalizeError> {
+    let (policy_decisions, policy_summary) = match policy {
+        Some(policy) => {
+            let evaluation =
+                policy.evaluate(&parts.findings, &parts.inventory, as_of.fixed_offset())?;
+            (evaluation.decisions, evaluation.summary)
+        }
+        None => (Default::default(), PolicySummary::default()),
+    };
+    let report = ScanReport {
+        schema_version: REPORT_SCHEMA_VERSION.to_owned(),
+        run: RunMetadata {
+            id: parts.run_id,
+            started_at: parts.started_at,
+            completed_at: Some(parts.completed_at),
+            scanner_version: parts.scanner_version,
+            metadata: parts.metadata,
+        },
+        inventory: parts.inventory,
+        findings: parts.findings,
+        policy_decisions,
+        policy_summary,
+    };
+    report.validate()?;
+    Ok(report)
 }
 
 /// Shared scoring pass behind `hooray scan` and the POST /v1/scans API route:
@@ -504,6 +587,7 @@ fn attach_dependency_remediation(
 
 fn merge_operational_risk(
     inventory: &Inventory,
+    graph: &DependencyGraph,
     findings: &mut BTreeMap<FindingId, Finding>,
     as_of: DateTime<Utc>,
 ) {
@@ -518,6 +602,7 @@ fn merge_operational_risk(
     }
     for (_, finding) in OperationalRiskAnalyzer::analyze(OperationalRiskInput {
         inventory,
+        graph,
         evidence_by_component: &evidence_by_component,
         as_of,
         config: OperationalRiskConfig::default(),

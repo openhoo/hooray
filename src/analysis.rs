@@ -5,8 +5,10 @@ use std::ops::ControlFlow;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::model::{
-    Applicability, ApplicabilityStatus, Component, ComponentId, Evidence, Inventory, Scope,
+    Applicability, ApplicabilityStatus, Component, ComponentId, Evidence, Inventory,
+    PackageEcosystem, Scope,
 };
+use crate::remediation::{VersionKey, package_ecosystem_for_purl_type};
 
 /// Mirrors the enumeration bounds of graph path collection
 /// (`engine::MAX_DEPENDENCY_PATHS` / `MAX_DEPENDENCY_DEPTH`): graphs with many
@@ -54,6 +56,11 @@ impl ApplicabilityAnalyzer {
         let ecosystem = purl_ecosystem(&input.component.purl);
         let evidence = EvidenceProperties::new(input.evidence);
         let version = version_parts(&input.component.version);
+        // PyPI and Maven order versions by PEP 440 / Maven rules rather than
+        // the generic token heuristic: parse the component version once here
+        // so every range comparison reuses it. Components the scoped
+        // comparator rejects stay on the legacy path everywhere below.
+        let scoped = ScopedOrdering::for_component(ecosystem, &input.component.version);
         let (paths, paths_truncated) = input
             .inventory
             .map(|inventory| dependency_paths(inventory, &input.component.identity))
@@ -89,7 +96,12 @@ impl ApplicabilityAnalyzer {
 
         let mut outcomes = BTreeSet::new();
         for range in matching_ranges {
-            let outcome = evaluate_range(range, &input.component.version, version.as_deref());
+            let outcome = evaluate_range(
+                range,
+                &input.component.version,
+                version.as_deref(),
+                scoped.as_ref(),
+            );
             outcomes.insert(outcome.status());
             rationale.push(outcome.detail().to_owned());
         }
@@ -348,10 +360,49 @@ impl RangeOutcome {
     }
 }
 
+/// Ecosystem-aware ordering context for PyPI and Maven components: carries
+/// the component version parsed once through remediation's comparator so OSV
+/// event boundaries compare under PEP 440 / Maven ordering.
+#[derive(Debug, Clone)]
+struct ScopedOrdering {
+    ecosystem: PackageEcosystem,
+    key: VersionKey,
+}
+
+impl ScopedOrdering {
+    /// Builds the context when the purl ecosystem routes through remediation's
+    /// comparator (PyPI, Maven only) and that comparator accepts the version;
+    /// every other ecosystem keeps the legacy heuristic untouched.
+    fn for_component(ecosystem: Option<&str>, version: &str) -> Option<Self> {
+        let ecosystem = package_ecosystem_for_purl_type(ecosystem?).filter(|ecosystem| {
+            matches!(ecosystem, PackageEcosystem::Pypi | PackageEcosystem::Maven)
+        })?;
+        let key = VersionKey::parse(ecosystem, version)?;
+        Some(Self { ecosystem, key })
+    }
+}
+
+/// Orders the component version against one OSV event boundary, preferring
+/// the scoped comparator and falling back to the legacy heuristic whenever
+/// either side cannot be parsed by it.
+fn compare_scoped(
+    scoped: Option<&ScopedOrdering>,
+    version_parts: Option<&[String]>,
+    boundary: &str,
+) -> Option<Ordering> {
+    if let Some(scoped) = scoped
+        && let Some(boundary) = VersionKey::parse(scoped.ecosystem, boundary)
+    {
+        return Some(scoped.key.cmp(&boundary));
+    }
+    compare_version_parts(version_parts, boundary)
+}
+
 fn evaluate_range(
     range: &OsvAffectedRange,
     version: &str,
     version_parts: Option<&[String]>,
+    scoped: Option<&ScopedOrdering>,
 ) -> RangeOutcome {
     if range.range_type == OsvRangeType::Git {
         return RangeOutcome::Unknown(
@@ -368,7 +419,7 @@ fn evaluate_range(
 
     let mut state = RangeState::default();
     for event in &range.events {
-        if let Some(outcome) = apply_event(&mut state, event, version_parts, version) {
+        if let Some(outcome) = apply_event(&mut state, event, version_parts, version, scoped) {
             return outcome;
         }
     }
@@ -394,8 +445,13 @@ impl<'a> RangeState<'a> {
         self.crossed_last_affected = None;
     }
 
-    fn cross_introduced(&mut self, version_parts: Option<&[String]>, introduced: &str) {
-        if let Some(ordering) = compare_version_parts(version_parts, introduced) {
+    fn cross_introduced(
+        &mut self,
+        scoped: Option<&ScopedOrdering>,
+        version_parts: Option<&[String]>,
+        introduced: &str,
+    ) {
+        if let Some(ordering) = compare_scoped(scoped, version_parts, introduced) {
             self.saw_comparable = true;
             if ordering != Ordering::Less {
                 self.activate();
@@ -403,8 +459,13 @@ impl<'a> RangeState<'a> {
         }
     }
 
-    fn cross_fixed(&mut self, version_parts: Option<&[String]>, fixed: &'a str) {
-        if let Some(ordering) = compare_version_parts(version_parts, fixed) {
+    fn cross_fixed(
+        &mut self,
+        scoped: Option<&ScopedOrdering>,
+        version_parts: Option<&[String]>,
+        fixed: &'a str,
+    ) {
+        if let Some(ordering) = compare_scoped(scoped, version_parts, fixed) {
             self.saw_comparable = true;
             if ordering != Ordering::Less {
                 self.active = false;
@@ -415,11 +476,12 @@ impl<'a> RangeState<'a> {
 
     fn cross_last_affected(
         &mut self,
+        scoped: Option<&ScopedOrdering>,
         version_parts: Option<&[String]>,
         last: &'a str,
         version: &str,
     ) -> Option<RangeOutcome> {
-        if let Some(ordering) = compare_version_parts(version_parts, last) {
+        if let Some(ordering) = compare_scoped(scoped, version_parts, last) {
             self.saw_comparable = true;
             if ordering == Ordering::Greater {
                 self.active = false;
@@ -433,8 +495,13 @@ impl<'a> RangeState<'a> {
         None
     }
 
-    fn cross_limit(&mut self, version_parts: Option<&[String]>, limit: &'a str) {
-        if let Some(ordering) = compare_version_parts(version_parts, limit) {
+    fn cross_limit(
+        &mut self,
+        scoped: Option<&ScopedOrdering>,
+        version_parts: Option<&[String]>,
+        limit: &'a str,
+    ) {
+        if let Some(ordering) = compare_scoped(scoped, version_parts, limit) {
             self.saw_comparable = true;
             if ordering != Ordering::Less {
                 self.active = false;
@@ -476,24 +543,25 @@ fn apply_event<'a>(
     event: &'a OsvEvent,
     version_parts: Option<&[String]>,
     version: &str,
+    scoped: Option<&ScopedOrdering>,
 ) -> Option<RangeOutcome> {
     match event.introduced.as_deref() {
         Some("0") => state.activate(),
-        Some(introduced) => state.cross_introduced(version_parts, introduced),
+        Some(introduced) => state.cross_introduced(scoped, version_parts, introduced),
         None => {}
     }
     if let Some(fixed) = event.fixed.as_deref() {
-        state.cross_fixed(version_parts, fixed);
+        state.cross_fixed(scoped, version_parts, fixed);
     }
     if let Some(outcome) = event
         .last_affected
         .as_deref()
-        .and_then(|last| state.cross_last_affected(version_parts, last, version))
+        .and_then(|last| state.cross_last_affected(scoped, version_parts, last, version))
     {
         return Some(outcome);
     }
     if let Some(limit) = event.limit.as_deref() {
-        state.cross_limit(version_parts, limit);
+        state.cross_limit(scoped, version_parts, limit);
     }
     None
 }
@@ -514,19 +582,37 @@ fn compare_versions(left: &str, right: &str) -> Option<Ordering> {
 fn compare_parsed_versions(left: &[String], right: &[String]) -> Option<Ordering> {
     let length = left.len().max(right.len());
     for index in 0..length {
-        let lhs = left.get(index).map(String::as_str).unwrap_or("0");
-        let rhs = right.get(index).map(String::as_str).unwrap_or("0");
-        let ordering = match (lhs.parse::<u64>(), rhs.parse::<u64>()) {
-            (Ok(lhs), Ok(rhs)) => lhs.cmp(&rhs),
-            (Ok(_), Err(_)) => Ordering::Greater,
-            (Err(_), Ok(_)) => Ordering::Less,
-            (Err(_), Err(_)) => lhs.cmp(rhs),
+        let ordering = match (left.get(index), right.get(index)) {
+            (Some(lhs), Some(rhs)) => compare_version_identifiers(lhs, rhs),
+            // One side ran out of identifiers: a surviving numeric identifier
+            // keeps comparing against implicit zero padding (1.2 == 1.2.0),
+            // while a surviving alphanumeric identifier outranks the exhausted
+            // release (1.0.0 > 1.0.0-alpha).
+            (Some(head), None) => match head.parse::<u64>() {
+                Ok(number) => number.cmp(&0),
+                Err(_) => Ordering::Less,
+            },
+            (None, Some(head)) => match head.parse::<u64>() {
+                Ok(number) => 0u64.cmp(&number),
+                Err(_) => Ordering::Greater,
+            },
+            (None, None) => Ordering::Equal,
         };
         if ordering != Ordering::Equal {
             return Some(ordering);
         }
     }
     Some(Ordering::Equal)
+}
+
+fn compare_version_identifiers(lhs: &str, rhs: &str) -> Ordering {
+    match (lhs.parse::<u64>(), rhs.parse::<u64>()) {
+        (Ok(lhs), Ok(rhs)) => lhs.cmp(&rhs),
+        // Numeric identifiers rank below alphanumeric ones (semver rule 11).
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        (Err(_), Err(_)) => lhs.cmp(rhs),
+    }
 }
 
 fn version_parts(version: &str) -> Option<Vec<String>> {
@@ -701,6 +787,28 @@ mod tests {
         let inventory = inventory(component.clone(), true);
         let evidence = evidence(properties);
         let ranges = range(events);
+        ApplicabilityAnalyzer::analyze(ApplicabilityInput {
+            component: &component,
+            inventory: Some(&inventory),
+            evidence: &evidence,
+            affected_ranges: &ranges,
+        })
+    }
+
+    fn analyze_in_ecosystem(
+        purl_type: &str,
+        version: &str,
+        events: Vec<OsvEvent>,
+    ) -> Applicability {
+        let mut component = component(version, Scope::Runtime);
+        component.purl = format!("pkg:{purl_type}/lib@{version}");
+        let inventory = inventory(component.clone(), true);
+        let evidence = evidence(&[]);
+        let ranges = vec![OsvAffectedRange {
+            range_type: OsvRangeType::Semver,
+            ecosystem: Some(purl_type.into()),
+            events,
+        }];
         ApplicabilityAnalyzer::analyze(ApplicabilityInput {
             component: &component,
             inventory: Some(&inventory),
@@ -937,6 +1045,143 @@ mod tests {
             Some(Ordering::Less)
         );
         assert_eq!(compare_versions("invalid version", "1.0"), None);
+    }
+
+    #[test]
+    fn prerelease_identifiers_follow_semver_precedence_rules() {
+        assert_eq!(
+            compare_versions("1.0.0-alpha", "1.0.0-1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("1.0.0-1", "1.0.0-beta"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(compare_versions("1.2", "1.2.0"), Some(Ordering::Equal));
+        assert_eq!(
+            compare_versions("1.0.0", "1.0.0-alpha"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("1.0.0-alpha", "1.0.0-alpha.1"),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn prerelease_comparison_is_antisymmetric_for_spot_pair() {
+        let forward = compare_versions("1.0.0-1", "1.0.0-beta");
+        let backward = compare_versions("1.0.0-beta", "1.0.0-1");
+        assert_eq!(forward, backward.map(Ordering::reverse));
+    }
+
+    #[test]
+    fn pypi_post_release_versions_compare_below_the_next_patch() {
+        // 1.0.post1 is a post-release of 1.0 and therefore still below the
+        // next patch boundary 1.0.1; the legacy token heuristic ranked the
+        // alphanumeric "post" above the numeric patch digit.
+        let events = vec![
+            OsvEvent {
+                introduced: Some("1.0".into()),
+                ..OsvEvent::default()
+            },
+            OsvEvent {
+                limit: Some("1.0.1".into()),
+                ..OsvEvent::default()
+            },
+        ];
+        assert_eq!(
+            analyze_in_ecosystem("pypi", "1.0.post1", events.clone()).status,
+            ApplicabilityStatus::Affected
+        );
+        // Dual pin: a post-release stacked onto the boundary release itself
+        // still ranks at or above that boundary, so the fixed side holds.
+        let patched = vec![
+            OsvEvent {
+                introduced: Some("1.0".into()),
+                ..OsvEvent::default()
+            },
+            OsvEvent {
+                fixed: Some("1.0.2".into()),
+                ..OsvEvent::default()
+            },
+        ];
+        assert_eq!(
+            analyze_in_ecosystem("pypi", "1.0.2.post1", patched).status,
+            ApplicabilityStatus::Fixed
+        );
+    }
+
+    #[test]
+    fn pypi_epoch_versions_are_comparable_instead_of_unknown() {
+        // Epoch-qualified versions carry a character the generic tokenizer
+        // rejects, so only the scoped PEP 440 comparator can order them.
+        let events = vec![OsvEvent {
+            introduced: Some("1!0.4".into()),
+            fixed: Some("1!0.6".into()),
+            ..OsvEvent::default()
+        }];
+        assert_eq!(
+            analyze_in_ecosystem("pypi", "1!0.5", events.clone()).status,
+            ApplicabilityStatus::Affected
+        );
+        assert_eq!(
+            analyze_in_ecosystem("pypi", "1!0.7", events).status,
+            ApplicabilityStatus::Fixed
+        );
+    }
+
+    #[test]
+    fn maven_qualifier_ordering_delegates_to_the_scoped_comparator() {
+        // Maven ranks qualifiers below ("alpha") and above ("sp") the plain
+        // release; the legacy heuristic placed both on the same side of 1.0.
+        let events = vec![OsvEvent {
+            introduced: Some("0".into()),
+            fixed: Some("1.0".into()),
+            ..OsvEvent::default()
+        }];
+        assert_eq!(
+            analyze_in_ecosystem("maven", "1.0-alpha", events.clone()).status,
+            ApplicabilityStatus::Affected
+        );
+        assert_eq!(
+            analyze_in_ecosystem("maven", "1.0-sp", events).status,
+            ApplicabilityStatus::Fixed
+        );
+    }
+
+    #[test]
+    fn legacy_ecosystems_keep_semver_rule_11_outcomes() {
+        // Prerelease identifiers sort below the plain release for ecosystems
+        // that stay on the legacy comparator...
+        let below = vec![OsvEvent {
+            introduced: Some("0".into()),
+            fixed: Some("1.0.0".into()),
+            ..OsvEvent::default()
+        }];
+        assert_eq!(
+            analyze_in_ecosystem("cargo", "1.0.0-alpha", below.clone()).status,
+            ApplicabilityStatus::Affected
+        );
+        assert_eq!(
+            analyze_in_ecosystem("npm", "1.0.0-alpha", below).status,
+            ApplicabilityStatus::Affected
+        );
+        // ...while alphanumeric identifiers outrank numeric ones at the same
+        // depth (semver rule 11), so beta sits above the fixed boundary -1.
+        let pinned = vec![OsvEvent {
+            introduced: Some("0".into()),
+            fixed: Some("1.0.0-1".into()),
+            ..OsvEvent::default()
+        }];
+        assert_eq!(
+            analyze_in_ecosystem("cargo", "1.0.0-beta", pinned.clone()).status,
+            ApplicabilityStatus::Fixed
+        );
+        assert_eq!(
+            analyze_in_ecosystem("npm", "1.0.0-beta", pinned).status,
+            ApplicabilityStatus::Fixed
+        );
     }
 
     #[test]

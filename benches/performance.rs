@@ -21,7 +21,7 @@ use hooray::{
     report::{ReportFormat, render},
     risk::{OperationalRiskAnalyzer, OperationalRiskConfig, OperationalRiskInput},
     scanners::{MalwareSignatures, ScannerConfig, analyze_bytes, scan_path},
-    store::Store,
+    store::{FindingFilter, Store},
 };
 use tempfile::TempDir;
 
@@ -394,14 +394,33 @@ fn main() {
         report(name, iterations, elapsed);
     }
 
+    // Sanitize fast-path pin: the same large fixture rendered without any
+    // sensitive keys versus with one planted in run.metadata.
+    let mut sensitive_report = report_fixture(250, 2);
+    sensitive_report.run.metadata.insert(
+        "api_token".into(),
+        serde_json::Value::String("never-print-me".into()),
+    );
+    let (iterations, elapsed) = measure(|| {
+        black_box(render(black_box(&large_report), ReportFormat::Sarif).expect("SARIF report"));
+    });
+    report("render_clean_sarif_500", iterations, elapsed);
+    let (iterations, elapsed) = measure(|| {
+        black_box(render(black_box(&sensitive_report), ReportFormat::Sarif).expect("SARIF report"));
+    });
+    report("render_sensitive_sarif_500", iterations, elapsed);
+
     let (risk_inventory, risk_evidence) = operational_risk_fixture(10_000);
     let risk_as_of = Utc
         .with_ymd_and_hms(2026, 7, 21, 0, 0, 0)
         .single()
         .expect("risk timestamp");
+    let risk_graph =
+        DependencyGraph::from_inventory(&risk_inventory).expect("benchmark dependency graph");
     let (iterations, elapsed) = measure(|| {
         black_box(OperationalRiskAnalyzer::analyze(OperationalRiskInput {
             inventory: &risk_inventory,
+            graph: &risk_graph,
             evidence_by_component: &risk_evidence,
             as_of: risk_as_of,
             config: OperationalRiskConfig::default(),
@@ -416,5 +435,47 @@ fn main() {
             .expect("save report");
         black_box(store);
     });
-    report("store_save_250_500", iterations, elapsed);
+    report("store_open_and_save_250_500", iterations, elapsed);
+
+    // Honest save-only measurement: one store opened outside the timed
+    // region; each iteration constructs a fresh fixture with a new run id
+    // (construction excluded) and only `save_report` accumulates time.
+    let mut save_store = Store::open_memory().expect("memory store");
+    let mut save_iterations = 0_u64;
+    let mut save_elapsed = Duration::ZERO;
+    loop {
+        let mut fresh_report = report_fixture(250, 2);
+        fresh_report.run.id =
+            RunId::new(format!("run:performance-save-{save_iterations}")).expect("run id");
+        let started = Instant::now();
+        save_store
+            .save_report(black_box(&fresh_report))
+            .expect("save report");
+        let spent = started.elapsed();
+        save_elapsed += spent;
+        save_iterations += 1;
+        if spent >= SAMPLE_TIME {
+            break;
+        }
+    }
+    report("store_save_report_250_500", save_iterations, save_elapsed);
+
+    let mut query_store = Store::open_memory().expect("memory store");
+    for run_index in 0..50 {
+        let mut seeded_report = report_fixture(250, 2);
+        seeded_report.run.id =
+            RunId::new(format!("run:performance-query-{run_index}")).expect("run id");
+        query_store
+            .save_report(&seeded_report)
+            .expect("seed report");
+    }
+    let findings_filter = FindingFilter::default();
+    let (iterations, elapsed) = measure(|| {
+        black_box(
+            query_store
+                .query_findings(black_box(&findings_filter), 100, 0)
+                .expect("findings page"),
+        );
+    });
+    report("store_query_findings_page", iterations, elapsed);
 }

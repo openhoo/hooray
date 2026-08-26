@@ -17,14 +17,14 @@ use hooray::{
     integrations::{
         IntegrationGenerator, IntegrationLimits, SignedWebhook, validate_webhook_config,
     },
-    model::{FindingId, RunId, ScanReport},
+    model::{RunId, ScanReport},
     monitor::{
         AdvisoryCursor, AdvisoryRefresh, AlertEvent, Evaluation, MonitorConfig, MonitorError,
-        MonitorFuture, MonitorRunner, MonitorService, Notifier, SystemClock, encode_time,
+        MonitorFuture, MonitorRunner, MonitorService, Notifier, SystemClock,
     },
     report::{self, ReportFormat},
-    store::{MonitorTarget, ReportDiff, Store},
-    util::sha256_hex,
+    store::{MonitorTarget, Store},
+    util::{sanitize_cell_text, sha256_hex},
 };
 use serde::Serialize;
 
@@ -388,8 +388,7 @@ async fn run_scan(config: &Config, args: ScanArgs) -> Result<CommandOutcome> {
         .map_or(args.input.as_path(), |file| file.path.as_path());
     let input = detect_input(kind, path, config)?;
     let policy_path = args.policy.unwrap_or_else(|| config.policy_path.clone());
-    let mut store = Store::open(&config.database_path)
-        .with_context(|| format!("failed to open {}", config.database_path.display()))?;
+    let mut store = open_store(config)?;
     let mut engine = Engine::new(config, &mut store, None);
     let mut request = ScanRequest::new(input, policy_path);
     request.baseline = args.baseline;
@@ -477,7 +476,7 @@ fn run_history(config: &Config, args: HistoryArgs) -> Result<CommandOutcome> {
         }
         HistoryCommand::Diff(args) => {
             let diff = store.diff_runs(&args.previous, &args.current)?;
-            write_output(&SerializableDiff::from(&diff), &args.output)?;
+            write_output(&diff, &args.output)?;
         }
     }
     Ok(CommandOutcome::Passed)
@@ -494,10 +493,15 @@ async fn run_serve(config: Config, args: ServeArgs) -> Result<CommandOutcome> {
     if args.once {
         bail!("serve does not support --once; use monitor --once for bounded execution");
     }
-    let store = Store::open(&config.database_path)?;
+    let store = open_store(&config)?;
     let state =
         hooray::api::ApiState::new(store, config.clone()).context("failed to initialize API")?;
-    hooray::api::serve(config.api_bind, state, hooray::api::shutdown_signal()).await?;
+    let shutdown =
+        hooray::api::shutdown_signal().context("failed to register shutdown signal handlers")?;
+    let listener = tokio::net::TcpListener::bind(config.api_bind)
+        .await
+        .with_context(|| format!("failed to bind {}", config.api_bind))?;
+    hooray::api::serve(listener, state, shutdown).await?;
     Ok(CommandOutcome::Passed)
 }
 
@@ -556,19 +560,12 @@ fn run_monitor_targets(config: &Config, args: MonitorTargetsArgs) -> Result<Comm
     let mut store = open_store(config)?;
     match args.command {
         MonitorTargetsCommand::Add(args) => {
-            let now = encode_time(Utc::now().timestamp());
-            let target = MonitorTarget {
-                target_id: args.target_id,
-                source: args.source,
-                interval_seconds: args.interval_seconds,
-                next_due_at: now.clone(),
-                source_fingerprint: None,
-                inventory: None,
-                advisory_digest: None,
-                policy_digest: None,
-                finding_ids: Vec::new(),
-                updated_at: now,
-            };
+            let target = MonitorTarget::new(
+                args.target_id,
+                args.source,
+                args.interval_seconds,
+                Utc::now().timestamp(),
+            )?;
             store.add_monitor_target(&target)?;
             println!("added monitor target '{}'", target.target_id);
         }
@@ -605,11 +602,11 @@ fn render_monitor_targets_table(targets: &[MonitorTarget]) -> String {
         .iter()
         .map(|target| {
             [
-                target.target_id.clone(),
-                target.source.clone(),
+                sanitize_cell_text(&target.target_id),
+                sanitize_cell_text(&target.source),
                 target.interval_seconds.to_string(),
-                target.next_due_at.clone(),
-                target.updated_at.clone(),
+                sanitize_cell_text(&target.next_due_at),
+                sanitize_cell_text(&target.updated_at),
             ]
         })
         .collect();
@@ -694,50 +691,56 @@ impl MonitorRunner for CliMonitorRunner {
             use sha2::{Digest, Sha256};
             use walkdir::WalkDir;
 
-            let root = Path::new(&target.source);
-            let metadata = std::fs::symlink_metadata(root)
-                .map_err(|error| MonitorError::Runner(error.to_string()))?;
-            let mut paths = if metadata.is_file() {
-                vec![root.to_owned()]
-            } else {
-                WalkDir::new(root)
-                    .follow_links(false)
-                    .sort_by_file_name()
-                    .into_iter()
-                    .filter_map(|entry| match entry {
-                        Err(error) => Some(Err(error)),
-                        Ok(entry) if entry.file_type().is_file() => Some(Ok(entry.into_path())),
-                        Ok(_) => None,
-                    })
-                    .take(self.config.max_archive_entries)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        MonitorError::Runner(format!(
-                            "failed to walk source '{}': {error}",
-                            root.display()
-                        ))
-                    })?
-            };
-            paths.sort();
-            let mut digest = Sha256::new();
-            let mut total = 0_u64;
-            for path in paths {
-                let relative = path.strip_prefix(root).unwrap_or(&path);
-                digest.update(relative.as_os_str().as_encoded_bytes());
-                // Bound enforced during the read (mirrors StdinFile::take) so
-                // an oversized file never allocates fully before rejection.
-                let bytes = read_bounded(&path, self.config.max_input_bytes)
+            let root = PathBuf::from(target.source.as_str());
+            let max_input_bytes = self.config.max_input_bytes;
+            let max_archive_entries = self.config.max_archive_entries;
+            tokio::task::spawn_blocking(move || -> Result<String, MonitorError> {
+                let metadata = std::fs::symlink_metadata(&root)
                     .map_err(|error| MonitorError::Runner(error.to_string()))?;
-                total = total.saturating_add(bytes.len() as u64);
-                if total > self.config.max_input_bytes {
-                    return Err(MonitorError::Runner(
-                        "source fingerprint exceeds configured input bound".into(),
-                    ));
+                let mut paths = if metadata.is_file() {
+                    vec![root.clone()]
+                } else {
+                    WalkDir::new(&root)
+                        .follow_links(false)
+                        .sort_by_file_name()
+                        .into_iter()
+                        .filter_map(|entry| match entry {
+                            Err(error) => Some(Err(error)),
+                            Ok(entry) if entry.file_type().is_file() => Some(Ok(entry.into_path())),
+                            Ok(_) => None,
+                        })
+                        .take(max_archive_entries)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| {
+                            MonitorError::Runner(format!(
+                                "failed to walk source '{}': {error}",
+                                root.display()
+                            ))
+                        })?
+                };
+                paths.sort();
+                let mut digest = Sha256::new();
+                let mut total = 0_u64;
+                for path in paths {
+                    let relative = path.strip_prefix(&root).unwrap_or(&path);
+                    digest.update(relative.as_os_str().as_encoded_bytes());
+                    // Bound enforced during the read (mirrors StdinFile::take) so
+                    // an oversized file never allocates fully before rejection.
+                    let bytes = read_bounded(&path, max_input_bytes)
+                        .map_err(|error| MonitorError::Runner(error.to_string()))?;
+                    total = total.saturating_add(bytes.len() as u64);
+                    if total > max_input_bytes {
+                        return Err(MonitorError::Runner(
+                            "source fingerprint exceeds configured input bound".into(),
+                        ));
+                    }
+                    digest.update((bytes.len() as u64).to_le_bytes());
+                    digest.update(bytes);
                 }
-                digest.update((bytes.len() as u64).to_le_bytes());
-                digest.update(bytes);
-            }
-            Ok(format!("{:x}", digest.finalize()))
+                Ok(format!("{:x}", digest.finalize()))
+            })
+            .await
+            .map_err(|_| MonitorError::Runner("source fingerprint task was cancelled".into()))?
         })
     }
 
@@ -801,6 +804,11 @@ impl WebhookNotifier {
         let generator = IntegrationGenerator::new(IntegrationLimits::default())
             .context("invalid webhook integration limits")?;
         let http = reqwest::Client::builder()
+            // Signed webhook headers and payload must never replay to a
+            // redirect target: reqwest's default follows up to 10 hops,
+            // including https->http downgrades, stripping only
+            // Authorization/Cookie-class headers.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(config.osv_connect_timeout_secs))
             .timeout(Duration::from_secs(config.osv_request_timeout_secs))
             .build()
@@ -912,31 +920,45 @@ fn write_output<T: Serialize>(value: &T, args: &OutputArgs) -> Result<()> {
     if !matches!(args.format, OutputFormat::Json | OutputFormat::Yaml) {
         bail!("this command supports only json and yaml output");
     }
-    let mut writer: Box<dyn Write> = if args.output == Path::new("-") {
-        Box::new(io::stdout().lock())
+    let mut bytes = if args.format == OutputFormat::Json {
+        serde_json::to_vec_pretty(value)?
     } else {
-        Box::new(
-            File::create(&args.output)
-                .with_context(|| format!("failed to create {}", args.output.display()))?,
-        )
+        serde_yaml::to_string(value)?.into_bytes()
     };
-    if args.format == OutputFormat::Json {
-        serde_json::to_writer_pretty(&mut writer, value)?;
-    } else {
-        serde_yaml::to_writer(&mut writer, value)?;
-    }
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    Ok(())
+    bytes.push(b'\n');
+    write_bytes(&bytes, &args.output)
 }
 
 fn write_bytes(bytes: &[u8], path: &Path) -> Result<()> {
     if path == Path::new("-") {
         io::stdout().lock().write_all(bytes)?;
     } else {
-        std::fs::write(path, bytes)
+        // Open in place rather than temp-file-plus-rename: rename swaps the
+        // directory entry itself, which breaks outputs bound to devices or
+        // bind mounts such as /dev/null.
+        write_in_place(bytes, path)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
+    Ok(())
+}
+
+/// Creates or truncates `path` and writes `bytes` in place.
+///
+/// On unix the open refuses a symlink at the final path component
+/// (`O_NOFOLLOW`) so planted links cannot redirect report output elsewhere,
+/// while regular-file overwrite keeps working. Other platforms keep plain
+/// create/truncate semantics: creating symlinks there already requires
+/// elevated privileges.
+fn write_in_place(bytes: &[u8], path: &Path) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
     Ok(())
 }
 
@@ -970,22 +992,6 @@ impl StdinFile {
 impl Drop for StdinFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-#[derive(Serialize)]
-struct SerializableDiff<'a> {
-    introduced: &'a [FindingId],
-    resolved: &'a [FindingId],
-    unchanged: &'a [FindingId],
-}
-impl<'a> From<&'a ReportDiff> for SerializableDiff<'a> {
-    fn from(diff: &'a ReportDiff) -> Self {
-        Self {
-            introduced: &diff.introduced,
-            resolved: &diff.resolved,
-            unchanged: &diff.unchanged,
-        }
     }
 }
 
@@ -2110,20 +2116,6 @@ mod tests {
     }
 
     #[test]
-    fn encoded_monitor_times_match_monitor_storage_format() {
-        // Registered targets stay decodable by the monitor service and sort
-        // chronologically as text because both sides share
-        // monitor::encode_time for store timestamps.
-        assert_eq!(encode_time(0), "09223372036854775808");
-        let epoch = 1_700_000_000_i64;
-        assert_eq!(
-            encode_time(epoch),
-            format!("{:020}", epoch as u64 ^ (1_u64 << 63))
-        );
-        assert!(encode_time(2) > encode_time(1));
-    }
-
-    #[test]
     fn monitor_targets_table_renders_empty_state_and_deterministic_rows() {
         let empty = render_monitor_targets_table(&[]);
         assert_eq!(
@@ -2171,5 +2163,33 @@ mod tests {
         for line in lines.iter().skip(1) {
             assert!(!line.ends_with(' '), "no trailing padding: {line}");
         }
+    }
+
+    #[test]
+    fn monitor_targets_table_replaces_control_characters_in_cells() {
+        let targets = vec![MonitorTarget {
+            target_id: "id\u{1b}[31m".into(),
+            source: "repo\ninjected".into(),
+            interval_seconds: 60,
+            next_due_at: "d\u{7}1".into(),
+            source_fingerprint: None,
+            inventory: None,
+            advisory_digest: None,
+            policy_digest: None,
+            finding_ids: Vec::new(),
+            updated_at: "u\t1".into(),
+        }];
+        let rendered = render_monitor_targets_table(&targets);
+        assert!(
+            rendered
+                .chars()
+                .filter(|character| character.is_control())
+                .all(|character| character == '\n'),
+            "control characters must not survive into table cells: {rendered:?}"
+        );
+        assert!(rendered.contains("id [31m"));
+        assert!(rendered.contains("repo injected"));
+        assert!(rendered.contains("d 1"));
+        assert!(rendered.contains("u 1"));
     }
 }

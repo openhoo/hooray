@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -13,6 +19,10 @@ pub const MAX_ERROR_BYTES: usize = 2048;
 pub const MAX_DUE_TARGETS: usize = 10_000;
 pub const MAX_DUE_EVENTS: usize = 10_000;
 pub const MAX_BACKOFF_SECONDS: i64 = 86_400;
+/// Lease granted to claimed events while a delivery batch runs; sized to a
+/// realistic delivery-batch duration instead of the retry backoff ceiling,
+/// because `save_event` restamps the lease on every attempt.
+pub const MONITOR_EVENT_LEASE_SECONDS: i64 = 300;
 pub type MonitorFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +267,8 @@ pub enum MonitorError {
     InvalidRetryPolicy(&'static str),
     #[error("monitor persistence failed: {0}")]
     Persistence(String),
+    #[error("store operation failed")]
+    Store(#[from] crate::store::StoreError),
     #[error("monitor runner failed: {0}")]
     Runner(String),
     #[error("monitor notifier failed")]
@@ -504,7 +516,7 @@ fn event_from_store(event: crate::store::MonitorEvent) -> Result<AlertEvent, Mon
     })
 }
 
-pub fn encode_time(timestamp: i64) -> String {
+pub(crate) fn encode_time(timestamp: i64) -> String {
     format!("{:020}", (timestamp as u64) ^ (1_u64 << 63))
 }
 
@@ -516,11 +528,11 @@ fn decode_time(field: &'static str, value: &str) -> Result<i64, MonitorError> {
 }
 
 fn store_error(error: crate::store::StoreError) -> MonitorError {
-    MonitorError::Persistence(error.to_string())
+    MonitorError::Store(error)
 }
 
 fn json_error(error: serde_json::Error) -> MonitorError {
-    MonitorError::Persistence(error.to_string())
+    MonitorError::Store(crate::store::StoreError::Serialization(error))
 }
 
 pub struct MonitorService<R, C, W, N> {
@@ -529,6 +541,10 @@ pub struct MonitorService<R, C, W, N> {
     runner: Arc<W>,
     notifier: Arc<N>,
     config: MonitorConfig,
+    /// Consecutive per-target failure counts keyed by target id; drives the
+    /// escalating retry delay. Session-local: restarting the process clears
+    /// every streak.
+    failure_streaks: HashMap<String, u32>,
 }
 
 impl<R, C, W, N> MonitorService<R, C, W, N>
@@ -552,12 +568,42 @@ where
             runner,
             notifier,
             config,
+            failure_streaks: HashMap::new(),
         })
     }
 
     #[cfg(test)]
     pub fn repository(&self) -> &R {
         &self.repository
+    }
+
+    /// Records one failed target cycle: pushes the redacted failure, schedules
+    /// the retry after an escalating delay (the consecutive-failure streak fed
+    /// through [`RetryPolicy::delay_after`], which caps it at the retry
+    /// policy's `max_backoff_seconds`), stamps and saves the target. A
+    /// persistence failure of that [`MonitorRepository::save_target`] call
+    /// aborts the cycle fail-fast (the supervisor restarts and re-runs it);
+    /// deferring a failure to keep the cycle alive applies only to event
+    /// saves, which delivery collects via `first_save_error`.
+    fn reschedule_target(
+        &mut self,
+        target: &mut MonitorTarget,
+        error: &str,
+        now: i64,
+        summary: &mut RunSummary,
+    ) -> Result<(), MonitorError> {
+        let streak = {
+            let entry = self.failure_streaks.entry(target.id.clone()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        summary.target_failures.push(TargetFailure {
+            target_id: target.id.clone(),
+            error: redact_error(error),
+        });
+        target.next_due_at = now.saturating_add(self.config.retry.delay_after(streak));
+        target.updated_at = now;
+        self.repository.save_target(target)
     }
 
     pub async fn run_once(&mut self) -> Result<RunSummary, MonitorError> {
@@ -583,30 +629,19 @@ where
             if let Err(error) = target.validate() {
                 // A stored target that no longer validates (for example an
                 // out-of-range interval registered before ingress validation
-                // existed) must not abort the whole cycle: reschedule it like
-                // other per-target failures so remaining targets, delivery,
-                // and pruning still proceed instead of starving forever.
-                summary.target_failures.push(TargetFailure {
-                    target_id: target.id.clone(),
-                    error: redact_error(&error.to_string()),
-                });
-                target.next_due_at = now.saturating_add(self.config.retry.initial_backoff_seconds);
-                target.updated_at = now;
-                self.repository.save_target(&target)?;
+                // existed) is downgraded to a rescheduled per-target failure
+                // so the remaining targets still get processed instead of
+                // starving forever. Only a persistence failure while saving
+                // that reschedule aborts the cycle fail-fast (supervisor
+                // restarts); event-save failures alone are deferred.
+                self.reschedule_target(&mut target, &error.to_string(), now, &mut summary)?;
                 continue;
             }
             summary.targets_considered += 1;
             let fingerprint = match self.runner.source_fingerprint(&target).await {
                 Ok(fingerprint) => fingerprint,
                 Err(error) => {
-                    summary.target_failures.push(TargetFailure {
-                        target_id: target.id.clone(),
-                        error: redact_error(&error.to_string()),
-                    });
-                    target.next_due_at =
-                        now.saturating_add(self.config.retry.initial_backoff_seconds);
-                    target.updated_at = now;
-                    self.repository.save_target(&target)?;
+                    self.reschedule_target(&mut target, &error.to_string(), now, &mut summary)?;
                     continue;
                 }
             };
@@ -665,14 +700,7 @@ where
                         evaluation.inventory
                     }
                     Err(error) => {
-                        summary.target_failures.push(TargetFailure {
-                            target_id: target.id.clone(),
-                            error: redact_error(&error.to_string()),
-                        });
-                        target.next_due_at =
-                            now.saturating_add(self.config.retry.initial_backoff_seconds);
-                        target.updated_at = now;
-                        self.repository.save_target(&target)?;
+                        self.reschedule_target(&mut target, &error.to_string(), now, &mut summary)?;
                         continue;
                     }
                 }
@@ -682,6 +710,10 @@ where
                 unreachable!("inventory absence is handled by the evaluation branch")
             };
 
+            // A clean cycle clears the target's failure streak so the next
+            // failure restarts at the initial backoff. Streaks never persist
+            // beyond this service instance.
+            self.failure_streaks.remove(&target.id);
             target.inventory = Some(inventory);
             target.source_fingerprint = Some(fingerprint);
             target.advisory_digest = Some(advisory_digest.clone());
@@ -732,12 +764,13 @@ where
         now: i64,
         summary: &mut RunSummary,
     ) -> Result<(), MonitorError> {
-        let lease_until = now.saturating_add(self.config.retry.max_backoff_seconds);
+        let lease_until = now.saturating_add(MONITOR_EVENT_LEASE_SECONDS);
         let mut events =
             self.repository
                 .claim_events(now, lease_until, self.config.event_batch_size)?;
         events
             .sort_by(|left, right| (left.created_at, &left.id).cmp(&(right.created_at, &right.id)));
+        let mut first_save_error: Option<MonitorError> = None;
         for mut event in events {
             if event.delivered_at.is_some() || event.dead_lettered_at.is_some() {
                 continue;
@@ -763,9 +796,16 @@ where
                     }
                 }
             }
-            self.repository.save_event(&event)?;
+            if let Err(error) = self.repository.save_event(&event) {
+                // A failed save must not abort the batch: keep delivering the
+                // remaining claimed events and surface the first error after.
+                first_save_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        match first_save_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -849,6 +889,20 @@ mod tests {
 
     use super::*;
     use crate::model::{Asset, AssetId, AssetKind};
+
+    #[test]
+    fn encoded_monitor_times_match_monitor_storage_format() {
+        // Registered targets stay decodable by the monitor service and sort
+        // chronologically as text because both sides share
+        // monitor::encode_time for store timestamps.
+        assert_eq!(encode_time(0), "09223372036854775808");
+        let epoch = 1_700_000_000_i64;
+        assert_eq!(
+            encode_time(epoch),
+            format!("{:020}", epoch as u64 ^ (1_u64 << 63))
+        );
+        assert!(encode_time(2) > encode_time(1));
+    }
 
     #[derive(Default)]
     struct MemoryRepository {
@@ -1010,6 +1064,55 @@ mod tests {
         }
         fn prune_before(&mut self, _: i64) -> Result<usize, MonitorError> {
             Ok(0)
+        }
+    }
+
+    /// Delegates to [`MemoryRepository`] but fails the first N `save_event`
+    /// calls, simulating a persistence error mid-delivery-batch.
+    #[derive(Default)]
+    struct FirstSaveEventFailsRepository {
+        inner: MemoryRepository,
+        remaining_save_failures: u32,
+    }
+    impl MonitorRepository for FirstSaveEventFailsRepository {
+        fn advisory_cursor(&mut self) -> Result<AdvisoryCursor, MonitorError> {
+            self.inner.advisory_cursor()
+        }
+        fn save_advisory_cursor(&mut self, cursor: &AdvisoryCursor) -> Result<(), MonitorError> {
+            self.inner.save_advisory_cursor(cursor)
+        }
+        fn due_targets(
+            &mut self,
+            now: i64,
+            limit: usize,
+        ) -> Result<Vec<MonitorTarget>, MonitorError> {
+            self.inner.due_targets(now, limit)
+        }
+        fn save_target(&mut self, target: &MonitorTarget) -> Result<(), MonitorError> {
+            self.inner.save_target(target)
+        }
+        fn enqueue_event(&mut self, event: &AlertEvent) -> Result<bool, MonitorError> {
+            self.inner.enqueue_event(event)
+        }
+        fn claim_events(
+            &mut self,
+            now: i64,
+            lease_until: i64,
+            limit: usize,
+        ) -> Result<Vec<AlertEvent>, MonitorError> {
+            self.inner.claim_events(now, lease_until, limit)
+        }
+        fn save_event(&mut self, event: &AlertEvent) -> Result<(), MonitorError> {
+            if self.remaining_save_failures > 0 {
+                self.remaining_save_failures -= 1;
+                let error =
+                    crate::store::StoreError::InvalidMonitorData("event save failed".to_owned());
+                return Err(MonitorError::Store(error));
+            }
+            self.inner.save_event(event)
+        }
+        fn prune_before(&mut self, cutoff: i64) -> Result<usize, MonitorError> {
+            self.inner.prune_before(cutoff)
         }
     }
 
@@ -1294,8 +1397,70 @@ mod tests {
             second.target_failures[0].error,
             "monitor runner failed: evaluation exploded password=[REDACTED]"
         );
-        assert_eq!(service.repository().targets["target"].next_due_at, 115);
+        // Second consecutive failure escalates: delay_after(2) = 2x initial.
+        assert_eq!(service.repository().targets["target"].next_due_at, 120);
     }
+    #[tokio::test]
+    async fn consecutive_target_failures_escalate_the_retry_delay() {
+        let mut repository = MemoryRepository::default();
+        repository.targets.insert("target".into(), target(100));
+        let clock = Arc::new(FakeClock::new(100));
+        let runner = Arc::new(FakeRunner::new());
+        let mut service = service(
+            repository,
+            clock.clone(),
+            runner.clone(),
+            Arc::new(FakeNotifier::succeeding()),
+            RetryPolicy {
+                max_attempts: 3,
+                initial_backoff_seconds: 10,
+                max_backoff_seconds: 40,
+            },
+        );
+        *runner.fingerprint_error.lock().unwrap() = Some("source unreachable".into());
+        // Delays escalate 10 -> 20 -> 40 and cap at max_backoff_seconds.
+        for expected in [110, 130, 170, 210] {
+            let summary = service.run_once().await.unwrap();
+            assert_eq!(summary.target_failures.len(), 1);
+            assert_eq!(service.repository().targets["target"].next_due_at, expected);
+            clock.set(expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_cycle_resets_the_failure_streak() {
+        let mut repository = MemoryRepository::default();
+        repository.targets.insert("target".into(), target(100));
+        let clock = Arc::new(FakeClock::new(100));
+        let runner = Arc::new(FakeRunner::new());
+        let mut service = service(
+            repository,
+            clock.clone(),
+            runner.clone(),
+            Arc::new(FakeNotifier::succeeding()),
+            RetryPolicy {
+                max_attempts: 3,
+                initial_backoff_seconds: 10,
+                max_backoff_seconds: 40,
+            },
+        );
+        *runner.fingerprint_error.lock().unwrap() = Some("source unreachable".into());
+        service.run_once().await.unwrap();
+        assert_eq!(service.repository().targets["target"].next_due_at, 110);
+
+        *runner.fingerprint_error.lock().unwrap() = None;
+        clock.set(110);
+        service.run_once().await.unwrap();
+        assert_eq!(service.repository().targets["target"].next_due_at, 120);
+
+        *runner.fingerprint_error.lock().unwrap() = Some("source unreachable".into());
+        clock.set(120);
+        service.run_once().await.unwrap();
+        // The streak restarted after success, so this failure delays by
+        // initial_backoff_seconds again instead of the escalated 20.
+        assert_eq!(service.repository().targets["target"].next_due_at, 130);
+    }
+
     #[tokio::test]
     async fn daemon_survives_transient_cycle_failures_and_retries() {
         let clock = Arc::new(YieldClock {
@@ -1516,6 +1681,62 @@ mod tests {
         assert_eq!(stored.dead_lettered_at, Some(125));
         assert_eq!(stored.last_error.as_deref(), Some("final"));
         assert_eq!(stored.dedupe_key, dedupe_key);
+    }
+
+    #[tokio::test]
+    async fn event_save_failure_does_not_abort_the_delivery_batch() {
+        let mut repository = FirstSaveEventFailsRepository::default();
+        for (id, created_at) in [("event-first", 1), ("event-second", 2)] {
+            repository.inner.events.insert(
+                id.into(),
+                AlertEvent {
+                    id: id.into(),
+                    dedupe_key: id.into(),
+                    target_id: "target".into(),
+                    payload: AlertPayload {
+                        target_id: "target".into(),
+                        evaluated_at: 0,
+                        source_fingerprint: "s".into(),
+                        advisory_digest: "a".into(),
+                        policy_digest: "p".into(),
+                        diff: FindingDiff {
+                            introduced: vec![],
+                            resolved: vec![],
+                            unchanged: vec![],
+                        },
+                    },
+                    created_at,
+                    attempts: 0,
+                    next_attempt_at: 0,
+                    delivered_at: None,
+                    dead_lettered_at: None,
+                    last_error: None,
+                },
+            );
+        }
+        repository.remaining_save_failures = 1;
+        let notifier = Arc::new(FakeNotifier::succeeding());
+        let mut service = MonitorService::new(
+            repository,
+            Arc::new(FakeClock::new(100)),
+            Arc::new(FakeRunner::new()),
+            notifier.clone(),
+            MonitorConfig::default(),
+        )
+        .unwrap();
+
+        let result = service.run_once().await;
+        assert!(matches!(
+            result,
+            Err(MonitorError::Store(
+                crate::store::StoreError::InvalidMonitorData(message)
+            )) if message == "event save failed"
+        ));
+        // The second claimed event was still notified and persisted.
+        assert_eq!(notifier.calls.load(Ordering::SeqCst), 2);
+        let events = &service.repository().inner.events;
+        assert_eq!(events["event-second"].delivered_at, Some(100));
+        assert_eq!(events["event-first"].delivered_at, None);
     }
 
     #[tokio::test]

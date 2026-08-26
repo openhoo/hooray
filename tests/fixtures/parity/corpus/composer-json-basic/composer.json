@@ -1,0 +1,17 @@
+{
+    "name": "acme/demo-app",
+    "description": "Demo PHP application with legacy pinned dependencies",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=7.2.5",
+        "guzzlehttp/guzzle": "6.5.0",
+        "symfony/console": "^4.4"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^8.5"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

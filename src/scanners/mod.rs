@@ -20,6 +20,15 @@ use crate::model::{
 };
 use crate::util::sha256_hex;
 
+mod sast;
+mod service_config;
+mod spans;
+
+use sast::scan_sast;
+#[cfg(test)]
+use sast::yaml_call_specifies_loader;
+use service_config::scan_service_config;
+
 const SECRET_ALLOWLIST_MARKERS: &[&str] = &[
     "hooray:allow-secret",
     "pragma: allowlist secret",
@@ -29,6 +38,8 @@ const SECRET_ALLOWLIST_MARKERS: &[&str] = &[
 const MAX_TEXT_LINE_BYTES: usize = 64 * 1024;
 const ARCHIVE_RATIO_LIMIT: u64 = 100;
 const ARCHIVE_ENTRY_SIZE_LIMIT: u64 = 512 * 1024 * 1024;
+const PARALLEL_MIN_FILES: usize = 32;
+const PARALLEL_MIN_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -88,24 +99,28 @@ pub struct ScanOutput {
     pub findings: Vec<Finding>,
     pub scanned_files: usize,
     pub scanned_bytes: u64,
+    /// Files rejected during admission; a LOWER BOUND once the walk's max_files cap trips (surplus entries are never enumerated).
     pub skipped_files: usize,
 }
 
 #[derive(Debug, Error)]
 pub enum ScanError {
-    #[error("cannot inspect '{path}': {source}")]
+    #[error("cannot inspect '{path}'")]
     Metadata {
         path: PathBuf,
+        #[source]
         source: std::io::Error,
     },
-    #[error("cannot read '{path}': {source}")]
+    #[error("cannot read '{path}'")]
     Read {
         path: PathBuf,
+        #[source]
         source: std::io::Error,
     },
-    #[error("filesystem traversal failed at '{path}': {source}")]
+    #[error("filesystem traversal failed at '{path}'")]
     Walk {
         path: PathBuf,
+        #[source]
         source: walkdir::Error,
     },
     #[error("scan root '{0}' is neither a regular file nor a directory")]
@@ -158,6 +173,7 @@ pub fn scan_path(
             if entry.file_type().is_file() {
                 paths.push(entry.into_path());
                 if paths.len() > config.max_files {
+                    // Sentinel early-exit stops enumeration at the cap; skipped_files is therefore only a lower bound past this point.
                     break;
                 }
             }
@@ -196,12 +212,12 @@ pub fn scan_path(
         output.scanned_bytes += bytes.len() as u64;
         admitted_bytes += bytes.len() as u64;
         admitted.push((display_path, bytes));
-        if admitted.len() >= 32 || admitted_bytes >= 16 * 1024 * 1024 {
-            analyze_admitted(&mut admitted, &mut output, &ctx);
+        if admitted.len() >= PARALLEL_MIN_FILES || admitted_bytes >= PARALLEL_MIN_BYTES {
+            analyze_admitted(&mut admitted, admitted_bytes, &mut output, &ctx);
             admitted_bytes = 0;
         }
     }
-    analyze_admitted(&mut admitted, &mut output, &ctx);
+    analyze_admitted(&mut admitted, admitted_bytes, &mut output, &ctx);
     output
         .findings
         .sort_by(|left, right| left.id.cmp(&right.id));
@@ -210,6 +226,7 @@ pub fn scan_path(
 
 fn analyze_admitted(
     admitted: &mut Vec<(String, Vec<u8>)>,
+    admitted_bytes: u64,
     output: &mut ScanOutput,
     ctx: &ScanContext<'_>,
 ) {
@@ -217,17 +234,18 @@ fn analyze_admitted(
         return;
     }
     let batch = std::mem::take(admitted);
-    let analyzed: Vec<_> = if batch.len() >= 32 {
-        batch
-            .par_iter()
-            .map(|(path, bytes)| analyze_file(path, bytes, ctx))
-            .collect()
-    } else {
-        batch
-            .iter()
-            .map(|(path, bytes)| analyze_file(path, bytes, ctx))
-            .collect()
-    };
+    let analyzed: Vec<_> =
+        if batch.len() >= PARALLEL_MIN_FILES || admitted_bytes >= PARALLEL_MIN_BYTES {
+            batch
+                .par_iter()
+                .map(|(path, bytes)| analyze_file(path, bytes, ctx))
+                .collect()
+        } else {
+            batch
+                .iter()
+                .map(|(path, bytes)| analyze_file(path, bytes, ctx))
+                .collect()
+        };
     for mut file_output in analyzed {
         output.locations.append(&mut file_output.locations);
         output.findings.append(&mut file_output.findings);
@@ -565,48 +583,56 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
         }
         for secret_rule in SECRET_RULES.iter() {
             for matched in secret_rule.regex.find_iter(line) {
-                add_secret(
-                    builder,
-                    secret_rule.rule,
-                    secret_rule.label,
-                    secret_rule.severity,
-                    line_index,
-                    matched.start(),
-                    matched.as_str(),
-                );
+                let entropy_milli = (shannon_entropy(matched.as_str()) * 1000.0).round() as u64;
+                let site = SecretSite {
+                    label: secret_rule.label,
+                    severity: secret_rule.severity,
+                    line: line_index,
+                    column: matched.start(),
+                    value: matched.as_str(),
+                    entropy_milli,
+                };
+                add_secret(builder, secret_rule.rule, site);
             }
         }
         for captures in SECRET_ASSIGNMENT_REGEX.captures_iter(line) {
             let value = captures.get(2).expect("capture exists");
+            let entropy = shannon_entropy(value.as_str()) * 1000.0;
             if looks_placeholder(value.as_str())
-                || shannon_entropy(value.as_str()) * 1000.0
-                    < f64::from(builder.ctx.config.secret_entropy_threshold_milli)
+                || entropy < f64::from(builder.ctx.config.secret_entropy_threshold_milli)
             {
                 continue;
             }
-            add_secret(
-                builder,
-                "secret.high-entropy-assignment",
-                "high-entropy credential assignment",
-                Severity::High,
-                line_index,
-                value.start(),
-                value.as_str(),
-            );
+            let site = SecretSite {
+                label: "high-entropy credential assignment",
+                severity: Severity::High,
+                line: line_index,
+                column: value.start(),
+                value: value.as_str(),
+                entropy_milli: entropy.round() as u64,
+            };
+            add_secret(builder, "secret.high-entropy-assignment", site);
         }
     }
 }
 
-fn add_secret(
-    builder: &mut FindingBuilder<'_>,
-    rule: &str,
-    label: &str,
+struct SecretSite<'a> {
+    label: &'a str,
     severity: Severity,
     line: usize,
     column: usize,
-    value: &str,
-) {
-    let entropy_milli = (shannon_entropy(value) * 1000.0).round() as u64;
+    value: &'a str,
+    entropy_milli: u64,
+}
+fn add_secret(builder: &mut FindingBuilder<'_>, rule: &str, site: SecretSite<'_>) {
+    let SecretSite {
+        label,
+        severity,
+        line,
+        column,
+        value,
+        entropy_milli,
+    } = site;
     let mut properties = BTreeMap::new();
     properties.insert(
         "fingerprint_sha256".to_owned(),
@@ -957,6 +983,66 @@ struct StructuredIacRule<'a> {
     cwe: &'a str,
 }
 
+/// Boolean-field predicates supported by the table-driven Kubernetes checks.
+#[derive(Clone, Copy)]
+enum KubernetesIacPredicate {
+    /// Fires only when the field is present and set to true.
+    IsTrue,
+    /// Fires unless the field is explicitly set to false.
+    IsNotFalse,
+}
+
+/// One table row: the boolean field to inspect, when the check fires, and
+/// the finding to emit.
+struct KubernetesIacCheck {
+    field: &'static str,
+    predicate: KubernetesIacPredicate,
+    rule: StructuredIacRule<'static>,
+}
+
+const KUBERNETES_POD_SPEC_CHECKS: &[KubernetesIacCheck] = &[KubernetesIacCheck {
+    field: "hostNetwork",
+    predicate: KubernetesIacPredicate::IsTrue,
+    rule: StructuredIacRule {
+        anchor: "",
+        needle: "hostNetwork",
+        rule: "iac.kubernetes.host-network",
+        summary: "Kubernetes workload uses the host network",
+        severity: Severity::High,
+        remediation: "Disable hostNetwork unless the workload has a documented, unavoidable requirement.",
+        cwe: "CWE-250",
+    },
+}];
+
+const KUBERNETES_SECURITY_CONTEXT_CHECKS: &[KubernetesIacCheck] = &[
+    KubernetesIacCheck {
+        field: "privileged",
+        predicate: KubernetesIacPredicate::IsTrue,
+        rule: StructuredIacRule {
+            anchor: "",
+            needle: "privileged",
+            rule: "iac.kubernetes.privileged-container",
+            summary: "Kubernetes container is privileged",
+            severity: Severity::Critical,
+            remediation: "Remove privileged mode and grant only narrowly required capabilities.",
+            cwe: "CWE-250",
+        },
+    },
+    KubernetesIacCheck {
+        field: "allowPrivilegeEscalation",
+        predicate: KubernetesIacPredicate::IsNotFalse,
+        rule: StructuredIacRule {
+            anchor: "",
+            needle: "allowPrivilegeEscalation",
+            rule: "iac.kubernetes.privilege-escalation",
+            summary: "Kubernetes container permits privilege escalation",
+            severity: Severity::High,
+            remediation: "Set securityContext.allowPrivilegeEscalation to false.",
+            cwe: "CWE-269",
+        },
+    },
+];
+
 fn scan_kubernetes_value(
     value: &serde_json::Value,
     text: &str,
@@ -968,26 +1054,14 @@ fn scan_kubernetes_value(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     for spec in pod_specs(value) {
-        if spec
-            .pointer("/hostNetwork")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        {
-            add_structured_iac(
-                builder,
-                text,
-                line_starts,
-                StructuredIacRule {
-                    anchor: workload,
-                    needle: "hostNetwork",
-                    rule: "iac.kubernetes.host-network",
-                    summary: "Kubernetes workload uses the host network",
-                    severity: Severity::High,
-                    remediation: "Disable hostNetwork unless the workload has a documented, unavoidable requirement.",
-                    cwe: "CWE-250",
-                },
-            );
-        }
+        run_kubernetes_iac_checks(
+            KUBERNETES_POD_SPEC_CHECKS,
+            spec,
+            workload,
+            text,
+            line_starts,
+            builder,
+        );
         for container in spec
             .get("containers")
             .and_then(serde_json::Value::as_array)
@@ -1001,46 +1075,44 @@ fn scan_kubernetes_value(
             let security = container
                 .get("securityContext")
                 .unwrap_or(&serde_json::Value::Null);
-            if security
-                .get("privileged")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
-                add_structured_iac(
-                    builder,
-                    text,
-                    line_starts,
-                    StructuredIacRule {
-                        anchor: name,
-                        needle: "privileged",
-                        rule: "iac.kubernetes.privileged-container",
-                        summary: "Kubernetes container is privileged",
-                        severity: Severity::Critical,
-                        remediation: "Remove privileged mode and grant only narrowly required capabilities.",
-                        cwe: "CWE-250",
-                    },
-                );
-            }
-            if security
-                .get("allowPrivilegeEscalation")
-                .and_then(serde_json::Value::as_bool)
-                != Some(false)
-            {
-                add_structured_iac(
-                    builder,
-                    text,
-                    line_starts,
-                    StructuredIacRule {
-                        anchor: name,
-                        needle: "allowPrivilegeEscalation",
-                        rule: "iac.kubernetes.privilege-escalation",
-                        summary: "Kubernetes container permits privilege escalation",
-                        severity: Severity::High,
-                        remediation: "Set securityContext.allowPrivilegeEscalation to false.",
-                        cwe: "CWE-269",
-                    },
-                );
-            }
+            run_kubernetes_iac_checks(
+                KUBERNETES_SECURITY_CONTEXT_CHECKS,
+                security,
+                name,
+                text,
+                line_starts,
+                builder,
+            );
+        }
+    }
+}
+
+/// Applies every check from `checks` against `fields`, emitting each rule
+/// whose predicate holds.
+fn run_kubernetes_iac_checks(
+    checks: &[KubernetesIacCheck],
+    fields: &serde_json::Value,
+    anchor: &str,
+    text: &str,
+    line_starts: &[usize],
+    builder: &mut FindingBuilder<'_>,
+) {
+    for check in checks {
+        let observed = fields.get(check.field).and_then(serde_json::Value::as_bool);
+        let fires = match check.predicate {
+            KubernetesIacPredicate::IsTrue => observed == Some(true),
+            KubernetesIacPredicate::IsNotFalse => observed != Some(false),
+        };
+        if fires {
+            add_structured_iac(
+                builder,
+                text,
+                line_starts,
+                StructuredIacRule {
+                    anchor,
+                    ..check.rule
+                },
+            );
         }
     }
 }
@@ -1155,990 +1227,6 @@ fn find_structured_scalar(text: &str, value: &str) -> Option<usize> {
                 })
                 .find_map(|(offset, line)| line.find(value).map(|column| offset + column))
         })
-}
-
-const WEAK_TLS_PROTOCOL_TOKENS: &[&str] = &["sslv2", "sslv3", "tlsv1", "tlsv1.0", "tlsv1.1"];
-
-struct ServiceConfigRule<'a> {
-    rule: &'a str,
-    summary: &'a str,
-    details: &'a str,
-    remediation: &'a str,
-    severity: Severity,
-    cwe: &'a str,
-    references: &'a [&'a str],
-}
-
-fn add_service_finding(
-    builder: &mut FindingBuilder<'_>,
-    rule: &ServiceConfigRule<'_>,
-    description: String,
-    line: u32,
-    column: u32,
-) {
-    builder.add(FindingSpec {
-        kind: FindingKind::Iac,
-        rule: rule.rule,
-        line,
-        column,
-        summary: rule.summary,
-        details: rule.details,
-        severity: rule.severity,
-        confidence: Confidence::High,
-        description,
-        references: rule.references,
-        properties: BTreeMap::new(),
-        redacted: false,
-        remediation: rule.remediation,
-        cwe: Some(rule.cwe),
-    });
-}
-
-fn scan_service_config(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
-    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-    let nginx_conf =
-        name == "nginx.conf" || (name.starts_with("nginx.") && name.ends_with(".conf"));
-    if nginx_conf {
-        scan_directive_config(text, builder, NGINX_CHECKS);
-    }
-    if name.ends_with(".conf")
-        && !nginx_conf
-        && !matches!(
-            name.as_str(),
-            "pg_hba.conf" | "postgresql.conf" | "redis.conf"
-        )
-    {
-        scan_directive_config(text, builder, APACHE_CHECKS);
-    }
-    match name.as_str() {
-        "pg_hba.conf" => scan_directive_config(text, builder, PG_HBA_CHECKS),
-        "postgresql.conf" => scan_key_value_config(text, builder, POSTGRESQL_CHECKS),
-        "redis.conf" => scan_key_value_config(text, builder, REDIS_CHECKS),
-        "sshd_config" => scan_directive_config(text, builder, SSHD_CHECKS),
-        _ => {}
-    }
-}
-
-fn config_lines(text: &str) -> impl Iterator<Item = (u32, usize, &str)> {
-    let mut offset = 0_usize;
-    text.lines().enumerate().map(move |(index, line)| {
-        let start = offset;
-        offset += line.len() + 1;
-        (index as u32 + 1, start, line)
-    })
-}
-
-fn effective_config_line(line: &str) -> &str {
-    line.split_once('#').map_or(line, |(code, _)| code).trim()
-}
-
-fn split_config_directive(line: &str) -> Option<(&str, &str)> {
-    line.split_once(char::is_whitespace)
-}
-
-fn directive_column(line: &str) -> u32 {
-    u32::try_from(line.len() - line.trim_start().len())
-        .unwrap_or(u32::MAX)
-        .saturating_add(1)
-}
-
-fn argument_tokens(arguments: &str) -> impl Iterator<Item = &str> {
-    arguments
-        .split(|character: char| character.is_whitespace() || character == ',' || character == ';')
-        .filter(|token| !token.is_empty())
-}
-
-fn is_weak_protocol_token(token: &str) -> bool {
-    let normalized = token.trim_matches(['+', '-']);
-    WEAK_TLS_PROTOCOL_TOKENS
-        .iter()
-        .any(|weak| normalized.eq_ignore_ascii_case(weak))
-}
-
-fn enables_weak_protocol(token: &str) -> bool {
-    !token.starts_with('-') && is_weak_protocol_token(token)
-}
-
-fn config_assignment(line: &str) -> Option<(&str, &str)> {
-    let content = effective_config_line(line);
-    if content.is_empty() {
-        return None;
-    }
-    let (key, value) = content
-        .split_once('=')
-        .or_else(|| content.split_once(char::is_whitespace))?;
-    let key = key.trim();
-    if key.is_empty() {
-        return None;
-    }
-    Some((key, unquote_config_value(value)))
-}
-
-fn unquote_config_value(value: &str) -> &str {
-    let trimmed = value.trim();
-    let Some(first) = trimmed.chars().next() else {
-        return "";
-    };
-    if (first == '"' || first == '\'')
-        && trimmed.len() >= 2 * first.len_utf8()
-        && trimmed.ends_with(first)
-    {
-        return &trimmed[first.len_utf8()..trimmed.len() - first.len_utf8()];
-    }
-    trimmed
-}
-
-const NGINX_WEAK_TLS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.nginx.weak-tls-protocol",
-    summary: "Nginx enables deprecated TLS protocols",
-    details: "The ssl_protocols directive explicitly lists SSLv2, SSLv3, TLSv1, or TLSv1.1.",
-    remediation: "Restrict ssl_protocols to TLSv1.2 and TLSv1.3.",
-    severity: Severity::High,
-    cwe: "CWE-327",
-    references: &["https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_protocols"],
-};
-
-const NGINX_SERVER_TOKENS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.nginx.server-tokens",
-    summary: "Nginx broadcasts its server version",
-    details: "The server_tokens directive is set to on, exposing the exact version in headers and error pages.",
-    remediation: "Set server_tokens off to reduce fingerprinting.",
-    severity: Severity::Low,
-    cwe: "CWE-200",
-    references: &["https://nginx.org/en/docs/http/ngx_http_core_module.html#server_tokens"],
-};
-
-const APACHE_WEAK_TLS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.apache.weak-tls-protocol",
-    summary: "Apache enables deprecated SSL/TLS protocols",
-    details: "The SSLProtocol directive enables SSLv2, SSLv3, TLSv1, or TLSv1.1.",
-    remediation: "Enable only TLSv1.2 and TLSv1.3 in SSLProtocol.",
-    severity: Severity::High,
-    cwe: "CWE-327",
-    references: &["https://httpd.apache.org/docs/current/mod/mod_ssl.html#sslprotocol"],
-};
-
-const APACHE_SERVER_TOKENS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.apache.server-tokens",
-    summary: "Apache discloses detailed server information",
-    details: "The ServerTokens directive is Full or OS, sending product, version, and OS details in response headers.",
-    remediation: "Set ServerTokens Prod to minimize version disclosure.",
-    severity: Severity::Low,
-    cwe: "CWE-200",
-    references: &["https://httpd.apache.org/docs/current/mod/core.html#servertokens"],
-};
-
-const PG_HBA_TRUST_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.pg-hba.trust-authentication",
-    summary: "PostgreSQL pg_hba entry trusts connections without authentication",
-    details: "A pg_hba.conf record uses the trust auth method, granting access without any credential check.",
-    remediation: "Replace trust with scram-sha-256 or certificate authentication.",
-    severity: Severity::Critical,
-    cwe: "CWE-306",
-    references: &["https://www.postgresql.org/docs/current/auth-pg-hba-conf.html"],
-};
-
-const POSTGRES_SSL_OFF_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.postgres.ssl-disabled",
-    summary: "PostgreSQL accepts unencrypted connections",
-    details: "The ssl setting is off, so client traffic is not encrypted.",
-    remediation: "Enable ssl and require encrypted connections for remote clients.",
-    severity: Severity::High,
-    cwe: "CWE-319",
-    references: &["https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-SSL"],
-};
-
-const POSTGRES_WEAK_PASSWORD_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.postgres.weak-password-encryption",
-    summary: "PostgreSQL stores passwords with a weak scheme",
-    details: "password_encryption is md5 or plain instead of a modern password-based scheme.",
-    remediation: "Set password_encryption to scram-sha-256 and re-set roles to upgrade stored verifiers.",
-    severity: Severity::Medium,
-    cwe: "CWE-916",
-    references: &[
-        "https://www.postgresql.org/docs/current/runtime-config-connection.html#GUC-PASSWORD-ENCRYPTION",
-    ],
-};
-
-const REDIS_PROTECTED_MODE_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.redis.protected-mode-disabled",
-    summary: "Redis protected mode disabled",
-    details: "protected-mode no lets Redis serve external clients even when no authentication is configured.",
-    remediation: "Keep protected-mode yes or configure ACLs and bind addresses before exposing Redis.",
-    severity: Severity::High,
-    cwe: "CWE-306",
-    references: &["https://redis.io/docs/latest/operate/oss_and_mgmt/admin/"],
-};
-
-const REDIS_EMPTY_PASSWORD_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.redis.empty-password",
-    summary: "Redis requirepass configured with an empty password",
-    details: "The requirepass directive is set to an empty quoted string, disabling authentication.",
-    remediation: "Configure a strong requirepass value or ACL users instead of an empty password.",
-    severity: Severity::High,
-    cwe: "CWE-521",
-    references: &["https://redis.io/docs/latest/operate/oss_and_mgmt/admin/"],
-};
-
-const SSHD_ROOT_LOGIN_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.sshd.root-login-permitted",
-    summary: "SSH permits direct root login",
-    details: "PermitRootLogin yes allows logins straight into the root account.",
-    remediation: "Use PermitRootLogin no (or prohibit-password) and escalate via sudo.",
-    severity: Severity::High,
-    cwe: "CWE-250",
-    references: &["https://man.openbsd.org/sshd_config#PermitRootLogin"],
-};
-
-const SSHD_PASSWORD_AUTH_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.sshd.password-authentication",
-    summary: "SSH permits password authentication",
-    details: "PasswordAuthentication yes allows brute-forceable password logins.",
-    remediation: "Require public key authentication.",
-    severity: Severity::Medium,
-    cwe: "CWE-521",
-    references: &["https://man.openbsd.org/sshd_config#PasswordAuthentication"],
-};
-
-const SSHD_PROTOCOL_ONE_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.sshd.protocol-version-1",
-    summary: "SSH protocol version 1 enabled",
-    details: "Protocol 1 enables the deprecated SSHv1 protocol with weak integrity guarantees.",
-    remediation: "Support SSH protocol version 2 only.",
-    severity: Severity::High,
-    cwe: "CWE-327",
-    references: &["https://man.openbsd.org/sshd_config#Protocol"],
-};
-
-const SSHD_EMPTY_PASSWORDS_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
-    rule: "iac.sshd.empty-passwords-permitted",
-    summary: "SSH permits empty passwords",
-    details: "PermitEmptyPasswords yes lets accounts without passwords authenticate.",
-    remediation: "Reject empty passwords with PermitEmptyPasswords no.",
-    severity: Severity::High,
-    cwe: "CWE-521",
-    references: &["https://man.openbsd.org/sshd_config#PermitEmptyPasswords"],
-};
-
-/// One service-config check: the directive keyword (compared
-/// case-insensitively; empty matches any line, used by record-style formats
-/// like pg_hba.conf), a predicate over the directive value, and the finding
-/// metadata to emit when both match. Table order is significant: the first
-/// matching check wins, mirroring the previous per-format if/else chains.
-struct ServiceConfigCheck {
-    directive: &'static str,
-    matches_value: fn(&str) -> bool,
-    rule: &'static ServiceConfigRule<'static>,
-}
-
-static NGINX_CHECKS: &[ServiceConfigCheck] = &[
-    ServiceConfigCheck {
-        directive: "ssl_protocols",
-        matches_value: arguments_contain_weak_protocol,
-        rule: &NGINX_WEAK_TLS_RULE,
-    },
-    ServiceConfigCheck {
-        directive: "server_tokens",
-        matches_value: first_argument_is_on,
-        rule: &NGINX_SERVER_TOKENS_RULE,
-    },
-];
-
-static APACHE_CHECKS: &[ServiceConfigCheck] = &[
-    ServiceConfigCheck {
-        directive: "SSLProtocol",
-        matches_value: arguments_enable_weak_protocol,
-        rule: &APACHE_WEAK_TLS_RULE,
-    },
-    ServiceConfigCheck {
-        directive: "ServerTokens",
-        matches_value: first_argument_is_full_or_os,
-        rule: &APACHE_SERVER_TOKENS_RULE,
-    },
-];
-
-static PG_HBA_CHECKS: &[ServiceConfigCheck] = &[ServiceConfigCheck {
-    directive: "",
-    matches_value: hba_tail_is_trust,
-    rule: &PG_HBA_TRUST_RULE,
-}];
-
-static POSTGRESQL_CHECKS: &[ServiceConfigCheck] = &[
-    ServiceConfigCheck {
-        directive: "ssl",
-        matches_value: value_is_off,
-        rule: &POSTGRES_SSL_OFF_RULE,
-    },
-    ServiceConfigCheck {
-        directive: "password_encryption",
-        matches_value: value_is_md5_or_plain,
-        rule: &POSTGRES_WEAK_PASSWORD_RULE,
-    },
-];
-
-static REDIS_CHECKS: &[ServiceConfigCheck] = &[
-    ServiceConfigCheck {
-        directive: "protected-mode",
-        matches_value: value_is_no,
-        rule: &REDIS_PROTECTED_MODE_RULE,
-    },
-    ServiceConfigCheck {
-        directive: "requirepass",
-        matches_value: str::is_empty,
-        rule: &REDIS_EMPTY_PASSWORD_RULE,
-    },
-];
-
-static SSHD_CHECKS: &[ServiceConfigCheck] = &[
-    ServiceConfigCheck {
-        directive: "PermitRootLogin",
-        matches_value: first_argument_is_yes,
-        rule: &SSHD_ROOT_LOGIN_RULE,
-    },
-    ServiceConfigCheck {
-        directive: "PasswordAuthentication",
-        matches_value: first_argument_is_yes,
-        rule: &SSHD_PASSWORD_AUTH_RULE,
-    },
-    ServiceConfigCheck {
-        directive: "Protocol",
-        matches_value: first_argument_is_protocol_one,
-        rule: &SSHD_PROTOCOL_ONE_RULE,
-    },
-    ServiceConfigCheck {
-        directive: "PermitEmptyPasswords",
-        matches_value: first_argument_is_yes,
-        rule: &SSHD_EMPTY_PASSWORDS_RULE,
-    },
-];
-
-fn first_argument_is(arguments: &str, expected: &str) -> bool {
-    argument_tokens(arguments)
-        .next()
-        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
-}
-
-fn first_argument_is_on(arguments: &str) -> bool {
-    first_argument_is(arguments, "on")
-}
-
-fn first_argument_is_full_or_os(arguments: &str) -> bool {
-    first_argument_is(arguments, "full") || first_argument_is(arguments, "os")
-}
-
-fn first_argument_is_yes(arguments: &str) -> bool {
-    first_argument_is(arguments, "yes")
-}
-
-fn first_argument_is_protocol_one(arguments: &str) -> bool {
-    first_argument_is(arguments, "1")
-}
-
-fn arguments_contain_weak_protocol(arguments: &str) -> bool {
-    argument_tokens(arguments).any(is_weak_protocol_token)
-}
-
-fn arguments_enable_weak_protocol(arguments: &str) -> bool {
-    argument_tokens(arguments).any(enables_weak_protocol)
-}
-
-fn value_is_off(value: &str) -> bool {
-    value.eq_ignore_ascii_case("off")
-}
-
-fn value_is_md5_or_plain(value: &str) -> bool {
-    value.eq_ignore_ascii_case("md5") || value.eq_ignore_ascii_case("plain")
-}
-
-fn value_is_no(value: &str) -> bool {
-    value.eq_ignore_ascii_case("no")
-}
-
-/// pg_hba.conf records carry no directive keyword: the driver hands this
-/// predicate everything after the first whitespace-separated field, so a
-/// trust record (connection type, database, user, method) has at least
-/// three remaining fields and ends with the trust method.
-fn hba_tail_is_trust(arguments: &str) -> bool {
-    arguments.split_whitespace().count() >= 3
-        && arguments
-            .split_whitespace()
-            .next_back()
-            .is_some_and(|method| method.eq_ignore_ascii_case("trust"))
-}
-
-/// Shared directive-style driver (nginx, Apache, sshd, pg_hba): at most one
-/// finding per line, first matching table entry wins.
-fn scan_directive_config(
-    text: &str,
-    builder: &mut FindingBuilder<'_>,
-    checks: &[ServiceConfigCheck],
-) {
-    for (number, _, line) in config_lines(text) {
-        let content = effective_config_line(line);
-        let Some((directive, arguments)) = split_config_directive(content) else {
-            continue;
-        };
-        let Some(check) = checks.iter().find(|check| {
-            (check.directive.is_empty() || directive.eq_ignore_ascii_case(check.directive))
-                && (check.matches_value)(arguments)
-        }) else {
-            continue;
-        };
-        add_service_finding(
-            builder,
-            check.rule,
-            content.to_owned(),
-            number,
-            directive_column(line),
-        );
-    }
-}
-
-/// Shared key=value driver (postgresql.conf, redis.conf).
-fn scan_key_value_config(
-    text: &str,
-    builder: &mut FindingBuilder<'_>,
-    checks: &[ServiceConfigCheck],
-) {
-    for (number, _, line) in config_lines(text) {
-        let Some((key, value)) = config_assignment(line) else {
-            continue;
-        };
-        let Some(check) = checks.iter().find(|check| {
-            key.eq_ignore_ascii_case(check.directive) && (check.matches_value)(value)
-        }) else {
-            continue;
-        };
-        add_service_finding(
-            builder,
-            check.rule,
-            effective_config_line(line).to_owned(),
-            number,
-            directive_column(line),
-        );
-    }
-}
-
-struct SastRule {
-    rule: &'static str,
-    regex: Regex,
-    summary: &'static str,
-    cwe: &'static str,
-    severity: Severity,
-    remediation: &'static str,
-}
-
-static SAST_RULES: LazyLock<BTreeMap<&'static str, Vec<SastRule>>> = LazyLock::new(|| {
-    let mut by_extension = BTreeMap::new();
-    for (extensions, rules) in [
-        (
-            &["rs"][..],
-            &[
-                (
-                    "sast.rust.command-shell",
-                    r#"\bCommand\s*::\s*new\s*\(\s*["'](?:sh|bash|cmd|powershell)["']\s*\)\s*\.\s*arg\s*\(\s*["'](?:-c|/C|Command)["']\s*\)\s*\.\s*arg\s*\([^"']"#,
-                    "Dynamic shell command execution",
-                    "CWE-78",
-                    Severity::High,
-                    "Pass fixed arguments directly to the target executable and strictly map permitted operations.",
-                ),
-                (
-                    "sast.rust.sql-format",
-                    r#"(?s)\b(?:query|execute)\s*\(\s*&?format!\s*\(\s*["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)\b"#,
-                    "Formatted SQL passed to a database API",
-                    "CWE-89",
-                    Severity::High,
-                    "Use parameterized queries and bind every untrusted value.",
-                ),
-                (
-                    "sast.rust.weak-hash-md5",
-                    r"\bMd5\s*::\s*new\s*\(",
-                    "MD5 hash construction",
-                    "CWE-327",
-                    Severity::Medium,
-                    "Use SHA-256 or BLAKE3; MD5 is broken for security-sensitive digests.",
-                ),
-                (
-                    "sast.rust.weak-hash-sha1",
-                    r"\bSha1\s*::\s*new\s*\(",
-                    "SHA-1 hash construction",
-                    "CWE-327",
-                    Severity::Medium,
-                    "Use SHA-256 or BLAKE3; SHA-1 is broken for security-sensitive digests.",
-                ),
-            ][..],
-        ),
-        (
-            &["js", "jsx", "ts", "tsx"][..],
-            &[
-                (
-                    "sast.javascript.eval-dynamic",
-                    r"\b(?:eval|Function)\s*\(\s*",
-                    "Dynamic JavaScript evaluation",
-                    "CWE-95",
-                    Severity::High,
-                    "Replace dynamic evaluation with explicit parsing and a fixed dispatch table.",
-                ),
-                (
-                    "sast.javascript.exec-dynamic",
-                    r#"\b(?:exec|execSync)\s*\(\s*(?:`[^`]*\$\{|[^"'`])"#,
-                    "Dynamic command execution",
-                    "CWE-78",
-                    Severity::High,
-                    "Use spawn/execFile with a fixed executable and validated argument array.",
-                ),
-                (
-                    "sast.javascript.sql-template",
-                    r"\b(?:query|execute)\s*\(\s*`[^`]*(?:SELECT|INSERT|UPDATE|DELETE)[^`]*\$\{",
-                    "Interpolated SQL query",
-                    "CWE-89",
-                    Severity::High,
-                    "Use driver placeholders and parameter binding.",
-                ),
-                (
-                    "sast.javascript.weak-hash",
-                    r#"\bcreateHash\s*\(\s*["'](md5|sha1)["']\s*\)"#,
-                    "Weak hash algorithm selected",
-                    "CWE-327",
-                    Severity::Medium,
-                    "Hash with createHash('sha256') or stronger algorithms.",
-                ),
-            ][..],
-        ),
-        (
-            &["py"][..],
-            &[
-                (
-                    "sast.python.eval-dynamic",
-                    r"\b(?:eval|exec)\s*\(\s*",
-                    "Dynamic Python evaluation",
-                    "CWE-95",
-                    Severity::High,
-                    "Parse expected data formats and use explicit operations rather than eval or exec.",
-                ),
-                (
-                    "sast.python.shell-true",
-                    r"\bsubprocess\.(?:run|call|Popen|check_output)\s*\([^\)]*\bshell\s*=\s*True",
-                    "Python subprocess enables a command shell",
-                    "CWE-78",
-                    Severity::High,
-                    "Set shell=False and pass a fixed executable plus a validated argument list.",
-                ),
-                (
-                    "sast.python.sql-format",
-                    r#"(?i)\.execute\s*\(\s*(?:f["']|["'][^"']*(?:select|insert|update|delete)[^"']*["']\s*(?:%|\.format\s*\())"#,
-                    "Formatted SQL execution",
-                    "CWE-89",
-                    Severity::High,
-                    "Use DB-API placeholders and a separate parameter sequence.",
-                ),
-                (
-                    "sast.python.weak-hash-md5",
-                    r"\bhashlib\.md5\s*\(",
-                    "MD5 hash usage",
-                    "CWE-327",
-                    Severity::Medium,
-                    "Prefer hashlib.sha256 or stronger for security-sensitive digests.",
-                ),
-                (
-                    "sast.python.weak-hash-sha1",
-                    r"\bhashlib\.sha1\s*\(",
-                    "SHA-1 hash usage",
-                    "CWE-327",
-                    Severity::Medium,
-                    "Prefer hashlib.sha256 or stronger for security-sensitive digests.",
-                ),
-                (
-                    "sast.python.pickle-deserialization",
-                    r"\bpickle\.loads?\s*\(",
-                    "Pickle deserialization",
-                    "CWE-502",
-                    Severity::High,
-                    "Exchange data in inert formats such as JSON instead of unpickling bytes.",
-                ),
-                (
-                    "sast.python.yaml-unsafe-load",
-                    r"\byaml\.load\s*\(",
-                    "YAML load without a restricted Loader",
-                    "CWE-502",
-                    Severity::High,
-                    "Use yaml.safe_load or pass an explicit Loader limited to safe types.",
-                ),
-            ][..],
-        ),
-        (
-            &["go"][..],
-            &[
-                (
-                    "sast.go.command-shell",
-                    r#"\bexec\.Command\s*\(\s*["'](?:sh|bash)["']\s*,\s*["']-c["']\s*,\s*[^"']"#,
-                    "Dynamic shell command execution",
-                    "CWE-78",
-                    Severity::High,
-                    "Invoke the intended executable directly with a validated argument slice.",
-                ),
-                (
-                    "sast.go.sql-format",
-                    r#"\b(?:Query|Exec|QueryRow)\s*\(\s*fmt\.Sprintf\s*\(\s*["'](?:SELECT|INSERT|UPDATE|DELETE)\b"#,
-                    "Formatted SQL passed to database/sql",
-                    "CWE-89",
-                    Severity::High,
-                    "Use database/sql placeholders and pass values as query arguments.",
-                ),
-                (
-                    "sast.go.weak-hash-md5",
-                    r"\bmd5\.New\s*\(",
-                    "MD5 hash construction",
-                    "CWE-327",
-                    Severity::Medium,
-                    "Use crypto/sha256 or stronger hashes for security-sensitive digests.",
-                ),
-                (
-                    "sast.go.weak-hash-sha1",
-                    r"\bsha1\.New\s*\(",
-                    "SHA-1 hash construction",
-                    "CWE-327",
-                    Severity::Medium,
-                    "Use crypto/sha256 or stronger hashes for security-sensitive digests.",
-                ),
-            ][..],
-        ),
-        (
-            &["java"][..],
-            &[
-                (
-                    "sast.java.runtime-exec",
-                    r"\bRuntime\.getRuntime\(\)\.exec\s*\(\s*",
-                    "Dynamic Runtime.exec command",
-                    "CWE-78",
-                    Severity::High,
-                    "Use ProcessBuilder with a fixed executable and validated arguments.",
-                ),
-                (
-                    "sast.java.sql-concat",
-                    r#"\b(?:executeQuery|executeUpdate|execute)\s*\(\s*["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)[^"']*["']\s*\+"#,
-                    "Concatenated SQL execution",
-                    "CWE-89",
-                    Severity::High,
-                    "Use PreparedStatement placeholders and typed setters.",
-                ),
-                (
-                    "sast.java.weak-hash",
-                    r#"\bMessageDigest\s*\.\s*getInstance\s*\(\s*["'](MD5|SHA-1|SHA1)["']\s*\)"#,
-                    "Weak MessageDigest algorithm requested",
-                    "CWE-327",
-                    Severity::Medium,
-                    "Request SHA-256 or stronger digest algorithms.",
-                ),
-                (
-                    "sast.java.unsafe-deserialization",
-                    r"\bObjectInputStream\b[^;\n]*?\.readObject\s*\(",
-                    "Native Java deserialization",
-                    "CWE-502",
-                    Severity::High,
-                    "Parse untrusted bytes with schema-based formats instead of ObjectInputStream.readObject.",
-                ),
-            ][..],
-        ),
-        (
-            &["cs"][..],
-            &[
-                (
-                    "sast.csharp.process-shell",
-                    r#"\bProcess\.Start\s*\(\s*["'](?:cmd\.exe|powershell(?:\.exe)?)["']\s*,\s*[^"']"#,
-                    "Dynamic shell process execution",
-                    "CWE-78",
-                    Severity::High,
-                    "Use ProcessStartInfo.ArgumentList with a fixed executable and validated arguments.",
-                ),
-                (
-                    "sast.csharp.sql-concat",
-                    r#"\b(?:SqlCommand|ExecuteSqlRaw)\s*\(\s*(?:\$["']|["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)[^"']*["']\s*\+)"#,
-                    "Interpolated or concatenated SQL",
-                    "CWE-89",
-                    Severity::High,
-                    "Use SQL parameters or ExecuteSqlInterpolated with trusted query structure.",
-                ),
-                (
-                    "sast.csharp.weak-hash",
-                    r"\b(?:MD5|SHA1)\.Create\s*\(\s*\)",
-                    "Weak hash algorithm instance",
-                    "CWE-327",
-                    Severity::Medium,
-                    "Create SHA256 or stronger hash instances for security-sensitive digests.",
-                ),
-                (
-                    "sast.csharp.unsafe-deserialization",
-                    r"\bBinaryFormatter\b[^;\n]*?\.Deserialize\s*\(",
-                    "BinaryFormatter deserialization",
-                    "CWE-502",
-                    Severity::High,
-                    "Replace BinaryFormatter with a safe serializer; never deserialize untrusted input.",
-                ),
-            ][..],
-        ),
-    ] {
-        for extension in extensions {
-            by_extension.insert(
-                *extension,
-                rules
-                    .iter()
-                    .map(
-                        |(rule, expression, summary, cwe, severity, remediation)| SastRule {
-                            rule,
-                            regex: Regex::new(expression).expect("constant SAST regex"),
-                            summary,
-                            cwe,
-                            severity: *severity,
-                            remediation,
-                        },
-                    )
-                    .collect(),
-            );
-        }
-    }
-    by_extension
-});
-
-fn scan_sast(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
-    let extension = Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let Some(rules) = SAST_RULES.get(extension.as_str()) else {
-        return;
-    };
-    let line_starts = line_starts(text);
-    let non_code = non_code_spans(text, &extension);
-    for rule in rules {
-        for matched in rule.regex.find_iter(text) {
-            if offset_in_non_code_span(&non_code, matched.start()) {
-                continue;
-            }
-            if matches!(
-                rule.rule,
-                "sast.javascript.eval-dynamic"
-                    | "sast.python.eval-dynamic"
-                    | "sast.java.runtime-exec"
-            ) && has_single_literal_argument(&text[matched.end()..])
-            {
-                continue;
-            }
-            if rule.rule == "sast.python.yaml-unsafe-load"
-                && yaml_call_specifies_loader(&text[matched.end()..])
-            {
-                continue;
-            }
-            let (line, column) = indexed_line_column(&line_starts, matched.start());
-            builder.add(FindingSpec { kind: FindingKind::Sast, rule: rule.rule, line, column, summary: rule.summary, details: "A language-specific call expression uses a dangerous sink with dynamic or explicitly unsafe syntax.", severity: rule.severity, confidence: Confidence::High, description: "Dangerous sink invocation detected; source expression omitted.".to_owned(), references: &["https://owasp.org/www-project-code-review-guide/"], properties: BTreeMap::new(), redacted: true, remediation: rule.remediation, cwe: Some(rule.cwe) });
-        }
-    }
-}
-
-fn has_single_literal_argument(after_open_paren: &str) -> bool {
-    let source = after_open_paren.trim_start();
-    let mut chars = source.char_indices();
-    let Some((_, quote @ ('\'' | '"' | '`'))) = chars.next() else {
-        return false;
-    };
-    let mut escaped = false;
-    for (offset, character) in chars {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            escaped = true;
-            continue;
-        }
-        if quote == '`' && character == '$' && source[offset..].starts_with("${") {
-            return false;
-        }
-        if character == quote {
-            return source[offset + character.len_utf8()..]
-                .trim_start()
-                .starts_with(')');
-        }
-    }
-    false
-}
-
-static YAML_RESTRICTED_LOADER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:Loader\s*=|C?SafeLoader|BaseLoader)\b")
-        .expect("constant YAML restricted-loader regex")
-});
-
-fn yaml_call_specifies_loader(after_open_paren: &str) -> bool {
-    const MAX_CALL_ARGUMENT_SCAN_BYTES: usize = 16 * 1024;
-    let mut depth = 0_usize;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut end = after_open_paren.len().min(MAX_CALL_ARGUMENT_SCAN_BYTES);
-    for (index, character) in after_open_paren.char_indices() {
-        if index >= MAX_CALL_ARGUMENT_SCAN_BYTES {
-            break;
-        }
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == active {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' | '[' | '{' => depth += 1,
-            ')' => {
-                if depth == 0 {
-                    end = index;
-                    break;
-                }
-                depth -= 1;
-            }
-            ']' | '}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    // The byte cap can stop inside a multi-byte UTF-8 character; fall back to
-    // the nearest char boundary so slicing can never panic on crafted input.
-    while end > 0 && !after_open_paren.is_char_boundary(end) {
-        end -= 1;
-    }
-    YAML_RESTRICTED_LOADER_REGEX.is_match(&after_open_paren[..end])
-}
-
-/// Byte spans of `text` where the lexer sits inside a comment or string
-/// literal for the given source extension, sorted and disjoint. An offset
-/// lies inside a span exactly when it is strictly after an opener's first
-/// byte and at or before the matching closer's first byte; unterminated
-/// regions extend through the end of the text.
-///
-/// Line comments and single-line strings reset at '\n'; block comments,
-/// JavaScript template literals, Go raw strings, and Python triple-quoted
-/// strings span lines. JavaScript division-vs-regex-literal ambiguity is
-/// resolved as code, so a regex literal containing a quote may leave
-/// tracking unopened and the match reported — suppression errs toward
-/// reporting, never hiding state.
-fn non_code_spans(text: &str, extension: &str) -> Vec<(usize, usize)> {
-    enum State {
-        Code,
-        LineComment,
-        BlockComment,
-        Quoted {
-            quote: u8,
-            spans_lines: bool,
-            triple: bool,
-        },
-    }
-    let bytes = text.as_bytes();
-    let python = extension == "py";
-    let backtick_spans_lines = matches!(extension, "js" | "jsx" | "ts" | "tsx" | "go");
-    let mut state = State::Code;
-    let mut index = 0_usize;
-    let mut open: Option<usize> = None;
-    let mut spans = Vec::new();
-    while index < bytes.len() {
-        let byte = bytes[index];
-        match state {
-            State::Code => {
-                let rest = &bytes[index..];
-                if python && byte == b'#' {
-                    state = State::LineComment;
-                    open = Some(index);
-                    index += 1;
-                } else if !python && byte == b'/' && rest.get(1) == Some(&b'/') {
-                    state = State::LineComment;
-                    open = Some(index);
-                    index += 2;
-                } else if !python && byte == b'/' && rest.get(1) == Some(&b'*') {
-                    state = State::BlockComment;
-                    open = Some(index);
-                    index += 2;
-                } else if matches!(byte, b'\'' | b'"' | b'`') {
-                    let triple = python && rest.starts_with(&[byte, byte, byte]);
-                    let spans_lines = triple || (byte == b'`' && backtick_spans_lines);
-                    state = State::Quoted {
-                        quote: byte,
-                        spans_lines,
-                        triple,
-                    };
-                    open = Some(index);
-                    index += if triple { 3 } else { 1 };
-                } else {
-                    index += 1;
-                }
-            }
-            State::LineComment => {
-                if byte == b'\n' {
-                    spans.push((
-                        open.take().expect("line comment opener recorded") + 1,
-                        index + 1,
-                    ));
-                    state = State::Code;
-                }
-                index += 1;
-            }
-            State::BlockComment => {
-                if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
-                    spans.push((
-                        open.take().expect("block comment opener recorded") + 1,
-                        index + 1,
-                    ));
-                    state = State::Code;
-                    index += 2;
-                } else {
-                    index += 1;
-                }
-            }
-            State::Quoted {
-                quote,
-                spans_lines,
-                triple,
-            } => {
-                if !spans_lines && byte == b'\n' {
-                    spans.push((open.take().expect("string opener recorded") + 1, index + 1));
-                    state = State::Code;
-                    index += 1;
-                    continue;
-                }
-                if quote != b'`' && byte == b'\\' {
-                    // Skip the escaped byte; overshooting the text end is fine.
-                    index += 2;
-                    continue;
-                }
-                if triple && bytes[index..].starts_with(&[quote, quote, quote]) {
-                    spans.push((
-                        open.take().expect("triple-quote opener recorded") + 1,
-                        index + 1,
-                    ));
-                    state = State::Code;
-                    index += 3;
-                    continue;
-                }
-                // Triple-quoted strings close only on their full
-                // terminator; a lone quote inside must not flip state.
-                if !triple && byte == quote {
-                    spans.push((open.take().expect("string opener recorded") + 1, index + 1));
-                    state = State::Code;
-                }
-                index += 1;
-            }
-        }
-    }
-    if let Some(open) = open {
-        // Unterminated comment or string: non-code through end of text.
-        spans.push((open + 1, text.len() + 1));
-    }
-    spans
-}
-
-fn offset_in_non_code_span(spans: &[(usize, usize)], offset: usize) -> bool {
-    let position = spans.partition_point(|&(start, _)| start <= offset);
-    position > 0 && offset < spans[position - 1].1
 }
 
 fn scan_malware(bytes: &[u8], builder: &mut FindingBuilder<'_>) {

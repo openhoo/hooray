@@ -590,6 +590,11 @@ pub fn stable_location_id(
     )))
 }
 
+/// Canonical cross-run finding identity: SHA-free FNV-1a 64-bit hash over the
+/// length-prefixed kind, rule, component, and location strings (empty string
+/// when component/location is absent). Stable across runs and machines;
+/// changing any input - or this derivation - breaks stored baselines, CSV
+/// `stable_finding_id` output, history diffs, and parity recordings.
 pub fn stable_finding_id(
     kind: FindingKind,
     rule_id: &RuleId,
@@ -628,6 +633,10 @@ pub fn salted_finding_id(
     ))
 }
 
+/// Length-prefixed FNV-1a-64 combiner: each part contributes its `u64`
+/// big-endian byte length followed by its UTF-8 bytes; rendered as
+/// `{prefix}:{hash:016x}`. Private building block for the `stable_*_id`
+/// constructors.
 fn stable_prefixed_id<'a>(prefix: &str, parts: impl IntoIterator<Item = &'a str>) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for part in parts {

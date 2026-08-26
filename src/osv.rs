@@ -38,6 +38,8 @@ const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 pub enum OsvError {
     #[error("invalid OSV API base URL: {0}")]
     InvalidBaseUrl(String),
+    #[error("failed to build OSV HTTP client: {0}")]
+    Client(#[from] reqwest::Error),
     #[error("OSV request to {endpoint} failed: {source}")]
     Request {
         endpoint: String,
@@ -94,7 +96,12 @@ impl OsvClient {
         }
 
         Ok(Self {
-            http: Client::new(),
+            // OSV endpoints never legitimately redirect scan traffic, so
+            // redirects are refused outright; requests stay pinned to the
+            // configured base URL instead of following a hostile Location.
+            http: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             base_url,
             concurrency: concurrency.max(1),
         })
@@ -118,37 +125,83 @@ impl OsvClient {
         let purls: Vec<&str> = components_by_purl.keys().copied().collect();
         let mut vulnerability_ids: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
 
+        type PageChain<'a> = std::pin::Pin<
+            Box<dyn Future<Output = (usize, Result<BTreeSet<String>, OsvError>)> + Send + 'a>,
+        >;
         for chunk in purls.chunks(MAX_BATCH_SIZE) {
             let queries: Vec<Query<'_>> = chunk.iter().map(|purl| Query::new(purl, None)).collect();
             let results = self.query_batch(&queries).await?;
 
-            for (purl, result) in chunk.iter().copied().zip(results) {
-                let ids = vulnerability_ids.entry(purl).or_default();
-                ids.extend(
-                    result
+            // OSV page tokens are opaque, so one purl's continuation chain
+            // cannot start before its own previous page returns; the chains
+            // of different purls are independent and run concurrently here,
+            // bounded by the client concurrency. Each chain enforces
+            // `MAX_PAGES_PER_PURL` locally and attributes failures to its
+            // own purl.
+            // Plain for-loop instead of an iterator-adaptor closure: a
+            // closure returning an async block that captures the item's
+            // borrowed fields makes `buffer_unordered` demand a higher-ranked
+            // FnOnce impl rustc cannot prove ("implementation of FnOnce is
+            // not general enough"). Pushing concrete pinned futures keeps
+            // every capture owned or borrow-of-self, so no item borrow
+            // crosses an await.
+            let mut chains: Vec<PageChain<'_>> = Vec::with_capacity(chunk.len());
+            for (index, (purl, result)) in chunk.iter().copied().zip(results).enumerate() {
+                // Own the purl so no borrow of the chunk iteration item
+                // crosses an await inside `buffer_unordered`.
+                let purl = purl.to_owned();
+                chains.push(Box::pin(async move {
+                    let mut ids: BTreeSet<String> = result
                         .vulns
                         .into_iter()
-                        .map(|vulnerability| vulnerability.id),
-                );
-
-                let mut page_token = result.next_page_token;
-                let mut pages = 0usize;
-                while let Some(token) = page_token.filter(|token| !token.is_empty()) {
-                    pages += 1;
-                    if pages > MAX_PAGES_PER_PURL {
-                        return Err(OsvError::PageLimit {
-                            purl: purl.to_owned(),
-                            maximum: MAX_PAGES_PER_PURL,
-                        });
+                        .map(|vulnerability| vulnerability.id)
+                        .collect();
+                    let mut page_token = result.next_page_token;
+                    let mut pages = 0usize;
+                    while let Some(token) = page_token.filter(|token| !token.is_empty()) {
+                        pages += 1;
+                        if pages > MAX_PAGES_PER_PURL {
+                            return (
+                                index,
+                                Err(OsvError::PageLimit {
+                                    purl,
+                                    maximum: MAX_PAGES_PER_PURL,
+                                }),
+                            );
+                        }
+                        let page = match self.query_batch(&[Query::new(&purl, Some(&token))]).await
+                        {
+                            Ok(results) => results
+                                .into_iter()
+                                .next()
+                                .expect("validated one-result response"),
+                            Err(error) => return (index, Err(error)),
+                        };
+                        ids.extend(page.vulns.into_iter().map(|vulnerability| vulnerability.id));
+                        page_token = page.next_page_token;
                     }
-                    let page = self
-                        .query_batch(&[Query::new(purl, Some(&token))])
-                        .await?
-                        .into_iter()
-                        .next()
-                        .expect("validated one-result response");
-                    ids.extend(page.vulns.into_iter().map(|vulnerability| vulnerability.id));
-                    page_token = page.next_page_token;
+                    (index, Ok(ids))
+                }));
+            }
+            let outcomes = stream::iter(chains)
+                .buffer_unordered(self.concurrency.max(1))
+                .collect::<Vec<(usize, Result<BTreeSet<String>, OsvError>)>>()
+                .await;
+
+            // Completion order is nondeterministic, so outcomes are scattered
+            // back to their chunk positions before merging: per-purl sets land
+            // in the purl-keyed map independently of order, and the first
+            // failure in purl order is surfaced, matching the previous
+            // sequential first-error behavior.
+            let mut slots: Vec<Option<Result<BTreeSet<String>, OsvError>>> =
+                (0..chunk.len()).map(|_| None).collect();
+            for (index, outcome) in outcomes {
+                slots[index] = Some(outcome);
+            }
+            for (purl, outcome) in chunk.iter().copied().zip(slots) {
+                match outcome.expect("every chunk purl records a chain outcome") {
+                    Ok(ids) => vulnerability_ids.entry(purl).or_default().extend(ids),
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -265,11 +318,22 @@ async fn decode_response<T: for<'de> Deserialize<'de>>(
     })
 }
 
-/// Retains at most `MAX_ERROR_BODY_BYTES` of a failed response body. Byte
-/// slicing may split a UTF-8 sequence; `from_utf8_lossy` replaces the partial
-/// suffix instead of panicking, so truncation at an arbitrary byte is safe.
+/// Retains at most `MAX_ERROR_BODY_BYTES` of a failed response body, minus
+/// control characters: tabs widen to spaces and every other C0/C1 control is
+/// dropped, so a hostile body cannot smuggle terminal escapes or log-framing
+/// into stderr and CLI diagnostics while printable content stays debuggable.
+/// Byte slicing may split a UTF-8 sequence; `from_utf8_lossy` replaces the
+/// partial suffix instead of panicking, so truncation at an arbitrary byte is
+/// safe.
 fn truncated_error_body(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_BODY_BYTES)]).into_owned()
+    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_BODY_BYTES)])
+        .chars()
+        .filter_map(|character| match character {
+            '\t' => Some(' '),
+            control if control.is_control() => None,
+            printable => Some(printable),
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -780,13 +844,20 @@ fn round_nearest_tenth(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, time::Duration};
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use super::*;
     use crate::model::{Asset, AssetId, AssetKind, ComponentId, Scope};
     use serde_json::json;
     use wiremock::{
-        Mock, MockServer, ResponseTemplate,
+        Mock, MockServer, Request, ResponseTemplate,
         matchers::{body_json, method, path},
     };
 
@@ -1000,6 +1071,251 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetches_page_chains_concurrently_across_purls() {
+        let server = MockServer::start().await;
+        let purl_a = "pkg:npm/chain-a@1.0.0";
+        let purl_b = "pkg:npm/chain-b@1.0.0";
+        // Structural overlap proof for continuation chains: each chain's
+        // page request registers itself as in-flight on arrival and holds
+        // its slot for at most the 200ms response delay, so the recorded
+        // peak reaches 2 only if both purl chains genuinely run
+        // concurrently; a sequential per-purl chain loop would serialize
+        // the two page requests and peak at 1.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let spawner = tokio::runtime::Handle::current();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(json!({
+                "queries": [
+                    {"package": {"purl": purl_a}},
+                    {"package": {"purl": purl_b}},
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {"vulns": [{"id": "OSV-A"}], "next_page_token": "token-a"},
+                    {"vulns": [{"id": "OSV-B"}], "next_page_token": "token-b"},
+                ]
+            })))
+            .mount(&server)
+            .await;
+        for (purl, token) in [(purl_a, "token-a"), (purl_b, "token-b")] {
+            let in_flight = Arc::clone(&in_flight);
+            let peak_in_flight = Arc::clone(&peak_in_flight);
+            let spawner = spawner.clone();
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .and(body_json(json!({
+                    "queries": [
+                        {"package": {"purl": purl}, "page_token": token}
+                    ]
+                })))
+                .respond_with(move |_request: &_| {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak_in_flight.fetch_max(current, Ordering::SeqCst);
+
+                    // Release the slot strictly before the delayed response
+                    // is delivered (120ms < 400ms): sequential chains would
+                    // therefore never observe a stale slot, while genuinely
+                    // overlapping chains push the recorded peak to 2.
+                    let release = Arc::clone(&in_flight);
+                    spawner.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        release.fetch_sub(1, Ordering::SeqCst);
+                    });
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(400))
+                        .set_body_json(json!({
+                            "results": [{"vulns": [], "next_page_token": ""}]
+                        }))
+                })
+                .mount(&server)
+                .await;
+        }
+        for id in ["OSV-A", "OSV-B"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(detail(id, json!({}))))
+                .mount(&server)
+                .await;
+        }
+
+        let findings = OsvClient::new(&server.uri(), 2)
+            .unwrap()
+            .scan(&inventory([
+                component("component:chain-a", "chain-a", "1.0.0", purl_a),
+                component("component:chain-b", "chain-b", "1.0.0", purl_b),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(findings.len(), 2);
+        let peak = peak_in_flight.load(Ordering::SeqCst);
+        assert!(peak >= 2, "two purl chains should overlap: peak {peak}");
+        assert!(
+            peak <= 2,
+            "chain concurrency must stay bounded by the client concurrency: peak {peak}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merges_page_chain_results_identically_to_sequential_reference() {
+        let server = MockServer::start().await;
+        let purl_a = "pkg:npm/merge-a@1.0.0";
+        let purl_b = "pkg:npm/merge-b@1.0.0";
+        let purl_c = "pkg:npm/merge-c@1.0.0";
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(json!({
+                "queries": [
+                    {"package": {"purl": purl_a}},
+                    {"package": {"purl": purl_b}},
+                    {"package": {"purl": purl_c}},
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {"vulns": [{"id": "OSV-1"}, {"id": "OSV-shared"}], "next_page_token": "a1"},
+                    {"vulns": [{"id": "OSV-shared"}], "next_page_token": "b1"},
+                    {"vulns": [{"id": "OSV-4"}]},
+                ]
+            })))
+            .mount(&server)
+            .await;
+        for (purl, token, vulns, next) in [
+            (purl_a, "a1", vec![json!({"id": "OSV-2"})], Some("a2")),
+            (purl_a, "a2", vec![json!({"id": "OSV-3"})], None),
+            (purl_b, "b1", Vec::<serde_json::Value>::new(), None),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .and(body_json(json!({
+                    "queries": [
+                        {"package": {"purl": purl}, "page_token": token}
+                    ]
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "results": [{
+                        "vulns": vulns,
+                        "next_page_token": next,
+                    }]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        for id in ["OSV-1", "OSV-2", "OSV-3", "OSV-4", "OSV-shared"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/vulns/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(detail(id, json!({}))))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let findings = OsvClient::new(&server.uri(), 4)
+            .unwrap()
+            .scan(&inventory([
+                component("component:merge-a", "merge-a", "1.0.0", purl_a),
+                component("component:merge-b", "merge-b", "1.0.0", purl_b),
+                component("component:merge-c", "merge-c", "1.0.0", purl_c),
+            ]))
+            .await
+            .unwrap();
+
+        // Sequential reference: fold each purl's pages in purl order exactly
+        // as the previous per-purl sequential chain loop did.
+        let pages_by_component: [(&str, Vec<Vec<&str>>); 3] = [
+            (
+                "component:merge-a",
+                vec![vec!["OSV-1", "OSV-shared"], vec!["OSV-2"], vec!["OSV-3"]],
+            ),
+            ("component:merge-b", vec![vec!["OSV-shared"], Vec::new()]),
+            ("component:merge-c", vec![vec!["OSV-4"]]),
+        ];
+        let reference: BTreeMap<&str, BTreeSet<&str>> = pages_by_component
+            .into_iter()
+            .map(|(component, pages)| {
+                let mut ids = BTreeSet::new();
+                for page in pages {
+                    ids.extend(page);
+                }
+                (component, ids)
+            })
+            .collect();
+        let observed: BTreeMap<&str, BTreeSet<&str>> =
+            findings.values().fold(BTreeMap::new(), |mut acc, finding| {
+                acc.entry(finding.component_id.as_ref().unwrap().as_str())
+                    .or_default()
+                    .insert(finding.advisory_id.as_deref().unwrap());
+                acc
+            });
+
+        assert_eq!(observed, reference);
+    }
+
+    #[tokio::test]
+    async fn fails_with_lowest_purl_when_concurrent_chains_exceed_page_limit() {
+        let server = MockServer::start().await;
+        let purl_first = "pkg:npm/looped-a@1.0.0";
+        let purl_second = "pkg:npm/looped-b@1.0.0";
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(json!({
+                "queries": [
+                    {"package": {"purl": purl_first}},
+                    {"package": {"purl": purl_second}},
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {"vulns": [], "next_page_token": "token-a"},
+                    {"vulns": [], "next_page_token": "token-b"},
+                ]
+            })))
+            .mount(&server)
+            .await;
+        // Both chains echo a stable token forever, so each independently
+        // enforces `MAX_PAGES_PER_PURL` under concurrency; the scan must
+        // attribute the failure to the first failing purl in input order.
+        for (purl, token) in [(purl_first, "token-a"), (purl_second, "token-b")] {
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .and(body_json(json!({
+                    "queries": [
+                        {"package": {"purl": purl}, "page_token": token}
+                    ]
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "results": [{
+                        "vulns": [],
+                        "next_page_token": token,
+                    }]
+                })))
+                .expect(MAX_PAGES_PER_PURL as u64)
+                .mount(&server)
+                .await;
+        }
+
+        let error = OsvClient::new(&server.uri(), 2)
+            .unwrap()
+            .scan(&inventory([
+                component("component:looped-a", "looped-a", "1.0.0", purl_first),
+                component("component:looped-b", "looped-b", "1.0.0", purl_second),
+            ]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OsvError::PageLimit { purl, maximum }
+                if purl == purl_first && maximum == MAX_PAGES_PER_PURL
+        ));
+    }
+
+    #[tokio::test]
     async fn rejects_oversized_response_bodies() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1028,29 +1344,45 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn reports_batch_http_body_decode_and_result_count_failures() {
-        async fn scan_with(response: ResponseTemplate) -> OsvError {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1/querybatch"))
-                .respond_with(response)
+    /// Shared failure-matrix harness: mounts `batch` on POST /v1/querybatch and,
+    /// when present, `detail` on GET /v1/vulns/OSV-detail, then returns the
+    /// scan error for a single-component inventory.
+    async fn scan_failing_via(
+        batch: ResponseTemplate,
+        detail: Option<ResponseTemplate>,
+    ) -> OsvError {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(batch)
+            .mount(&server)
+            .await;
+        if let Some(detail_response) = detail {
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/OSV-detail"))
+                .respond_with(detail_response)
                 .mount(&server)
                 .await;
-            OsvClient::new(&server.uri(), 1)
-                .unwrap()
-                .scan(&inventory([component(
-                    "component:failure",
-                    "failure",
-                    "1.0.0",
-                    "pkg:cargo/failure@1.0.0",
-                )]))
-                .await
-                .unwrap_err()
         }
+        OsvClient::new(&server.uri(), 1)
+            .unwrap()
+            .scan(&inventory([component(
+                "component:failure",
+                "failure",
+                "1.0.0",
+                "pkg:cargo/failure@1.0.0",
+            )]))
+            .await
+            .unwrap_err()
+    }
 
-        let error =
-            scan_with(ResponseTemplate::new(503).set_body_string("upstream unavailable")).await;
+    #[tokio::test]
+    async fn reports_batch_http_body_decode_and_result_count_failures() {
+        let error = scan_failing_via(
+            ResponseTemplate::new(503).set_body_string("upstream unavailable"),
+            None,
+        )
+        .await;
         assert!(matches!(
             error,
             OsvError::Http { status, body, .. }
@@ -1058,13 +1390,17 @@ mod tests {
                     && body == "upstream unavailable"
         ));
 
-        let error = scan_with(ResponseTemplate::new(200).set_body_string("not json")).await;
+        let error =
+            scan_failing_via(ResponseTemplate::new(200).set_body_string("not json"), None).await;
         assert!(
             matches!(error, OsvError::Decode { endpoint, .. } if endpoint.ends_with("/v1/querybatch"))
         );
 
-        let error =
-            scan_with(ResponseTemplate::new(200).set_body_json(json!({"results": []}))).await;
+        let error = scan_failing_via(
+            ResponseTemplate::new(200).set_body_json(json!({"results": []})),
+            None,
+        )
+        .await;
         assert!(matches!(
             error,
             OsvError::ResultCount {
@@ -1076,33 +1412,15 @@ mod tests {
 
     #[tokio::test]
     async fn reports_detail_http_and_decode_failures() {
-        async fn scan_with(response: ResponseTemplate) -> OsvError {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1/querybatch"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "results": [{"vulns": [{"id": "OSV-detail"}]}]
-                })))
-                .mount(&server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/v1/vulns/OSV-detail"))
-                .respond_with(response)
-                .mount(&server)
-                .await;
-            OsvClient::new(&server.uri(), 1)
-                .unwrap()
-                .scan(&inventory([component(
-                    "component:detail",
-                    "detail",
-                    "1.0.0",
-                    "pkg:cargo/detail@1.0.0",
-                )]))
-                .await
-                .unwrap_err()
-        }
+        let successful_batch = ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{"vulns": [{"id": "OSV-detail"}]}]
+        }));
 
-        let error = scan_with(ResponseTemplate::new(404).set_body_string("missing advisory")).await;
+        let error = scan_failing_via(
+            successful_batch.clone(),
+            Some(ResponseTemplate::new(404).set_body_string("missing advisory")),
+        )
+        .await;
         assert!(matches!(
             error,
             OsvError::Http { status, body, endpoint }
@@ -1110,7 +1428,23 @@ mod tests {
                     && body == "missing advisory"
                     && endpoint.ends_with("/v1/vulns/OSV-detail")
         ));
-        let error = scan_with(ResponseTemplate::new(200).set_body_string("{")).await;
+        let error = scan_failing_via(
+            successful_batch.clone(),
+            Some(ResponseTemplate::new(429).set_body_string("rate limited")),
+        )
+        .await;
+        assert!(matches!(
+            error,
+            OsvError::Http { status, body, endpoint }
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    && body == "rate limited"
+                    && endpoint.ends_with("/v1/vulns/OSV-detail")
+        ));
+        let error = scan_failing_via(
+            successful_batch,
+            Some(ResponseTemplate::new(200).set_body_string("{")),
+        )
+        .await;
         assert!(matches!(
             error,
             OsvError::Decode { endpoint, .. } if endpoint.ends_with("/v1/vulns/OSV-detail")
@@ -1234,6 +1568,13 @@ mod tests {
     #[tokio::test]
     async fn fetches_independent_details_concurrently() {
         let server = MockServer::start().await;
+        // Structural overlap proof instead of a wall-clock upper bound: every
+        // GET registers itself as in flight on arrival and holds its slot for
+        // most of the 400ms response delay, so the recorded peak reaches 2
+        // only if both detail fetches genuinely ran concurrently.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let spawner = tokio::runtime::Handle::current();
         Mock::given(method("POST"))
             .and(path("/v1/querybatch"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1242,13 +1583,27 @@ mod tests {
             .mount(&server)
             .await;
         for id in ["OSV-1", "OSV-2"] {
+            let in_flight = Arc::clone(&in_flight);
+            let peak_in_flight = Arc::clone(&peak_in_flight);
+            let spawner = spawner.clone();
             Mock::given(method("GET"))
                 .and(path(format!("/v1/vulns/{id}")))
-                .respond_with(
+                .respond_with(move |_: &Request| {
+                    let outstanding = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak_in_flight.fetch_max(outstanding, Ordering::SeqCst);
+                    // Release the slot strictly before the delayed response is
+                    // delivered (120ms < 400ms): a sequential client therefore
+                    // never observes a stale slot, while truly overlapping
+                    // fetches push the recorded peak to 2.
+                    let release = Arc::clone(&in_flight);
+                    spawner.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        release.fetch_sub(1, Ordering::SeqCst);
+                    });
                     ResponseTemplate::new(200)
-                        .set_delay(Duration::from_millis(200))
-                        .set_body_json(detail(id, json!({}))),
-                )
+                        .set_delay(Duration::from_millis(400))
+                        .set_body_json(detail(id, json!({})))
+                })
                 .mount(&server)
                 .await;
         }
@@ -1259,7 +1614,6 @@ mod tests {
             "pkg:cargo/concurrent@1.0.0",
         )]);
 
-        let started = tokio::time::Instant::now();
         let findings = OsvClient::new(&server.uri(), 2)
             .unwrap()
             .scan(&inventory)
@@ -1268,8 +1622,8 @@ mod tests {
 
         assert_eq!(findings.len(), 2);
         assert!(
-            started.elapsed() < Duration::from_millis(350),
-            "two delayed detail requests should overlap"
+            peak_in_flight.load(Ordering::SeqCst) >= 2,
+            "two independent detail requests should overlap"
         );
     }
 

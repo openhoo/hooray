@@ -6,6 +6,7 @@ use crate::model::{
     ApplicabilityStatus, Component, DependencyKind, DependencyPaths, Finding, FindingKind,
     ManifestTool, PackageEcosystem, UpgradePlan,
 };
+use crate::util::percent_decode_strict;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RemediationError {
@@ -122,6 +123,20 @@ pub fn nearest_fixed_version<'a>(
         .map(|(_, version)| version.to_owned())
 }
 
+/// Maps a purl type to its package ecosystem; shared by remediation planning
+/// and applicability analysis so both interpret purl types identically.
+pub(crate) fn package_ecosystem_for_purl_type(kind: &str) -> Option<PackageEcosystem> {
+    match kind.to_ascii_lowercase().as_str() {
+        "cargo" => Some(PackageEcosystem::Cargo),
+        "npm" => Some(PackageEcosystem::Npm),
+        "pypi" => Some(PackageEcosystem::Pypi),
+        "golang" => Some(PackageEcosystem::Go),
+        "maven" => Some(PackageEcosystem::Maven),
+        "nuget" => Some(PackageEcosystem::Nuget),
+        _ => None,
+    }
+}
+
 fn parse_purl(purl: &str) -> Result<(PackageEcosystem, String), RemediationError> {
     let package = purl
         .strip_prefix("pkg:")
@@ -134,38 +149,13 @@ fn parse_purl(purl: &str) -> Result<(PackageEcosystem, String), RemediationError
     if name.is_empty() {
         return Err(RemediationError::UnsupportedPackageUrl(purl.to_owned()));
     }
-    let ecosystem = match kind.to_ascii_lowercase().as_str() {
-        "cargo" => PackageEcosystem::Cargo,
-        "npm" => PackageEcosystem::Npm,
-        "pypi" => PackageEcosystem::Pypi,
-        "golang" => PackageEcosystem::Go,
-        "maven" => PackageEcosystem::Maven,
-        "nuget" => PackageEcosystem::Nuget,
-        _ => return Err(RemediationError::UnsupportedPackageUrl(purl.to_owned())),
-    };
+    let ecosystem = package_ecosystem_for_purl_type(kind)
+        .ok_or_else(|| RemediationError::UnsupportedPackageUrl(purl.to_owned()))?;
     Ok((
         ecosystem,
-        percent_decode(name)
+        percent_decode_strict(name)
             .ok_or_else(|| RemediationError::UnsupportedPackageUrl(purl.to_owned()))?,
     ))
-}
-
-fn percent_decode(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let hex = bytes.get(index + 1..index + 3)?;
-            let text = std::str::from_utf8(hex).ok()?;
-            output.push(u8::from_str_radix(text, 16).ok()?);
-            index += 3;
-        } else {
-            output.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(output).ok()
 }
 
 fn manifest_commands(
@@ -229,7 +219,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct VersionKey {
+pub(crate) struct VersionKey {
     epoch: u64,
     release: Vec<u64>,
     suffix: VersionSuffix,
@@ -256,7 +246,7 @@ enum VersionPart {
 }
 
 impl VersionKey {
-    fn parse(ecosystem: PackageEcosystem, value: &str) -> Option<Self> {
+    pub(crate) fn parse(ecosystem: PackageEcosystem, value: &str) -> Option<Self> {
         match ecosystem {
             PackageEcosystem::Pypi => parse_pep440(value),
             PackageEcosystem::Maven => parse_maven(value),

@@ -3,9 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::analysis::EvidenceProperties;
+use crate::graph::DependencyGraph;
 use crate::model::{
-    ApplicabilityStatus, Component, ComponentId, Confidence, Evidence, Finding, FindingKind,
-    FindingStatus, Inventory, Remediation, Risk, RuleId, Scope, Severity, stable_finding_id,
+    ApplicabilityStatus, Component, ComponentId, Confidence, DependencyKind, Evidence, Finding,
+    FindingKind, FindingStatus, Inventory, Remediation, Risk, RuleId, Scope, Severity,
+    stable_finding_id,
 };
 
 const DIRECT_COMPONENT: i32 = 1_000;
@@ -181,9 +183,14 @@ impl Default for OperationalRiskConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OperationalRiskInput<'a> {
     pub inventory: &'a Inventory,
+    /// Dependency graph built from `inventory`, e.g. via
+    /// [`DependencyGraph::from_inventory`]. Directness follows graph depth
+    /// semantics: depth 1 is direct, while roots and isolated components are
+    /// unknown rather than assumed direct.
+    pub graph: &'a DependencyGraph,
     pub evidence_by_component: &'a BTreeMap<ComponentId, BTreeSet<Evidence>>,
     pub as_of: DateTime<Utc>,
     pub config: OperationalRiskConfig,
@@ -195,152 +202,165 @@ pub struct OperationalRiskAnalyzer;
 impl OperationalRiskAnalyzer {
     pub fn analyze(input: OperationalRiskInput<'_>) -> BTreeMap<crate::model::FindingId, Finding> {
         let mut findings = BTreeMap::new();
-        let directness = DirectnessIndex::new(input.inventory);
         for component in input.inventory.components.values() {
             let Some(evidence) = input.evidence_by_component.get(&component.identity) else {
                 continue;
             };
             let metadata = EvidenceProperties::new(evidence);
-            let mut conditions = Vec::new();
-
-            if matches!(
-                metadata
-                    .value("maintenance.status")
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("abandoned" | "unmaintained" | "end-of-life")
-            ) {
-                conditions.push((
-                    "abandoned",
-                    Severity::High,
-                    "Component provenance declares the project abandoned or unmaintained"
-                        .to_owned(),
-                ));
-            }
-            if metadata.boolean("package.yanked") == Some(true)
-                || metadata.boolean("release.yanked") == Some(true)
-            {
-                conditions.push((
-                    "yanked",
-                    Severity::High,
-                    "Component provenance declares this release yanked".to_owned(),
-                ));
-            }
-            if metadata.boolean("package.deprecated") == Some(true)
-                || metadata.boolean("release.deprecated") == Some(true)
-                || metadata
-                    .value("maintenance.status")
-                    .is_some_and(|value| value.eq_ignore_ascii_case("deprecated"))
-            {
-                conditions.push((
-                    "deprecated",
-                    Severity::Medium,
-                    "Component provenance declares this component or release deprecated".to_owned(),
-                ));
-            }
-            if let Some(last_release) = metadata.date_time("release.last_published") {
-                let age_days = input.as_of.signed_duration_since(last_release).num_days();
-                if age_days >= input.config.stale_after_days {
-                    conditions.push(("stale", Severity::Medium, format!("Last provenance-backed release was {age_days} days ago, meeting the {} day stale threshold", input.config.stale_after_days)));
-                }
-            }
-            if let Some(versions_behind) = metadata.integer("release.versions_behind")
-                && versions_behind >= input.config.excessively_outdated_versions
-            {
-                conditions.push(("excessively-outdated", Severity::Medium, format!("Provenance reports the component {versions_behind} releases behind, meeting the {} release threshold", input.config.excessively_outdated_versions)));
-            }
-
-            for (condition, severity, rationale) in conditions {
-                let rule_id = RuleId::new(format!("operational-risk:{condition}"))
-                    .expect("static operational risk rule identifier is non-empty");
-                let id = stable_finding_id(
-                    FindingKind::OperationalRisk,
-                    &rule_id,
-                    Some(&component.identity),
-                    None,
-                );
+            // Directness mirrors the engine scoring pass: graph depth 1 is
+            // direct; roots and isolated components stay unknown.
+            let kind = input
+                .graph
+                .classify(&component.identity)
+                .expect("operational risk graph is built from the analyzed inventory");
+            let direct = match kind {
+                DependencyKind::Direct => Some(true),
+                DependencyKind::Transitive => Some(false),
+                DependencyKind::Disconnected => None,
+            };
+            for condition in detect_conditions(&metadata, &input.config, input.as_of) {
                 let relevant_evidence: BTreeSet<_> = evidence
                     .iter()
-                    .filter(|item| supports_condition(item, condition))
+                    .filter(|item| supports_condition(item, condition.rule))
                     .cloned()
                     .collect();
                 if relevant_evidence.is_empty() {
                     continue;
                 }
-                let risk = RiskScorer::score(RiskInput {
-                    severity,
-                    confidence: Confidence::High,
-                    applicability: ApplicabilityStatus::Affected,
+                let finding = operational_finding(
                     component,
-                    direct: directness.classify(&component.identity),
-                    remediation: None,
-                    evidence: &relevant_evidence,
-                    as_of: input.as_of.date_naive(),
-                });
-                findings.insert(
-                    id.clone(),
-                    Finding {
-                        id,
-                        kind: FindingKind::OperationalRisk,
-                        rule_id,
-                        advisory_id: None,
-                        component_id: Some(component.identity.clone()),
-                        location_id: None,
-                        aliases: BTreeSet::new(),
-                        summary: Some(format!("{} component: {condition}", component.name)),
-                        details: Some(rationale),
-                        severity,
-                        confidence: Confidence::High,
-                        evidence: relevant_evidence,
-                        applicability: Some(crate::model::Applicability {
-                            status: ApplicabilityStatus::Affected,
-                            rationale: Some(
-                                "Finding is based only on explicit provenance metadata".to_owned(),
-                            ),
-                        }),
-                        remediation: None,
-                        risk: Some(risk),
-                        first_seen: None,
-                        last_seen: None,
-                        modified: None,
-                        status: FindingStatus::Open,
-                    },
+                    &condition,
+                    &relevant_evidence,
+                    direct,
+                    input.as_of,
                 );
+                findings.insert(finding.id.clone(), finding);
             }
         }
         findings
     }
 }
 
-struct DirectnessIndex<'a> {
-    incoming: BTreeSet<&'a ComponentId>,
-    direct: BTreeSet<&'a ComponentId>,
+struct OperationalCondition {
+    rule: &'static str,
+    severity: Severity,
+    rationale: String,
 }
 
-impl<'a> DirectnessIndex<'a> {
-    fn new(inventory: &'a Inventory) -> Self {
-        let incoming: BTreeSet<_> = inventory.dependencies.iter().map(|edge| &edge.to).collect();
-        let roots: BTreeSet<_> = inventory
-            .components
-            .keys()
-            .filter(|id| !incoming.contains(id))
-            .collect();
-        let mut direct = roots.clone();
-        direct.extend(
-            inventory
-                .dependencies
-                .iter()
-                .filter(|edge| roots.contains(&edge.from))
-                .map(|edge| &edge.to),
-        );
-        Self { incoming, direct }
+fn detect_conditions(
+    metadata: &EvidenceProperties<'_>,
+    config: &OperationalRiskConfig,
+    as_of: DateTime<Utc>,
+) -> Vec<OperationalCondition> {
+    let mut conditions = Vec::new();
+
+    if matches!(
+        metadata
+            .value("maintenance.status")
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("abandoned" | "unmaintained" | "end-of-life")
+    ) {
+        conditions.push(OperationalCondition {
+            rule: "abandoned",
+            severity: Severity::High,
+            rationale: "Component provenance declares the project abandoned or unmaintained"
+                .to_owned(),
+        });
+    }
+    if metadata.boolean("package.yanked") == Some(true)
+        || metadata.boolean("release.yanked") == Some(true)
+    {
+        conditions.push(OperationalCondition {
+            rule: "yanked",
+            severity: Severity::High,
+            rationale: "Component provenance declares this release yanked".to_owned(),
+        });
+    }
+    if metadata.boolean("package.deprecated") == Some(true)
+        || metadata.boolean("release.deprecated") == Some(true)
+        || metadata
+            .value("maintenance.status")
+            .is_some_and(|value| value.eq_ignore_ascii_case("deprecated"))
+    {
+        conditions.push(OperationalCondition {
+            rule: "deprecated",
+            severity: Severity::Medium,
+            rationale: "Component provenance declares this component or release deprecated"
+                .to_owned(),
+        });
+    }
+    if let Some(last_release) = metadata.date_time("release.last_published") {
+        let age_days = as_of.signed_duration_since(last_release).num_days();
+        if age_days >= config.stale_after_days {
+            conditions.push(OperationalCondition {
+                rule: "stale",
+                severity: Severity::Medium,
+                rationale: format!("Last provenance-backed release was {age_days} days ago, meeting the {} day stale threshold", config.stale_after_days),
+            });
+        }
+    }
+    if let Some(versions_behind) = metadata.integer("release.versions_behind")
+        && versions_behind >= config.excessively_outdated_versions
+    {
+        conditions.push(OperationalCondition {
+            rule: "excessively-outdated",
+            severity: Severity::Medium,
+            rationale: format!("Provenance reports the component {versions_behind} releases behind, meeting the {} release threshold", config.excessively_outdated_versions),
+        });
     }
 
-    fn classify(&self, component: &ComponentId) -> Option<bool> {
-        self.direct
-            .contains(component)
-            .then_some(true)
-            .or_else(|| self.incoming.contains(component).then_some(false))
+    conditions
+}
+
+fn operational_finding(
+    component: &Component,
+    condition: &OperationalCondition,
+    evidence: &BTreeSet<Evidence>,
+    direct: Option<bool>,
+    as_of: DateTime<Utc>,
+) -> Finding {
+    let rule_id = RuleId::new(format!("operational-risk:{}", condition.rule))
+        .expect("static operational risk rule identifier is non-empty");
+    let id = stable_finding_id(
+        FindingKind::OperationalRisk,
+        &rule_id,
+        Some(&component.identity),
+        None,
+    );
+    let risk = RiskScorer::score(RiskInput {
+        severity: condition.severity,
+        confidence: Confidence::High,
+        applicability: ApplicabilityStatus::Affected,
+        component,
+        direct,
+        remediation: None,
+        evidence,
+        as_of: as_of.date_naive(),
+    });
+    Finding {
+        id,
+        kind: FindingKind::OperationalRisk,
+        rule_id,
+        advisory_id: None,
+        component_id: Some(component.identity.clone()),
+        location_id: None,
+        aliases: BTreeSet::new(),
+        summary: Some(format!("{} component: {}", component.name, condition.rule)),
+        details: Some(condition.rationale.clone()),
+        severity: condition.severity,
+        confidence: Confidence::High,
+        evidence: evidence.clone(),
+        applicability: Some(crate::model::Applicability {
+            status: ApplicabilityStatus::Affected,
+            rationale: Some("Finding is based only on explicit provenance metadata".to_owned()),
+        }),
+        remediation: None,
+        risk: Some(risk),
+        first_seen: None,
+        last_seen: None,
+        modified: None,
+        status: FindingStatus::Open,
     }
 }
 
@@ -613,8 +633,10 @@ mod tests {
         let inventory = inventory(component.clone());
         let evidence_by_component =
             BTreeMap::from([(component.identity.clone(), evidence(properties))]);
+        let graph = DependencyGraph::from_inventory(&inventory).expect("test inventory is acyclic");
         OperationalRiskAnalyzer::analyze(OperationalRiskInput {
             inventory: &inventory,
+            graph: &graph,
             evidence_by_component: &evidence_by_component,
             as_of: DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
                 .unwrap()
@@ -711,6 +733,64 @@ mod tests {
             OperationalRiskConfig::default(),
         );
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn graph_direct_components_get_the_directness_boost_and_roots_do_not() {
+        let mut root = component(Scope::Runtime);
+        root.identity = ComponentId::new("component:root").unwrap();
+        root.purl = "pkg:cargo/root@1.0.0".into();
+        let child = component(Scope::Runtime);
+        let properties = &[("maintenance.status", "abandoned")];
+        let inventory = Inventory {
+            asset: Asset {
+                id: AssetId::new("asset:test").unwrap(),
+                name: "test".into(),
+                kind: AssetKind::Repository,
+                version: None,
+                metadata: BTreeMap::<String, Value>::new(),
+            },
+            components: BTreeMap::from([
+                (root.identity.clone(), root.clone()),
+                (child.identity.clone(), child.clone()),
+            ]),
+            locations: BTreeSet::new(),
+            dependencies: BTreeSet::from([DependencyEdge {
+                from: root.identity.clone(),
+                to: child.identity.clone(),
+                scope: Scope::Runtime,
+                optional: false,
+            }]),
+        };
+        let evidence_by_component = BTreeMap::from([
+            (root.identity.clone(), evidence(properties)),
+            (child.identity.clone(), evidence(properties)),
+        ]);
+        let graph = DependencyGraph::from_inventory(&inventory).expect("test inventory is acyclic");
+        let findings = OperationalRiskAnalyzer::analyze(OperationalRiskInput {
+            inventory: &inventory,
+            graph: &graph,
+            evidence_by_component: &evidence_by_component,
+            as_of: DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            config: OperationalRiskConfig::default(),
+        });
+        let directness = |component_id: &ComponentId| {
+            findings
+                .values()
+                .find(|finding| finding.component_id.as_ref() == Some(component_id))
+                .map(|finding| {
+                    finding
+                        .risk
+                        .as_ref()
+                        .expect("operational findings are scored")
+                        .factors["dependency-directness"]
+                })
+                .expect("every inventoried component has an abandoned-condition finding")
+        };
+        assert_eq!(directness(&child.identity), DIRECT_COMPONENT);
+        assert_eq!(directness(&root.identity), UNKNOWN_DIRECTNESS);
     }
 
     #[test]

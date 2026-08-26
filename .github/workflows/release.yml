@@ -35,7 +35,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   HOOVERSION_VERSION: "0.1.1"
-  RUST_VERSION: "1.90.0"
 
 jobs:
   prepare:

@@ -74,6 +74,9 @@ fields are rejected. Rules can select findings by:
 Rules are evaluated by descending priority and then rule ID. Outcomes are
 `allow`, `warn`, or `deny`; if no rule matches, `default_outcome` applies.
 Policies can fail closed when applicability or license data is unknown.
+Exceptions can override these denials only when their selectors explicitly
+name the fail-closed policy id (`fail-closed-applicability` or
+`fail-closed-license`).
 
 Exceptions are deliberately narrow and auditable. Every exception requires an
 ID, owner, reason, ticket, RFC 3339 expiry, and at least one exact selector.
@@ -137,7 +140,7 @@ Hooray validates declared SPDX expressions and reports missing or invalid
 license metadata. For project directories and OCI layouts, it also examines
 bounded `LICENSE`, `LICENCE`, `COPYING`, `NOTICE`, and
 `THIRD-PARTY-NOTICES` files without following symbolic links. Recognized text
-signatures include MIT, Apache-2.0, GPL-3.0, LGPL-3.0, MPL-2.0, BSD-2-Clause,
+signatures include MIT, Apache-2.0, GPL-3.0-only/or-later, LGPL-3.0-only, MPL-2.0, BSD-2-Clause,
 BSD-3-Clause, ISC, BSL-1.0, and Unlicense. Detection is evidence, not legal
 advice; policy should decide which expressions are acceptable for a deployment.
 
@@ -341,6 +344,52 @@ cd hooray
 cargo build --locked --release
 ```
 
+## Library usage
+
+Hooray is also a library crate. Add it to a project with:
+
+```toml
+[dependencies]
+hooray = "0.5"
+```
+
+The minimum supported Rust version is 1.90, enforced through the repository's
+`rust-toolchain.toml`. The only feature flag is the optional `parity`, which
+gates the JFrog Xray record-replay harness module and its `hooray-parity`
+binary; it is disabled by default.
+
+A minimal scan pipeline:
+
+```rust
+use hooray::config::Config;
+use hooray::engine::{Engine, ScanRequest};
+use hooray::input::ScanInput;
+use hooray::report::{ReportFormat, render_to_string};
+use hooray::store::Store;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load(None)?;
+    let mut store = Store::open("hooray.db")?;
+
+    let input = ScanInput::detect("./my-project", &config)?;
+    let request = ScanRequest::new(input, std::path::PathBuf::from("hooray-policy.yaml"));
+    let report = Engine::new(&config, &mut store, None).scan(request).await?;
+
+    store.save_report(&report)?;
+    print!("{}", render_to_string(&report, ReportFormat::Json)?);
+    Ok(())
+}
+```
+
+`ScanInput::detect` auto-detects the input kind and builds the normalized
+inventory; every scan loads and evaluates a policy document, so
+`ScanRequest::new` takes its path. Passing `None` as the engine's provider
+selects the built-in OSV client; supply a custom `VulnerabilityProvider`
+implementation instead for deterministic or offline behavior.
+`render_to_string` supports the same formats as the CLI, and `save_report`
+persists the completed report to SQLite history.
+
 ## CLI reference
 
 The top-level syntax is:
@@ -530,6 +579,161 @@ The test suite covers every module with focused unit and end-to-end tests;
 CI measures line coverage on every run and enforces a 90% floor. Commit messages
 are linted as Conventional Commits, and dependency advisories, bans, licenses,
 and sources are checked on every pull request and push to `main`.
+
+Dependency-comparison claims against JFrog Xray are backed by a measured
+record-replay harness; see [JFrog Xray parity testing](#jfrog-xray-parity-testing).
+
+## JFrog Xray parity testing
+
+Hooray claims capability parity with JFrog Xray at the commit level since
+version 0.5.0. The optional `parity` harness turns that claim into a measured,
+repeatable differential test instead of an assertion: an identical
+deterministic corpus is scanned by Hooray and by a real JFrog Xray
+installation through the JFrog CLI, both outputs are normalized into one
+canonical model, and explicit overlap metrics compare the two sides.
+
+### Architecture
+
+The harness is record-replay. A deterministic corpus of about 21 cases under
+`tests/fixtures/parity/corpus/<case_id>/`, described by
+`corpus/manifest.json`, covers every supported input format kind: project
+directories, CycloneDX SBOMs, SPDX SBOMs, and ZIP archives. Each case is
+scanned twice - once with Hooray and once with real JFrog Xray invoked via
+`jf audit` - and both outputs are normalized into canonical model version 1:
+components sorted by package URL with scope, directness, and licenses;
+vulnerabilities sorted with aliases, fixed versions, and severity labels;
+license findings; and parse errors. A recording under
+`tests/fixtures/parity/recordings/<case_id>.recording.json` commits both
+sides together with provenance, so every later comparison replays offline
+without network access.
+
+Comparison runs on two tiers:
+
+- Tier 1 (CI, offline) replays committed recordings. It verifies corpus
+  detect/parse coverage against the manifest, applies a drift guard that
+  re-scans each case offline and compares components, licenses, license
+  findings, and parse errors exactly against the recorded Hooray side, and
+  computes the scorecard from recordings, applying enforcement thresholds
+  where a recording declares them.
+- Tier 2 (operator refresh) runs in a licensed environment where a real Xray
+  installation exists: capture fresh `jf audit` output per case, run `record`
+  to commit refreshed recordings, and land those recordings with the change.
+
+Determinism is pinned for replayability: scans use run ID
+`run:00000000-0000-4000-8000-000000000000` and advisory date
+`2026-01-01T00:00:00Z`.
+
+### Building and running
+
+Build the harness binary behind the `parity` feature:
+
+```bash
+cargo build --locked --features parity --bin hooray-parity
+```
+
+Scan one corpus case, normalize raw Xray output into the canonical model, or
+commit a recording that stores both sides:
+
+```bash
+hooray-parity scan-case \
+  --case tests/fixtures/parity/corpus/npm-package-lock-basic \
+  --offline --policy tests/fixtures/parity/policy/minimal-policy.yaml \
+  --format json
+
+hooray-parity normalize-xray --case npm-package-lock-basic \
+  --xray-json xray-audit.json --xray-sbom xray-sbom.json
+
+hooray-parity record \
+  --case tests/fixtures/parity/corpus/npm-package-lock-basic \
+  --out tests/fixtures/parity/recordings/npm-package-lock-basic.recording.json \
+  --xray-json xray-audit.json --xray-sbom xray-sbom.json
+```
+
+`normalize-xray` and `record` accept one or both of `--xray-json FILE` and
+`--xray-sbom FILE`; both also take optional `--xray-cli-version VERSION` and
+`--xray-db-date DATE` provenance flags.
+
+Tier-2 refreshes capture Xray reality in a licensed environment with the JFrog
+CLI; its JSON output feeds `--xray-json` and its CycloneDX SBOM feeds
+`--xray-sbom`:
+
+```bash
+jf audit --format json --licenses > xray-audit.json
+jf audit --format cyclonedx > xray-sbom.json
+```
+
+The CI gate checks the whole corpus against the recordings directory:
+
+```bash
+hooray-parity check --corpus tests/fixtures/parity/corpus \
+  --recordings tests/fixtures/parity/recordings \
+  --format table \
+  --min-purl-recall 0.95 --min-purl-precision 0.95 --min-cve-jaccard 0.8
+```
+
+`check` also accepts `--format json`; per-recording enforcement thresholds
+apply automatically when present, and the optional `--min-*` flags supply
+global floors. Exit codes follow the house convention: `0` when comparisons
+pass or a case is skipped, `1` for a parity violation, and `2` for
+operational errors such as missing files or unparseable input. The
+integration suite runs through Cargo:
+
+```bash
+cargo test --test parity_harness
+```
+
+### Recording provenance
+
+A vulnerability comparison is only meaningful against a pinned database
+state, because Xray's vulnerability database moves daily. Every recording
+therefore records provenance:
+
+- `hooray_version` - required;
+- the Xray server version and JFrog CLI version - required;
+- `xray_db_date` - required, pinning the database the comparison was made
+  against; and
+- enforcement thresholds (`min_purl_recall`, `min_purl_precision`,
+  `min_cve_jaccard`) - optional per recording.
+
+### Metrics
+
+All metrics compare the Hooray side with the Xray side using the shared match
+key `pkg:<type>/<namespace>/name@version`: type and namespace/name are
+lowercased except golang, qualifiers and fragments are stripped, and the
+version is kept verbatim.
+
+- PURL recall divides matched purls by all Xray purls; precision divides
+  matched purls by all Hooray purls.
+- CVE Jaccard similarity over the two advisory sets; two empty sets score
+  1.0.
+- Severity agreement over matched CVEs at the label level only (`unknown`,
+  `low`, `medium`, `high`, `critical`).
+- License agreement as Jaccard similarity over licenses of shared components.
+
+### Limitations
+
+Parity is bounded by what each side can know, and the scorecard measures
+overlap rather than identity:
+
+- `composer.json` yields constraint-style versions (there is no
+  `composer.lock` support), so PHP inventory parity is specifier-level
+  rather than resolved-version-level.
+- Formats without dependency edges (`requirements.txt`, `go.mod`,
+  `Pipfile.lock`, `Gemfile.lock`, `Package.resolved`, `pubspec.lock`,
+  `Podfile.lock`, `composer.json`, `environment.yml`, `Chart.yaml`) classify
+  all components as disconnected; direct/transitive parity is comparable
+  only for npm, Yarn, pnpm, Poetry, Cargo, and NuGet cases.
+- Hooray derives severity as bucketed labels from OSV while Xray exposes
+  numeric CVSS scores; severity agreement compares label buckets only.
+- Vulnerability sets can never be identical because OSV and Xray curate
+  different databases. Metrics are overlap measures, not exact-match
+  assertions, and recordings pin `xray_db_date` to keep overlaps
+  interpretable across refreshes.
+- License parity is meaningful mainly for SBOM-input and license-file cases:
+  lockfile parsers rarely carry license data while Xray's database does.
+- SBOM ingestion takes purls verbatim while Xray canonicalizes qualifier and
+  case variants; the match key normalizes case, but diffs report verbatim
+  identifiers.
 
 ## Releases
 

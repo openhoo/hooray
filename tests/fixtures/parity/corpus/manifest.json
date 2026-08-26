@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "npm-package-lock-basic",
+      "kind": "project-directory",
+      "description": "npm package-lock.json lockfileVersion 3 with direct lodash 4.17.15 (CVE-2020-8203, CVE-2019-10744), rc 1.2.8 pulling transitive minimist 1.2.0 (CVE-2020-7598), and dev-only chalk chain.",
+      "expected_ecosystems": ["npm"],
+      "min_components": 13,
+      "directness_comparable": true,
+      "notes": "Full nested dep graph (rc -> deep-extend/ini/minimist/strip-json-comments, chalk -> ansi-styles/escape-string-regexp/supports-color -> has-flag/color-convert) so dependency edges exist for directness comparison."
+    },
+    {
+      "case_id": "yarn-classic-basic",
+      "kind": "project-directory",
+      "description": "Yarn classic (v1) yarn.lock with lodash 4.17.15 and the same rc/minimist plus chalk dev chain as the npm case.",
+      "expected_ecosystems": ["npm"],
+      "min_components": 13,
+      "directness_comparable": true,
+      "notes": "Same package universe as npm-package-lock-basic; per-entry dependencies blocks produce edges."
+    },
+    {
+      "case_id": "yarn-berry-basic",
+      "kind": "project-directory",
+      "description": "Yarn Berry yarn.lock (__metadata header, resolution:/checksum:/languageName:) with lodash 4.17.15 and the same legacy graph.",
+      "expected_ecosystems": ["npm"],
+      "min_components": 13,
+      "directness_comparable": true,
+      "notes": "Berry-style keys ('name@npm:range') and hex checksums; per-entry dependencies blocks produce edges."
+    },
+    {
+      "case_id": "pnpm-basic",
+      "kind": "project-directory",
+      "description": "pnpm-lock.yaml lockfileVersion 6.0 with devDependencies (chalk chain) and optionalDependencies (fsevents 2.3.2) alongside the lodash/rc production set.",
+      "expected_ecosystems": ["npm"],
+      "min_components": 14,
+      "directness_comparable": true,
+      "notes": "importers section + /name@version packages entries; flat version pins in dependency maps carry edges."
+    },
+    {
+      "case_id": "requirements-txt-basic",
+      "kind": "project-directory",
+      "description": "Flat requirements.txt pinned to django==3.0 (multiple known CVEs), requests==2.19.0 era stack including urllib3==1.24.2.",
+      "expected_ecosystems": ["pypi"],
+      "min_components": 8,
+      "directness_comparable": false,
+      "notes": "requirements.txt carries no dependency edges by design; requests transitive deps listed explicitly as pins."
+    },
+    {
+      "case_id": "poetry-lock-basic",
+      "kind": "project-directory",
+      "description": "Modern poetry.lock ([[package]] array-of-tables with [package.dependencies]) pinning django 3.0 and markupsafe 2.0.1; pyproject.toml sibling included for realism.",
+      "expected_ecosystems": ["pypi"],
+      "min_components": 4,
+      "directness_comparable": true,
+      "notes": "django -> pytz/sqlparse [package.dependencies] entries produce edges; pyproject.toml is not an inventory input for hooray."
+    },
+    {
+      "case_id": "pipfile-lock-basic",
+      "kind": "project-directory",
+      "description": "Pipfile.lock with _meta.hash.sha256, default section (jinja2 2.11.3, CVE-2020-28493 era) and develop section (pytest 6.2.5).",
+      "expected_ecosystems": ["pypi"],
+      "min_components": 5,
+      "directness_comparable": false,
+      "notes": "Pipfile.lock records hashes only, no dependency graph."
+    },
+    {
+      "case_id": "gemfile-lock-basic",
+      "kind": "project-directory",
+      "description": "Gemfile.lock GEM/specs with rails 6.0.0 (CVE-2022-21831 era), nokogiri 1.10.10 and a consistent actionpack/activesupport/railties/rack graph.",
+      "expected_ecosystems": ["gem"],
+      "min_components": 17,
+      "directness_comparable": false,
+      "notes": "hooray emits both specs entries and their referenced dependency rows as components (hence 17); ecosystem string is 'gem'."
+    },
+    {
+      "case_id": "swift-package-resolved",
+      "kind": "project-directory",
+      "description": "Package.resolved version 2 pins array with legacy swift-nio 2.20.0 and swift-collections 0.0.4 remoteSourceControl pins.",
+      "expected_ecosystems": ["swift"],
+      "min_components": 2,
+      "directness_comparable": false,
+      "notes": "Flat pin list; no edges available from Package.resolved."
+    },
+    {
+      "case_id": "pubspec-lock-basic",
+      "kind": "project-directory",
+      "description": "pubspec.lock with sdks section, yaml 2.2.1 direct main pin, http 0.12.2, one direct dev dep (pedantic 1.11.1) and transitive http_parser/path/async.",
+      "expected_ecosystems": ["pub"],
+      "min_components": 6,
+      "directness_comparable": false,
+      "notes": "Ecosystem string is 'pub'; hosted-source descriptions in old style (name+url, no sha256)."
+    },
+    {
+      "case_id": "podfile-lock-basic",
+      "kind": "project-directory",
+      "description": "Podfile.lock PODS/DEPENDENCIES/SPEC CHECKSUMS sections with AFNetworking 3.2.1 and SDWebImage 4.4.8 -> FLAnimatedImage 1.2.0.",
+      "expected_ecosystems": ["cocoapods"],
+      "min_components": 4,
+      "directness_comparable": false,
+      "notes": "Ecosystem string is 'cocoapods'."
+    },
+    {
+      "case_id": "composer-json-basic",
+      "kind": "project-directory",
+      "description": "composer.json require/require-dev with guzzlehttp/guzzle 6.5.0 exact pin, symfony/console ^4.4 range constraint and phpunit ^8.5 dev constraint.",
+      "expected_ecosystems": ["composer"],
+      "min_components": 3,
+      "directness_comparable": false,
+      "notes": "EXPECTED QUIRK: composer.json stores constraints and hooray records them as Component.version; range constraints (^4.4, ^8.5, >=7.2.5) therefore yield VERSIONLESS purls while the exact 6.5.0 pin yields pkg:composer/guzzlehttp/guzzle@6.5.0. The php platform package is not emitted."
+    },
+    {
+      "case_id": "conda-environment-basic",
+      "kind": "project-directory",
+      "description": "environment.yml name/channels/prefix with pinned legacy conda packages (urllib3 1.25.9, jinja2 2.11.3) and a pip subsection pinning requests==2.22.0.",
+      "expected_ecosystems": ["conda", "pypi"],
+      "min_components": 5,
+      "directness_comparable": false,
+      "notes": "pip subsection components are emitted as pypi; conda entries as conda."
+    },
+    {
+      "case_id": "helm-chart-basic",
+      "kind": "project-directory",
+      "description": "Chart.yaml apiVersion v2 with dependencies[] carrying repository/version/condition/tags for bitnami postgresql 9.8.0 and redis 10.5.7.",
+      "expected_ecosystems": ["helm"],
+      "min_components": 2,
+      "directness_comparable": false
+    },
+    {
+      "case_id": "cargo-lock-basic",
+      "kind": "project-directory",
+      "description": "Cargo.lock version 3 with a small registry graph demo-crate -> dep-a 1.0.0 -> dep-b 0.2.1 -> dep-c 0.4.2; Cargo.toml sibling declares the root crate license (MIT OR Apache-2.0).",
+      "expected_ecosystems": ["cargo"],
+      "min_components": 4,
+      "directness_comparable": true,
+      "notes": "[[package]] blocks produce [[package]].dependencies edges; Cargo.toml sidecar exercises the license inheritance path."
+    },
+    {
+      "case_id": "go-mod-basic",
+      "kind": "project-directory",
+      "description": "go.mod with module/go/toolchain directives and require block pinning golang.org/x/crypto v0.0.0-20190308221718-c2843e01e9fb pseudo-version (CVE-2020-9283/9288 window) and github.com/pkg/errors v0.9.1; go.sum sibling included.",
+      "expected_ecosystems": ["golang"],
+      "min_components": 2,
+      "directness_comparable": false,
+      "notes": "go.sum is hashed as a sidecar but must NOT emit packages; component count equals go.mod require count exactly."
+    },
+    {
+      "case_id": "nuget-packages-lock",
+      "kind": "project-directory",
+      "description": "packages.lock.json for .NETCoreApp v3.1 with Direct Castle.Windsor 5.0.0 -> Transitive Castle.Core 4.4.0, Serilog.Sinks.File 3.1.1 -> Serilog 2.9.0, and Direct Newtonsoft.Json 12.0.3.",
+      "expected_ecosystems": ["nuget"],
+      "min_components": 5,
+      "directness_comparable": true,
+      "notes": "type Direct/Transitive plus per-package dependencies maps give real edges."
+    },
+    {
+      "case_id": "cyclonedx-sbom-nested",
+      "kind": "cyclonedx-sbom",
+      "description": "CycloneDX 1.6 bom.cdx.json adapted from the official CycloneDX 1.6 example (see UPSTREAM): metadata.component root plus lodash 4.17.15 (MIT expression license), minimist 1.2.0, django 3.0, all with versioned purls and a dependencies[] graph.",
+      "expected_ecosystems": ["npm", "pypi"],
+      "min_components": 3,
+      "directness_comparable": true,
+      "notes": "Versioned purls required on every component or the scan aborts. Declared edges between collected COMPONENTS are recorded (lodash -> minimist); dependsOn entries naming only metadata.component are dropped by hooray's refs map, so the fixture keeps a component-to-component edge."
+    },
+    {
+      "case_id": "spdx-sbom-basic",
+      "kind": "spdx-sbom",
+      "description": "SPDX-2.3 doc.spdx.json with spdxVersion SPDX-2.3, three packages carrying versionInfo and versioned purl externalRefs, one DESCRIBES and resolving DEPENDS_ON relationships.",
+      "expected_ecosystems": ["npm"],
+      "min_components": 3,
+      "directness_comparable": true,
+      "notes": "Unversioned purl externalRefs fail closed (InvalidComponent); observed DEPENDS_ON relationships produce two real dependency edges, so directness comparison applies."
+    },
+    {
+      "case_id": "archive-zip-project",
+      "kind": "archive-zip",
+      "description": "Deterministically built project.zip containing a simplified package-lock.json (lodash 4.17.15, rc 1.2.8 -> minimist 1.2.0) from the same content family as npm-package-lock-basic.",
+      "expected_ecosystems": ["npm"],
+      "min_components": 3,
+      "directness_comparable": false,
+      "notes": "Scan via 'scan artifact'; zip members route through the same virtual-file lockfile dispatch as directories."
+    },
+    {
+      "case_id": "license-files-project",
+      "kind": "project-directory",
+      "description": "Single-package Cargo project (license-files-project 0.1.0, no declared license) with LICENSE (MIT text) and COPYING (BSD-2-Clause text) files.",
+      "expected_ecosystems": ["cargo"],
+      "min_components": 1,
+      "directness_comparable": false,
+      "notes": "Detected license files attribute only to the unlicensed asset-named component (license.rs asset_component contract), so the package name must equal the directory name. Expect two detected license findings with case-relative paths."
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "dependencies": {
+    ".NETCoreApp,Version=v3.1": {
+      "Castle.Core": {
+        "type": "Transitive",
+        "resolved": "4.4.0",
+        "contentHash": "XjJTbvHr6u5cJIHcbN3rd2wC9jC4Yr7+iTtxh73lpJqQKldAK6IA7/zbadJR+cfXwfW4LQLr4Z+yhRpqll7WIQ=="
+      },
+      "Castle.Windsor": {
+        "type": "Direct",
+        "requested": "[5.0.0, )",
+        "resolved": "5.0.0",
+        "contentHash": "Cqnvx1cNhEhOxWWVHa5Ardh57atoSVfwga0lmkKkpzGyqFdIbG7yDgL7mN5/N6XIM9vlxZXBWAr4VOdbJEOsoA==",
+        "dependencies": {
+          "Castle.Core": "4.4.0"
+        }
+      },
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[12.0.3, )",
+        "resolved": "12.0.3",
+        "contentHash": "cEYSX0dI4Ikw+MZUxM6KCLoS8W+8mgOgHeI6/8kaNLIrpOZRmpx6r/KibODIYyOTyFjRQkrZDiy4LrlexM71rg=="
+      },
+      "Serilog": {
+        "type": "Transitive",
+        "resolved": "2.9.0",
+        "contentHash": "yw9itT1+bY5aRZCeIXCGmvCoDs7IL85RU8ijbMbyCGKu11lalzi2jH/p9LOubbMzhCfvwwlhv6xOM46jkTXaeA=="
+      },
+      "Serilog.Sinks.File": {
+        "type": "Direct",
+        "requested": "[3.1.1, )",
+        "resolved": "3.1.1",
+        "contentHash": "7R0B6k4X0p7rbxMVAI338trMRSjPHp90Buqkjh5FitVTt7zc/OTJlsZ4UHLtIHaAiQLxVB5nRiV0AujU4PvtUQ==",
+        "dependencies": {
+          "Serilog": ">= 2.8.0"
+        }
+      }
+    }
+  }
+}

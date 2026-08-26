@@ -1,0 +1,12 @@
+name: demo-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8.10
+  - urllib3=1.25.9
+  - jinja2=2.11.3
+  - pip=20.2.4
+  - pip:
+      - requests==2.22.0
+prefix: /opt/conda/envs/demo-env

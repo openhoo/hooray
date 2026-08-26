@@ -1,0 +1,104 @@
+lockfileVersion: '6.0'
+
+dependencies:
+  lodash:
+    specifier: ^4.17.15
+    version: 4.17.15
+  rc:
+    specifier: ^1.2.8
+    version: 1.2.8
+
+devDependencies:
+  chalk:
+    specifier: ^2.4.2
+    version: 2.4.2
+
+optionalDependencies:
+  fsevents:
+    specifier: ^2.3.2
+    version: 2.3.2
+
+packages:
+
+  /ansi-styles@3.2.1:
+    resolution: {integrity: sha512-mE65v5BJdQvJA0UIk8ScDsfwAFPdSRUp9GqGbXHYA6XVhKBAD/M/MZV8D07zADpCghRoP1wCQK2VxilHXNdFgw==}
+    engines: {node: '>=4'}
+    dependencies:
+      color-convert: 1.9.3
+    dev: false
+
+  /chalk@2.4.2:
+    resolution: {integrity: sha512-Fv/Fzn4DsjuaJfLKlc2RPxB7Ilq+/UDPM991oKirSyHZxL6H7pMRXqfVAu/wHhjY8tzY8DZQXTVemaiUeukgDw==}
+    engines: {node: '>=4'}
+    dependencies:
+      ansi-styles: 3.2.1
+      escape-string-regexp: 1.0.5
+      supports-color: 5.5.0
+    dev: false
+
+  /color-convert@1.9.3:
+    resolution: {integrity: sha512-pNx0RWYrkPEfaySnfE6c5RRWskPa0ehYNWIUW6CbISkn1Pb5Xz4Yq+FEpZ7pjXAPewBcCerxVSU6bELI2c2K7w==}
+    dependencies:
+      color-name: 1.1.3
+    dev: false
+
+  /color-name@1.1.3:
+    resolution: {integrity: sha512-TzqZ2QQ6xEZB2TeZ5cSN/S56l2SHXu/KwIn6PYnPQpGJnOPPzB6lleu9raYxiOFdCUWyN7XR8GwmT0bi7N5axA==}
+    dev: false
+
+  /deep-extend@0.6.0:
+    resolution: {integrity: sha512-Q95yznedirWz8Z5UT6M6V/Soohgs5tndWrOoq5Vev5wFPtNp5VVBBmoS8EEdOJVEsuLQtdMjJIMfHpJmFESUNg==}
+    dev: false
+
+  /escape-string-regexp@1.0.5:
+    resolution: {integrity: sha512-yG9m8gFsiH4OZKVG4+HPeT4R3MQhzPbdsi8HbyKsaAfncRgWmry75Waa6Qw2kxto8hDoNqE0v/oGVEtUkXhnuQ==}
+    engines: {node: '>=0.8.0'}
+    dev: false
+
+  /fsevents@2.3.2:
+    resolution: {integrity: sha512-CK8e4Dgzs/zDztbOFBf/RyB0ksWKWFwLo28EpfwQf20Heshsb0g7vJAjPpmqfd+9KQukIbbARhUYTYhrxxZ5cQ==}
+    engines: {node: '^8.16.0 || >=10.6.0'}
+    requiresBuild: true
+    optional: true
+    dev: false
+
+  /has-flag@3.0.0:
+    resolution: {integrity: sha512-pSrPWrLX4cgaHXIrl73mcNvzKB+LYXeMzA3fNZDuIC8a4OnP1kssD9bVN5gtje8lDmQkMIPq065FtojTMs+C6Q==}
+    engines: {node: '>=4'}
+    dev: false
+
+  /ini@1.3.5:
+    resolution: {integrity: sha512-g6jWTg6Wlf/ckvYAkMS0LRbmVpXonvA1/dOzu8+jmIK8Y/GWlTivUKMixcyY9QlpNsjN5/BFhy9wf/tDSEjBbQ==}
+    dev: false
+
+  /lodash@4.17.15:
+    resolution: {integrity: sha512-Xew+85XBfVbNuIp0sAECx1QNL5KLdw7O9P3DiX68DZaVYT5VyJ6hzzmWmEzfzTFJYwKSIb/4KPtFXH8OLOGiNw==}
+    dev: false
+
+  /minimist@1.2.0:
+    resolution: {integrity: sha512-uVboR5Omj/bcLuqfTrFdnfzPhQhBRprU7iocnJVoEW4GebZqfhAIm6ElUkiPBNyrDKpwy1riDNZOn3Rr9Zp+pg==}
+    dev: false
+
+  /rc@1.2.8:
+    resolution: {integrity: sha512-fqpEtuoEUtweD3ar1Nm4/i/eMUhAWLu8l4TKJe9pyvM5MDbQNwuq6TUY/SaCO4rokr2Tfj410tCgNUmFwvDHXw==}
+    dependencies:
+      deep-extend: 0.6.0
+      ini: 1.3.5
+      minimist: 1.2.0
+      strip-json-comments: 2.0.1
+    dev: false
+
+  /strip-json-comments@2.0.1:
+    resolution: {integrity: sha512-yt39myfcQobXz8TwX3pEkOBUUX2VgPGdVdoL9FPxTsexlVpyZ17LTtEsvexRjOSC3kd6vkofg9/a2FXiEo8PUg==}
+    dev: false
+
+  /supports-color@5.5.0:
+    resolution: {integrity: sha512-KJ3SE0Np4A4Z8oOvHThnlldSlyDF5fL1byXgt9ff7gVYcyvUm2c3WMUqHfwerEn6oTJKRd87lGGI3foGdUy9uA==}
+    engines: {node: '>=4'}
+    dependencies:
+      has-flag: 3.0.0
+    dev: false
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false

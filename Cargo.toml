@@ -14,13 +14,21 @@ name = "hooray"
 path = "src/main.rs"
 
 
+[[bin]]
+name = "hooray-parity"
+path = "src/bin/hooray-parity.rs"
+required-features = ["parity"]
+
+[features]
+parity = []
+
 [[bench]]
 name = "performance"
 harness = false
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 globset = "0.4"
@@ -37,16 +45,25 @@ tar = "0.4"
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "limit", "request-id", "trace"] }
-uuid = { version = "1.18", features = ["serde", "v4"] }
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1.18", features = ["v4"] }
 walkdir = "2.5"
 zip = { version = "4.6", default-features = false, features = ["bzip2", "deflate", "zstd"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 http-body-util = "0.1"
 jsonschema = { version = "0.47", default-features = false, features = ["resolve-file"] }
-proptest = "1.7"
 tempfile = "3.20"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
+tokio = { version = "1.45", features = ["macros", "rt", "test-util"] }
+
+# No panic=abort: spawn_blocking JoinError handling and poisoned-store
+# recovery rely on unwinding.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

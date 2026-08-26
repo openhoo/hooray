@@ -285,17 +285,27 @@ struct Detection {
     name: Option<String>,
     confidence: Confidence,
     matched: &'static str,
+    /// Matched descriptors of lower-precedence signatures that also matched
+    /// the same text; empty when exactly one signature matched.
+    additional_matched: Vec<&'static str>,
 }
 impl Detection {
     fn evidence(&self) -> Evidence {
+        let mut properties = BTreeMap::from([
+            ("path".into(), self.path.clone()),
+            ("detector".into(), self.matched.into()),
+        ]);
+        if !self.additional_matched.is_empty() {
+            let mut detectors = Vec::with_capacity(1 + self.additional_matched.len());
+            detectors.push(self.matched);
+            detectors.extend_from_slice(&self.additional_matched);
+            properties.insert("matched_detectors".into(), detectors.join(", "));
+        }
         Evidence {
             description: format!("{} matched {}", self.path, self.matched),
             locations: BTreeSet::new(),
             references: BTreeSet::new(),
-            properties: BTreeMap::from([
-                ("path".into(), self.path.clone()),
-                ("detector".into(), self.matched.into()),
-            ]),
+            properties,
             redacted: false,
         }
     }
@@ -311,7 +321,13 @@ struct LicenseSignature {
 
 /// Probe order is precedence: the first row whose needles all occur in the
 /// whitespace-normalized text wins. Near-duplicates (GPL or-later before
-/// only, BSD-3 before BSD-2) must stay above their weaker siblings.
+/// only, BSD-3 before BSD-2) must stay above their weaker siblings, and
+/// LGPL-3.0-only must stay above both GPL-3.0 rows: the canonical LGPL-3.0
+/// text incorporates the terms and conditions of version 3 of the GNU
+/// General Public License, so it contains the plain GPL needle pair and an
+/// earlier GPL probe would misread it as GPL. Pure GPL texts never contain
+/// the "gnu lesser general public license" title needle, so this earlier
+/// LGPL row cannot steal them.
 const SIGNATURES: &[LicenseSignature] = &[
     LicenseSignature {
         needles: &[
@@ -335,6 +351,13 @@ const SIGNATURES: &[LicenseSignature] = &[
         matched: "Apache-2.0 title and canonical URL",
     },
     LicenseSignature {
+        needles: &["gnu lesser general public license", "version 3"],
+        expression: Some("LGPL-3.0-only"),
+        name: "GNU LGPL v3",
+        confidence: Confidence::Medium,
+        matched: "LGPL v3 title",
+    },
+    LicenseSignature {
         needles: &[
             "gnu general public license",
             "version 3",
@@ -351,13 +374,6 @@ const SIGNATURES: &[LicenseSignature] = &[
         name: "GNU GPL v3",
         confidence: Confidence::Medium,
         matched: "GPL v3 title",
-    },
-    LicenseSignature {
-        needles: &["gnu lesser general public license", "version 3"],
-        expression: Some("LGPL-3.0-only"),
-        name: "GNU LGPL v3",
-        confidence: Confidence::Medium,
-        matched: "LGPL v3 title",
     },
     LicenseSignature {
         needles: &["mozilla public license version 2.0"],
@@ -419,27 +435,50 @@ fn detect_license_text(path: &str, bytes: &[u8]) -> Detection {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let signature = SIGNATURES.iter().find(|signature| {
+    let mut candidates = SIGNATURES.iter().filter(|signature| {
         signature
             .needles
             .iter()
             .all(|needle| normalized.contains(needle))
     });
-    match signature {
-        Some(signature) => Detection {
-            path: path.to_owned(),
-            expression: signature.expression.map(str::to_owned),
-            name: Some(signature.name.into()),
-            confidence: signature.confidence,
-            matched: signature.matched,
-        },
-        None => Detection {
+    let Some(signature) = candidates.next() else {
+        return Detection {
             path: path.to_owned(),
             expression: None,
             name: Some("unknown or undetermined license text".into()),
             confidence: Confidence::Low,
             matched: "no canonical license signature",
-        },
+            additional_matched: Vec::new(),
+        };
+    };
+    // Precedence picks the winner; identity stays on the first match.
+    // Implied-subset signatures are non-independent detections: every needle
+    // they require already matched inside the winner, so they neither
+    // downgrade confidence nor count as extra evidence. Remaining extra
+    // co-matching signatures only downgrade confidence to their minimum and
+    // are recorded as evidence.
+    let mut confidence = signature.confidence;
+    let mut additional_matched = Vec::new();
+    for other in candidates {
+        if other
+            .needles
+            .iter()
+            .all(|needle| signature.needles.contains(needle))
+        {
+            continue;
+        }
+        if other.confidence < confidence {
+            confidence = other.confidence;
+        }
+        additional_matched.push(other.matched);
+    }
+    Detection {
+        path: path.to_owned(),
+        expression: signature.expression.map(str::to_owned),
+        name: Some(signature.name.into()),
+        confidence,
+        matched: signature.matched,
+        additional_matched,
     }
 }
 
@@ -1047,5 +1086,161 @@ mod tests {
         // Without a per-license discriminator both entries collapsed onto one id.
         assert_ne!(analysis.findings[0].id, analysis.findings[1].id);
         assert_ne!(analysis.findings[0].summary, analysis.findings[1].summary);
+    }
+    #[test]
+    fn multiple_detected_license_files_fuse_onto_one_id_keeping_first_alias() {
+        // Two matched license files on one unlicensed component emit per-file
+        // entries that share a single stable finding id (same kind/rule/
+        // component, no salt or location); downstream id-keyed merging folds
+        // them into exactly one report finding. Emission is sorted by path,
+        // so COPYING precedes LICENSE regardless of input order and its BSD
+        // alias is the primary attribution that survives the fusion.
+        let analysis = analyze_with_files(
+            &inventory(BTreeSet::new()),
+            vec![
+                (
+                    "LICENSE".into(),
+                    b"MIT License\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software. THE SOFTWARE IS PROVIDED \"AS IS\"".to_vec(),
+                ),
+                (
+                    "COPYING".into(),
+                    b"Redistribution and use in source and binary forms, with or without modification, are permitted provided that neither the name of the project nor the names of its contributors may be used to endorse derived products.".to_vec(),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(analysis.findings.len(), 2);
+        let ids: BTreeSet<_> = analysis
+            .findings
+            .iter()
+            .map(|finding| &finding.id)
+            .collect();
+        assert_eq!(ids.len(), 1);
+        let bsd_entry = &analysis.findings[0];
+        assert_eq!(
+            bsd_entry.summary.as_deref(),
+            Some("License file suggests BSD-3-Clause")
+        );
+        assert_eq!(bsd_entry.confidence, Confidence::Medium);
+        assert_eq!(bsd_entry.aliases, BTreeSet::from(["BSD-3-Clause".into()]));
+        assert_eq!(
+            bsd_entry.evidence.iter().next().unwrap().properties["path"],
+            "COPYING"
+        );
+        let mit_entry = &analysis.findings[1];
+        assert_eq!(
+            mit_entry.summary.as_deref(),
+            Some("License file suggests MIT")
+        );
+        assert_eq!(mit_entry.aliases, BTreeSet::from(["MIT".into()]));
+        assert_eq!(
+            mit_entry.evidence.iter().next().unwrap().properties["path"],
+            "LICENSE"
+        );
+    }
+
+    #[test]
+    fn canonical_lgpl3_text_identifies_lgpl_not_gpl() {
+        // Verbatim gnu.org LGPL-3.0 excerpt: its incorporation clause contains
+        // the plain GPL needle pair, so the LGPL row must be probed first.
+        let detection = detect_license_text(
+            "LICENSE",
+            b"GNU LESSER GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007\n\n Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>\n Everyone is permitted to copy and distribute verbatim copies\n of this license document, but changing it is not allowed.\n\n  This version of the GNU Lesser General Public License incorporates\nthe terms and conditions of version 3 of the GNU General Public\nLicense, supplemented by the additional permissions listed below.".as_slice(),
+        );
+        assert_eq!(detection.expression.as_deref(), Some("LGPL-3.0-only"));
+        assert_eq!(detection.name.as_deref(), Some("GNU LGPL v3"));
+        assert_eq!(detection.confidence, Confidence::Medium);
+        assert_eq!(
+            detection.evidence().properties["matched_detectors"],
+            "LGPL v3 title, GPL v3 title"
+        );
+    }
+
+    #[test]
+    fn lgpl21_grant_does_not_match_lgpl3_or_gpl3_needles() {
+        let detection = detect_license_text(
+            "COPYING.lesser",
+            b"Copyright (C) 1991 Free Software Foundation, Inc.\nThis library is free software; you can redistribute it and/or modify it under the terms of the GNU Lesser General Public License as published by the Free Software Foundation; either version 2.1 of the License, or (at your option) any later version.".as_slice(),
+        );
+        assert_eq!(detection.expression, None);
+        assert!(detection.name.is_some());
+        assert_eq!(detection.confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn pure_gpl_or_later_text_keeps_high_confidence_without_subset_noise() {
+        // The GPL-3.0-only needle set is implied by the or-later grant, so
+        // that subset row must neither downgrade High nor appear as a second
+        // detector.
+        let detection = detect_license_text(
+            "COPYING",
+            b"GNU General Public License Version 3; either version 3 of the License, or (at your option) any later version".as_slice(),
+        );
+        assert_eq!(detection.expression.as_deref(), Some("GPL-3.0-or-later"));
+        assert_eq!(detection.confidence, Confidence::High);
+        assert!(
+            !detection
+                .evidence()
+                .properties
+                .contains_key("matched_detectors")
+        );
+    }
+
+    #[test]
+    fn concatenated_mit_and_lgpl_still_attributes_mit_first_row_wins() {
+        let result = analyze_with_files(
+            &inventory(BTreeSet::new()),
+            vec![(
+                "LICENSE".into(),
+                b"MIT License\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software. THE SOFTWARE IS PROVIDED \"AS IS\"\n\nGNU LESSER GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007\nThis version of the GNU Lesser General Public License incorporates\nthe terms and conditions of version 3 of the GNU General Public\nLicense, supplemented by the additional permissions listed below.".to_vec(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].aliases, BTreeSet::from(["MIT".into()]));
+        assert_eq!(
+            result.findings[0].summary.as_deref(),
+            Some("License file suggests MIT")
+        );
+        // Co-matching LGPL/GPL signatures downgrade MIT's confidence to their
+        // shared minimum instead of keeping High.
+        assert_eq!(result.findings[0].confidence, Confidence::Medium);
+        assert_eq!(
+            result.findings[0]
+                .evidence
+                .iter()
+                .next()
+                .unwrap()
+                .properties["matched_detectors"],
+            "MIT canonical clauses, LGPL v3 title, GPL v3 title"
+        );
+    }
+
+    #[test]
+    fn concatenated_mit_and_gpl_downgrades_confidence_and_lists_both_detectors() {
+        let result = analyze_with_files(
+            &inventory(BTreeSet::new()),
+            vec![(
+                "LICENSE".into(),
+                b"MIT License\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software. THE SOFTWARE IS PROVIDED \"AS IS\"\n\nGNU General Public License Version 3".to_vec(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].aliases, BTreeSet::from(["MIT".into()]));
+        assert_eq!(
+            result.findings[0].summary.as_deref(),
+            Some("License file suggests MIT")
+        );
+        assert_eq!(result.findings[0].confidence, Confidence::Medium);
+        assert_eq!(
+            result.findings[0]
+                .evidence
+                .iter()
+                .next()
+                .unwrap()
+                .properties["matched_detectors"],
+            "MIT canonical clauses, GPL v3 title"
+        );
     }
 }
