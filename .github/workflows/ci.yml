@@ -29,7 +29,7 @@ jobs:
           fetch-depth: 0
 
       - name: Lint commit messages
-        uses: openhoo/hooversion/actions/lint@f5ee7eef255519b4ef33f4a93c7223805113c3a2 # v0.1.1
+        uses: openhoo/hooversion/actions/lint@799ecf4a9c29e8ce4d5ad7055a6030adf665cf82 # v0.2.0
         with:
           version: 0.1.1
 
