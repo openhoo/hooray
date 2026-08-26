@@ -454,7 +454,7 @@ fn main() {
         let spent = started.elapsed();
         save_elapsed += spent;
         save_iterations += 1;
-        if spent >= SAMPLE_TIME {
+        if save_elapsed >= SAMPLE_TIME {
             break;
         }
     }
