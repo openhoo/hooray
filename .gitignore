@@ -2,6 +2,7 @@
 /dist/
 /.hooversion/
 /.release-version
+hooray.db*
 
 # Editors
 .idea/

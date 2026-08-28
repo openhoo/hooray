@@ -589,7 +589,11 @@ fn collect_license_files(
             source: io::Error::other(error),
         })?;
         if entry.file_type().is_symlink() {
-            return Err(LicenseError::Symlink(entry.path().to_owned()));
+            // WalkDir does not follow links. Skip nested links, including
+            // license-shaped names, so their external targets cannot be
+            // attributed to this asset and unrelated tooling links do not
+            // make an otherwise safe repository unscannable.
+            continue;
         }
         if !entry.file_type().is_file() {
             continue;
@@ -857,16 +861,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlinks_in_license_tree() {
+    fn skips_symlinks_in_license_tree_without_reading_targets() {
         use std::os::unix::fs::symlink;
         let dir = tempdir().unwrap();
         let outside = tempdir().unwrap();
         fs::write(outside.path().join("LICENSE"), "secret").unwrap();
         symlink(outside.path().join("LICENSE"), dir.path().join("LICENSE")).unwrap();
-        assert!(matches!(
-            collect_license_files(dir.path(), 1024),
-            Err(LicenseError::Symlink(_))
-        ));
+        assert!(collect_license_files(dir.path(), 1024).unwrap().is_empty());
     }
 
     #[test]

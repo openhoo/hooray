@@ -5,6 +5,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
+    time::Duration,
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -19,8 +20,9 @@ use crate::{
     input::ScanInput,
     license,
     model::{
-        ApplicabilityStatus, ComponentId, DependencyKind, Evidence, Finding, FindingId,
-        FindingKind, Inventory, PolicySummary, RunId, RunMetadata, ScanReport,
+        Applicability, ApplicabilityStatus, ComponentId, Confidence, DependencyKind, Evidence,
+        Finding, FindingId, FindingKind, FindingStatus, Inventory, PolicySummary, Remediation,
+        RuleId, RunId, RunMetadata, ScanReport, Severity, salted_finding_id,
     },
     osv::{OsvClient, OsvError},
     policy::{Policy, PolicyError},
@@ -197,8 +199,12 @@ impl<'a> Engine<'a> {
             match self.provider {
                 Some(provider) => provider.scan(&inventory).await?,
                 None => {
-                    let provider =
-                        OsvClient::new(&self.config.osv_url, self.config.max_concurrency)?;
+                    let provider = OsvClient::with_timeouts(
+                        &self.config.osv_url,
+                        self.config.max_concurrency,
+                        Duration::from_secs(self.config.osv_connect_timeout_secs),
+                        Duration::from_secs(self.config.osv_request_timeout_secs),
+                    )?;
                     provider.scan(&inventory).await?
                 }
             }
@@ -495,10 +501,72 @@ fn filesystem_findings(
         &scanner_config,
         &MalwareSignatures::default(),
     )?;
-    inventory.locations.extend(output.locations);
+    let scanners::ScanOutput {
+        locations,
+        mut findings,
+        scanned_files,
+        scanned_bytes,
+        skipped_files,
+    } = output;
+    inventory.locations.extend(locations);
+    if skipped_files > 0 {
+        let rule_id = RuleId::new("scanner:coverage-incomplete")
+            .expect("static scanner rule identifier is valid");
+        findings.push(Finding {
+            id: salted_finding_id(
+                FindingKind::OperationalRisk,
+                &rule_id,
+                None,
+                None,
+                inventory.asset.id.as_str(),
+            ),
+            kind: FindingKind::OperationalRisk,
+            rule_id,
+            advisory_id: None,
+            component_id: None,
+            location_id: None,
+            aliases: BTreeSet::new(),
+            summary: Some("Filesystem scan coverage was incomplete".to_owned()),
+            details: Some(
+                "One or more files exceeded configured admission bounds and were not analyzed."
+                    .to_owned(),
+            ),
+            severity: Severity::High,
+            confidence: Confidence::High,
+            evidence: BTreeSet::from([Evidence {
+                description: "Bounded filesystem scanner admission summary".to_owned(),
+                locations: BTreeSet::new(),
+                references: BTreeSet::new(),
+                properties: BTreeMap::from([
+                    ("scanned_bytes".to_owned(), scanned_bytes.to_string()),
+                    ("scanned_files".to_owned(), scanned_files.to_string()),
+                    (
+                        "skipped_files_lower_bound".to_owned(),
+                        skipped_files.to_string(),
+                    ),
+                ]),
+                redacted: false,
+            }]),
+            applicability: Some(Applicability {
+                status: ApplicabilityStatus::Affected,
+                rationale: Some("Scanner admission counters prove omitted coverage.".to_owned()),
+            }),
+            remediation: Some(Remediation {
+                description:
+                    "Raise scanner input/file bounds or reduce the scan target, then rescan."
+                        .to_owned(),
+                fixed_versions: BTreeSet::new(),
+                references: BTreeSet::new(),
+            }),
+            risk: None,
+            first_seen: None,
+            last_seen: None,
+            modified: None,
+            status: FindingStatus::Open,
+        });
+    }
     let known_locations = inventory.location_ids();
-    Ok(output
-        .findings
+    Ok(findings
         .into_iter()
         .map(|mut finding| {
             if finding
@@ -521,7 +589,7 @@ fn filesystem_findings(
         .collect())
 }
 
-fn attach_dependency_remediation(
+pub(crate) fn attach_dependency_remediation(
     inventory: &Inventory,
     graph: &DependencyGraph,
     findings: &mut BTreeMap<FindingId, Finding>,
@@ -585,7 +653,7 @@ fn attach_dependency_remediation(
     Ok(())
 }
 
-fn merge_operational_risk(
+pub(crate) fn merge_operational_risk(
     inventory: &Inventory,
     graph: &DependencyGraph,
     findings: &mut BTreeMap<FindingId, Finding>,
@@ -611,7 +679,7 @@ fn merge_operational_risk(
     }
 }
 
-fn merge_findings(target: &mut BTreeMap<FindingId, Finding>, incoming: Vec<Finding>) {
+pub(crate) fn merge_findings(target: &mut BTreeMap<FindingId, Finding>, incoming: Vec<Finding>) {
     for finding in incoming {
         merge_finding(target, finding);
     }
@@ -888,6 +956,33 @@ mod tests {
             Some("2026-01-04T00:00:00.000Z")
         );
         assert_eq!(merged.modified.as_deref(), Some("2026-01-04T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn filesystem_bound_omissions_become_policy_visible_findings() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("one.py"), "print('one')\n").unwrap();
+        fs::write(project.join("two.py"), "print('two')\n").unwrap();
+        let input = ScanInput::ProjectDirectory(project);
+        let mut inventory = minimal_report().inventory;
+        let config = Config {
+            max_archive_entries: 1,
+            ..Config::default()
+        };
+
+        let findings = filesystem_findings(&input, &mut inventory, &config).unwrap();
+        let coverage = findings
+            .iter()
+            .find(|finding| finding.rule_id.as_str() == "scanner:coverage-incomplete")
+            .unwrap();
+        assert_eq!(coverage.kind, FindingKind::OperationalRisk);
+        assert_eq!(coverage.severity, Severity::High);
+        assert_eq!(
+            coverage.evidence.iter().next().unwrap().properties["skipped_files_lower_bound"],
+            "1"
+        );
     }
 
     #[tokio::test]

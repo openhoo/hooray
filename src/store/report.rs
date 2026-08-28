@@ -19,6 +19,9 @@ impl Store {
     pub fn save_report(&mut self, report: &ScanReport) -> Result<(), StoreError> {
         reject_unredacted_secrets(&report.findings)?;
         report.validate()?;
+        let sanitized = crate::report::sanitize_report(report)
+            .map_err(|error| StoreError::Sanitization(error.to_string()))?;
+        let report = &*sanitized;
         let report_json = serde_json::to_string(report)?;
         let finding_count =
             i64::try_from(report.findings.len()).map_err(|_| StoreError::FindingCountOverflow)?;
@@ -1003,5 +1006,40 @@ mod tests {
             s.save_report(&r),
             Err(StoreError::UnredactedSecret { .. })
         ));
+    }
+
+    #[test]
+    fn sensitive_free_form_values_are_redacted_before_persistence() {
+        let mut store = Store::open_memory().unwrap();
+        let mut report = rich_report("run:redacted", "2026-01-01Z", "asset:redacted");
+        report
+            .run
+            .metadata
+            .insert("api_key".to_owned(), serde_json::json!("raw-run-secret"));
+        report.inventory.asset.metadata.insert(
+            "deployment".to_owned(),
+            serde_json::json!({"clientSecret":"raw-asset-secret","region":"eu"}),
+        );
+
+        store.save_report(&report).unwrap();
+        let stored = store.get_run(&report.run.id).unwrap().unwrap();
+        let serialized = serde_json::to_string(&stored).unwrap();
+        assert!(serialized.contains("[REDACTED]"));
+        assert!(serialized.contains("eu"));
+        assert!(!serialized.contains("raw-run-secret"));
+        assert!(!serialized.contains("raw-asset-secret"));
+
+        let raw: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT r.report_json, a.asset_json FROM scan_runs r JOIN scan_assets a USING (run_id) WHERE r.run_id=?1",
+                [report.run.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        for value in [raw.0, raw.1] {
+            assert!(!value.contains("raw-run-secret"));
+            assert!(!value.contains("raw-asset-secret"));
+        }
     }
 }

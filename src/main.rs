@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -525,9 +526,21 @@ async fn run_monitor(config: &Config, args: MonitorArgs) -> Result<CommandOutcom
     let runner = Arc::new(CliMonitorRunner {
         config: config.clone(),
     });
+    let poll_interval = Duration::from_secs(config.monitor_interval_secs);
     match webhook {
-        Some(notifier) => run_monitor_loop(store, runner, args.once, Arc::new(notifier)).await,
-        None => run_monitor_loop(store, runner, args.once, Arc::new(StderrNotifier)).await,
+        Some(notifier) => {
+            run_monitor_loop(store, runner, args.once, Arc::new(notifier), poll_interval).await
+        }
+        None => {
+            run_monitor_loop(
+                store,
+                runner,
+                args.once,
+                Arc::new(StderrNotifier),
+                poll_interval,
+            )
+            .await
+        }
     }
 }
 
@@ -536,13 +549,17 @@ async fn run_monitor_loop<N: Notifier>(
     runner: Arc<CliMonitorRunner>,
     once: bool,
     notifier: Arc<N>,
+    poll_interval: Duration,
 ) -> Result<CommandOutcome> {
     let mut service = MonitorService::new(
         store,
         Arc::new(SystemClock),
         runner,
         notifier,
-        MonitorConfig::default(),
+        MonitorConfig {
+            poll_interval,
+            ..MonitorConfig::default()
+        },
     )?;
     if once {
         service.run_once().await?;
@@ -691,14 +708,40 @@ impl MonitorRunner for CliMonitorRunner {
             use sha2::{Digest, Sha256};
             use walkdir::WalkDir;
 
-            let root = PathBuf::from(target.source.as_str());
+            let requested_root = PathBuf::from(target.source.as_str());
             let max_input_bytes = self.config.max_input_bytes;
             let max_archive_entries = self.config.max_archive_entries;
+            let database_path = self.config.database_path.clone();
             tokio::task::spawn_blocking(move || -> Result<String, MonitorError> {
-                let metadata = std::fs::symlink_metadata(&root)
+                let metadata = std::fs::symlink_metadata(&requested_root)
                     .map_err(|error| MonitorError::Runner(error.to_string()))?;
+                if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+                    return Err(MonitorError::Runner(format!(
+                        "monitor source '{}' is not a regular file or directory",
+                        requested_root.display()
+                    )));
+                }
+                let root = std::fs::canonicalize(&requested_root)
+                    .map_err(|error| MonitorError::Runner(error.to_string()))?;
+                let excluded_database_paths = std::fs::canonicalize(&database_path)
+                    .ok()
+                    .map(|database| {
+                        let mut paths = BTreeSet::from([database.clone()]);
+                        for suffix in ["-wal", "-shm", "-journal"] {
+                            if let Some(name) = database.file_name() {
+                                let mut sidecar_name = name.to_os_string();
+                                sidecar_name.push(suffix);
+                                paths.insert(database.with_file_name(sidecar_name));
+                            }
+                        }
+                        paths
+                    })
+                    .unwrap_or_default();
                 let mut paths = if metadata.is_file() {
-                    vec![root.clone()]
+                    (!excluded_database_paths.contains(&root))
+                        .then(|| root.clone())
+                        .into_iter()
+                        .collect()
                 } else {
                     WalkDir::new(&root)
                         .follow_links(false)
@@ -706,10 +749,15 @@ impl MonitorRunner for CliMonitorRunner {
                         .into_iter()
                         .filter_map(|entry| match entry {
                             Err(error) => Some(Err(error)),
-                            Ok(entry) if entry.file_type().is_file() => Some(Ok(entry.into_path())),
+                            Ok(entry)
+                                if entry.file_type().is_file()
+                                    && !excluded_database_paths.contains(entry.path()) =>
+                            {
+                                Some(Ok(entry.into_path()))
+                            }
                             Ok(_) => None,
                         })
-                        .take(max_archive_entries)
+                        .take(max_archive_entries.saturating_add(1))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|error| {
                             MonitorError::Runner(format!(
@@ -718,12 +766,20 @@ impl MonitorRunner for CliMonitorRunner {
                             ))
                         })?
                 };
+                if paths.len() > max_archive_entries {
+                    return Err(MonitorError::Runner(format!(
+                        "source fingerprint exceeds configured file bound of {max_archive_entries}"
+                    )));
+                }
                 paths.sort();
                 let mut digest = Sha256::new();
+                digest.update(b"hooray.source-fingerprint.v2\0");
                 let mut total = 0_u64;
                 for path in paths {
                     let relative = path.strip_prefix(&root).unwrap_or(&path);
-                    digest.update(relative.as_os_str().as_encoded_bytes());
+                    let relative = relative.as_os_str().as_encoded_bytes();
+                    digest.update((relative.len() as u64).to_be_bytes());
+                    digest.update(relative);
                     // Bound enforced during the read (mirrors StdinFile::take) so
                     // an oversized file never allocates fully before rejection.
                     let bytes = read_bounded(&path, max_input_bytes)
@@ -734,7 +790,7 @@ impl MonitorRunner for CliMonitorRunner {
                             "source fingerprint exceeds configured input bound".into(),
                         ));
                     }
-                    digest.update((bytes.len() as u64).to_le_bytes());
+                    digest.update((bytes.len() as u64).to_be_bytes());
                     digest.update(bytes);
                 }
                 Ok(format!("{:x}", digest.finalize()))
@@ -1589,6 +1645,74 @@ mod tests {
             fingerprint_error.contains("source fingerprint exceeds configured input bound"),
             "{fingerprint_error}"
         );
+    }
+
+    #[tokio::test]
+    async fn monitor_fingerprint_rejects_file_count_truncation() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("project");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("one"), "1").unwrap();
+        std::fs::write(source.join("two"), "2").unwrap();
+        let runner = CliMonitorRunner {
+            config: Config {
+                max_archive_entries: 1,
+                ..config(&temp)
+            },
+        };
+        let target = hooray::monitor::MonitorTarget {
+            id: "entry-bound-test".into(),
+            source: source.display().to_string(),
+            interval_seconds: 60,
+            next_due_at: 0,
+            source_fingerprint: None,
+            inventory: None,
+            advisory_digest: None,
+            policy_digest: None,
+            finding_ids: BTreeSet::new(),
+            updated_at: 0,
+        };
+        let error = runner
+            .source_fingerprint(&target)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("configured file bound of 1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn monitor_fingerprint_ignores_its_own_database_files() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("project");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("Cargo.lock"), "version = 3\n").unwrap();
+        let database_path = source.join("hooray.db");
+        std::fs::write(&database_path, "database-before").unwrap();
+        let runner = CliMonitorRunner {
+            config: Config {
+                database_path: database_path.clone(),
+                ..config(&temp)
+            },
+        };
+        let target = hooray::monitor::MonitorTarget {
+            id: "database-exclusion-test".into(),
+            source: source.display().to_string(),
+            interval_seconds: 60,
+            next_due_at: 0,
+            source_fingerprint: None,
+            inventory: None,
+            advisory_digest: None,
+            policy_digest: None,
+            finding_ids: BTreeSet::new(),
+            updated_at: 0,
+        };
+        let before = runner.source_fingerprint(&target).await.unwrap();
+        std::fs::write(&database_path, "database-after").unwrap();
+        std::fs::write(source.join("hooray.db-wal"), "wal").unwrap();
+        std::fs::write(source.join("hooray.db-shm"), "shm").unwrap();
+        std::fs::write(source.join("hooray.db-journal"), "journal").unwrap();
+        let after = runner.source_fingerprint(&target).await.unwrap();
+        assert_eq!(before, after);
     }
 
     #[cfg(unix)]

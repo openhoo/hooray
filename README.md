@@ -204,8 +204,9 @@ the same policy, history, and risk-scoring model as other finding kinds.
 
 ### History, baselines, and monitoring
 
-Every completed CLI scan is saved to the configured SQLite database. History
-commands list runs, return complete reports, and diff introduced, resolved, and
+Every completed CLI scan is saved to the configured SQLite database. Newly
+created database files use owner-only permissions on Unix. History commands
+list runs, return complete reports, and diff introduced, resolved, and
 unchanged stable finding IDs:
 
 ```bash
@@ -264,7 +265,7 @@ The v1 API provides:
 | --- | --- | --- |
 | `GET` | `/health` | Process health |
 | `GET` | `/ready` | SQLite readiness |
-| `POST` | `/v1/scans` | Scan a submitted normalized inventory with optional policy |
+| `POST` | `/v1/scans` | Analyze a submitted normalized inventory with optional policy |
 | `GET` | `/v1/runs` | Paginated run history |
 | `GET` | `/v1/runs/{run_id}` | Complete stored report |
 | `GET` | `/v1/runs/{run_id}/diff/{baseline_run_id}` | Finding-ID diff |
@@ -276,6 +277,10 @@ The v1 API provides:
 | `POST` | `/v1/policies/validate` | Validate a policy document |
 | `POST` | `/v1/policies/evaluate` | Evaluate a policy against a report at an explicit time |
 | `POST` | `/v1/exceptions/validate` | Validate one exception |
+
+Submitted inventories receive vulnerability, declared-license, operational-risk,
+scoring, remediation, and policy passes. Offline mode skips only OSV access;
+the local inventory analyses and report persistence remain available.
 
 API requests have a configurable body limit, a 30-second processing timeout,
 bounded concurrent scan capacity, validated pagination and filters, structured
@@ -350,7 +355,7 @@ Hooray is also a library crate. Add it to a project with:
 
 ```toml
 [dependencies]
-hooray = "0.5"
+hooray = "0.6"
 ```
 
 The minimum supported Rust version is 1.90, enforced through the repository's
@@ -509,7 +514,8 @@ Security and resource defaults:
 - 100,000 archive entries;
 - configuration values of 10 seconds for OSV connect timeout and 30 seconds for OSV request timeout;
 - loopback-only API binding unless bearer authentication is configured;
-- no symbolic-link traversal for inventory and license collection;
+- no symbolic-link traversal for inventory and license collection; root links
+  are rejected and safe nested links are skipped;
 - path traversal, archive links, OCI digest mismatches, malformed documents, and
   model-invariant violations fail closed; and
 - maximum accepted configuration values are validated before execution.
@@ -518,10 +524,9 @@ The OSV URL must use HTTPS unless the host is a loopback address, include a
 host, and must not contain embedded credentials, a query, or a fragment. The
 default endpoint is HTTPS.
 
-The timeout and `monitor_interval_secs` fields are validated configuration
-values, but the current CLI OSV client uses reqwest's client defaults and the
-monitor service polls every 30 seconds. Do not rely on those three fields as
-active runtime overrides in this release.
+OSV connection and request operations use the configured timeout values. The
+monitor service uses `monitor_interval_secs` as its polling interval; each
+target's own interval still determines when that target becomes due.
 
 ## Exit codes
 
@@ -561,7 +566,9 @@ legacy severity-only `--fail-on` interface.
 
 Project-directory detection requires at least one supported lockfile. Files with
 similar names are not treated as supported inputs, and malformed supported files
-fail rather than being silently skipped.
+fail rather than being silently skipped. If filesystem-analysis admission bounds
+omit files, the report includes a high-severity `scanner:coverage-incomplete`
+operational-risk finding with scanned and skipped counters.
 
 ## Quality and security verification
 

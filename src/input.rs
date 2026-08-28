@@ -219,7 +219,10 @@ fn scan_directory(root: &Path, config: &Config) -> Result<Inventory, InputError>
             .strip_prefix(root)
             .map_err(|_| InputError::PathTraversal(entry.path().display().to_string()))?;
         if entry.file_type().is_symlink() {
-            return Err(InputError::Symlink(entry.path().to_owned()));
+            // WalkDir does not follow links here. Ignore nested links so a
+            // repository containing ordinary package-manager or tooling
+            // links remains scannable without admitting content outside root.
+            continue;
         }
         if !entry.file_type().is_file() || !is_inventory_file(relative) {
             continue;
@@ -850,6 +853,35 @@ mod tests {
             ScanInput::detect(&link, &config()),
             Err(InputError::Symlink(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_nested_symlinks_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("requirements.txt"), "inside==1\n").unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, "outside==9\n").unwrap();
+        symlink(&outside, root.join("linked-requirements.txt")).unwrap();
+        symlink(&outside, root.join("requirements-link.txt")).unwrap();
+
+        let inventory = scan_path(&root, &config()).unwrap();
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|component| component.name == "inside")
+        );
+        assert!(
+            inventory
+                .components
+                .values()
+                .all(|component| component.name != "outside")
+        );
     }
 
     #[test]

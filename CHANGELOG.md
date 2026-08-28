@@ -17,6 +17,19 @@
 
 ## Unreleased
 
+### Review Hardening
+
+- Activated configured OSV connection/request timeouts and monitor polling.
+- Aligned API scans with CLI inventory analyses, including offline operation.
+- Redacted sensitive free-form report values before SQLite persistence and
+  created new Unix database files with owner-only permissions.
+- Fixed quality-aware report negotiation, monitor fingerprint truncation and
+  database self-triggering, and safe handling of nested repository symlinks in
+  inventory and license passes.
+- Made filesystem scanner bound omissions visible to policy and reports.
+- Removed a tracked runtime database and stale advisory exception, and replaced
+  the yanked lock-only `chacha20` release.
+
 ### Major Features
 
 - Replaced the original single-purpose CycloneDX/OSV command with a clean-cut enterprise security analysis and policy-enforcement CLI. The previous positional scan interface and severity-only `--fail-on` gate are removed entirely.

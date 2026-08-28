@@ -7,7 +7,11 @@
 //! report-history spelling of the same time-based retention over
 //! `scan_runs`, recorded in `retention_events`. Existing names are public
 //! API and are not renamed to enforce the convention retroactively.
-use std::{path::Path, time::Duration};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use rusqlite::{Connection, Transaction, TransactionBehavior, types::Value};
 use serde::{Deserialize, Serialize};
@@ -34,6 +38,14 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("report serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("report redaction failed: {0}")]
+    Sanitization(String),
+    #[error("failed to create private SQLite database {path}: {source}")]
+    DatabaseCreate {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("invalid report: {0}")]
     InvalidReport(#[from] ModelInvariantError),
     #[error("secret finding '{finding_id}' contains unredacted evidence")]
@@ -191,6 +203,8 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        create_private_database_if_missing(path)?;
         let connection = Connection::open(path)?;
         configure_connection(&connection, true)?;
         Self::initialize(connection)
@@ -240,6 +254,37 @@ impl Store {
     }
 }
 
+#[cfg(unix)]
+fn create_private_database_if_missing(path: &Path) -> Result<(), StoreError> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if path == Path::new(":memory:") {
+        return Ok(());
+    }
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => {
+            drop(file);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(source) => Err(StoreError::DatabaseCreate {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_database_if_missing(_path: &Path) -> Result<(), StoreError> {
+    Ok(())
+}
+
 fn configure_connection(c: &Connection, wal: bool) -> Result<(), rusqlite::Error> {
     c.busy_timeout(BUSY_TIMEOUT)?;
     c.pragma_update(None, "foreign_keys", "ON")?;
@@ -271,10 +316,13 @@ fn migrate_legacy_v1(t: &Transaction<'_>) -> Result<(), StoreError> {
     for report in reports {
         reject_unredacted_secrets(&report.findings)?;
         report.validate()?;
-        let json = serde_json::to_string(&report)?;
+        let sanitized = crate::report::sanitize_report(&report)
+            .map_err(|error| StoreError::Sanitization(error.to_string()))?;
+        let report = &*sanitized;
+        let json = serde_json::to_string(report)?;
         let count =
             i64::try_from(report.findings.len()).map_err(|_| StoreError::FindingCountOverflow)?;
-        insert_report(t, &report, &json, count)?;
+        insert_report(t, report, &json, count)?;
     }
     t.execute("INSERT INTO schema_migrations(version,name,applied_at) VALUES (1,'core','1970-01-01T00:00:00Z')",[])?;
     Ok(())
@@ -471,6 +519,22 @@ mod tests {
     use rusqlite::params;
     use std::thread;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_created_database_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private.db");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+            0,
+            "scan history must not be readable by group or other users"
+        );
+        drop(store);
+    }
 
     #[test]
     fn migrates_v1_fixture_transactionally() {

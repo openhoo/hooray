@@ -31,8 +31,12 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    engine::{FinalizeError, ScanParts, contextualize_and_score, finalize_scan},
+    engine::{
+        FinalizeError, ScanParts, attach_dependency_remediation, contextualize_and_score,
+        finalize_scan, merge_findings, merge_operational_risk,
+    },
     graph::DependencyGraph,
+    license,
     model::{Finding, FindingKind, Inventory, RunId, ScanReport, Severity},
     monitor::FindingDiff,
     osv::{OsvClient, OsvError},
@@ -72,7 +76,12 @@ impl ApiState {
         config.validate()?;
         // One shared OSV client per API process: endpoint validation happens
         // once at state construction instead of on every scan request.
-        let osv = Arc::new(OsvClient::new(&config.osv_url, config.max_concurrency)?);
+        let osv = Arc::new(OsvClient::with_timeouts(
+            &config.osv_url,
+            config.max_concurrency,
+            Duration::from_secs(config.osv_connect_timeout_secs),
+            Duration::from_secs(config.osv_request_timeout_secs),
+        )?);
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             scan_slots: Arc::new(Semaphore::new(config.max_concurrency)),
@@ -195,13 +204,6 @@ async fn scan_with_deadline(
         .inventory
         .validate()
         .map_err(|error| ApiError::bad_request("invalid_inventory", error.to_string()))?;
-    if state.config.offline {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "offline",
-            "scans requiring vulnerability intelligence are disabled in offline mode",
-        ));
-    }
     let permit = state.scan_slots.clone().try_acquire_owned().map_err(|_| {
         ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -210,7 +212,10 @@ async fn scan_with_deadline(
         )
     })?;
     let started_at = timestamp();
-    let mut findings =
+    let as_of = Utc::now();
+    let mut findings = if state.config.offline {
+        BTreeMap::new()
+    } else {
         match tokio::time::timeout(fetch_bound, state.osv.scan(&request.inventory)).await {
             Ok(result) => result.map_err(|error| vulnerability_service_error(&error))?,
             Err(_) => {
@@ -220,13 +225,27 @@ async fn scan_with_deadline(
                     "vulnerability service processing exceeded the time limit",
                 ));
             }
-        };
-    // Score findings exactly like the CLI engine pass before policy
-    // evaluation; unscored findings would silently disable every
-    // risk-selector rule on this route.
+        }
+    };
+    // Run every inventory-only analysis stage exposed by the CLI. Filesystem
+    // analysis is intentionally absent because this endpoint receives a
+    // normalized inventory rather than an untrusted filesystem path.
     let graph = DependencyGraph::from_inventory(&request.inventory)
         .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
-    contextualize_and_score(&request.inventory, &graph, &mut findings, Utc::now())
+    contextualize_and_score(&request.inventory, &graph, &mut findings, as_of)
+        .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
+    let license_findings = license::analyze(
+        &request.inventory,
+        None,
+        state.config.max_input_bytes.min(8 * 1024 * 1024),
+    )
+    .map_err(|error| ApiError::internal("license_analysis_failed", error.to_string()))?
+    .findings;
+    merge_findings(&mut findings, license_findings);
+    attach_dependency_remediation(&request.inventory, &graph, &mut findings)
+        .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
+    merge_operational_risk(&request.inventory, &graph, &mut findings, as_of);
+    contextualize_and_score(&request.inventory, &graph, &mut findings, as_of)
         .map_err(|error| ApiError::internal("finding_scoring_failed", error.to_string()))?;
     let report = finalize_scan(
         request.policy.as_ref(),
@@ -240,7 +259,7 @@ async fn scan_with_deadline(
             scanner_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             metadata: request.metadata,
         },
-        Utc::now(),
+        as_of,
     )
     .map_err(|error| match error {
         FinalizeError::Policy(error) => {
@@ -683,38 +702,112 @@ fn parse_finding_kind(value: &str) -> Result<FindingKind, ApiError> {
 }
 
 fn negotiate_report(headers: &HeaderMap, report: &ScanReport) -> Result<Response, ApiError> {
-    if accepts_media(headers, &["application/json"]) {
-        let bytes = serde_json::to_vec(report)
-            .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))?;
-        return Ok(([(CONTENT_TYPE, "application/json")], bytes).into_response());
+    match preferred_report_media(headers) {
+        Some(ReportMedia::Json) => {
+            let bytes = serde_json::to_vec(report)
+                .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))?;
+            Ok(([(CONTENT_TYPE, "application/json")], bytes).into_response())
+        }
+        Some(ReportMedia::Yaml) => {
+            let bytes = serde_yaml::to_string(report)
+                .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))?;
+            Ok(([(CONTENT_TYPE, "application/yaml")], bytes).into_response())
+        }
+        None => Err(ApiError::new(
+            StatusCode::NOT_ACCEPTABLE,
+            "unsupported_report_format",
+            "supported report formats are application/json and application/yaml",
+        )),
     }
-    if accepts_media(
-        headers,
-        &["application/yaml", "application/x-yaml", "text/yaml"],
-    ) {
-        let bytes = serde_yaml::to_string(report)
-            .map_err(|error| ApiError::internal("serialization_failed", error.to_string()))?;
-        return Ok(([(CONTENT_TYPE, "application/yaml")], bytes).into_response());
-    }
-    Err(ApiError::new(
-        StatusCode::NOT_ACCEPTABLE,
-        "unsupported_report_format",
-        "supported report formats are application/json and application/yaml",
-    ))
 }
 
-/// Returns whether the Accept header lists any of `media_types` (or the
-/// wildcard `*/*`), ignoring parameters such as `;q=`. A missing or
-/// non-UTF-8 header defaults to `application/json` compatibility.
-fn accepts_media(headers: &HeaderMap, media_types: &[&str]) -> bool {
-    let accepts = headers
-        .get(ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/json");
-    accepts.split(',').any(|value| {
-        let media = value.trim().split(';').next().unwrap_or_default().trim();
-        media == "*/*" || media_types.contains(&media)
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReportMedia {
+    Json,
+    Yaml,
+}
+
+fn preferred_report_media(headers: &HeaderMap) -> Option<ReportMedia> {
+    if !headers.contains_key(ACCEPT) {
+        return Some(ReportMedia::Json);
+    }
+    let ranges = headers
+        .get_all(ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(parse_media_range)
+        .collect::<Vec<_>>();
+    let json = representation_quality(&ranges, &["application/json"]);
+    let yaml = representation_quality(
+        &ranges,
+        &["application/yaml", "application/x-yaml", "text/yaml"],
+    );
+    match (json, yaml) {
+        (0, 0) => None,
+        (json, yaml) if yaml > json => Some(ReportMedia::Yaml),
+        _ => Some(ReportMedia::Json),
+    }
+}
+
+fn parse_media_range(value: &str) -> Option<(String, u16)> {
+    let mut parts = value.split(';');
+    let media = parts.next()?.trim().to_ascii_lowercase();
+    let (kind, subtype) = media.split_once('/')?;
+    if kind.is_empty()
+        || subtype.is_empty()
+        || kind.contains(char::is_whitespace)
+        || subtype.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    let mut quality = 1_000;
+    for parameter in parts {
+        let Some((name, value)) = parameter.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("q") {
+            quality = parse_quality(value.trim()).unwrap_or(0);
+        }
+    }
+    Some((media, quality))
+}
+
+fn parse_quality(value: &str) -> Option<u16> {
+    let (whole, fractional) = value.split_once('.').unwrap_or((value, ""));
+    if fractional.len() > 3 || !fractional.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    match whole {
+        "0" => {
+            let padded = format!("{fractional:0<3}");
+            padded.parse().ok()
+        }
+        "1" if fractional.bytes().all(|byte| byte == b'0') => Some(1_000),
+        _ => None,
+    }
+}
+
+fn representation_quality(ranges: &[(String, u16)], aliases: &[&str]) -> u16 {
+    ranges
+        .iter()
+        .filter_map(|(range, quality)| {
+            let specificity = if aliases.contains(&range.as_str()) {
+                2
+            } else if range == "*/*" {
+                0
+            } else if let Some(kind) = range.strip_suffix("/*") {
+                aliases
+                    .iter()
+                    .any(|alias| alias.starts_with(&format!("{kind}/")))
+                    .then_some(1)?
+            } else {
+                return None;
+            };
+            Some((specificity, *quality))
+        })
+        .max_by_key(|(specificity, quality)| (*specificity, *quality))
+        .map_or(0, |(_, quality)| quality)
 }
 
 async fn store_call<T, F>(state: &ApiState, operation: F) -> Result<T, ApiError>
@@ -1142,7 +1235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_scan_against_osv_and_rejects_invalid_or_offline_inventory() {
+    async fn creates_online_and_offline_scans_with_inventory_analyses() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/querybatch"))
@@ -1180,7 +1273,15 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(saved["run"]["metadata"]["source"], "api-test");
-        assert_eq!(saved["findings"], json!({}));
+        assert_eq!(saved["findings"].as_object().unwrap().len(), 2);
+        assert!(
+            saved["findings"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|finding| finding["kind"] == "license"
+                    && finding["rule_id"] == "license:unknown")
+        );
 
         let mut invalid = rich_report("template", &[]).inventory;
         invalid.asset.name.clear();
@@ -1195,11 +1296,12 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_inventory");
 
+        let offline_application = app(Config {
+            offline: true,
+            ..Config::default()
+        });
         let (status, body) = response(
-            app(Config {
-                offline: true,
-                ..Config::default()
-            }),
+            offline_application.clone(),
             Request::post("/v1/scans")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -1208,8 +1310,17 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["code"], "offline");
+        assert_eq!(status, StatusCode::CREATED);
+        let offline_run_id = body["run_id"].as_str().unwrap();
+        let (status, offline_report) = response(
+            offline_application,
+            Request::get(format!("/v1/runs/{offline_run_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(offline_report["findings"].as_object().unwrap().len(), 2);
 
         let failing_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1845,6 +1956,36 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
     }
 
+    #[test]
+    fn accept_negotiation_honors_quality_specificity_and_multiple_fields() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json;q=0, application/yaml;q=0.8"),
+        );
+        assert_eq!(preferred_report_media(&headers), Some(ReportMedia::Yaml));
+
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json;q=0, */*;q=0.5"),
+        );
+        assert_eq!(preferred_report_media(&headers), Some(ReportMedia::Yaml));
+
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json;q=0, application/yaml;q=0"),
+        );
+        assert_eq!(preferred_report_media(&headers), None);
+
+        headers.clear();
+        headers.append(ACCEPT, HeaderValue::from_static("application/json;q=0.2"));
+        headers.append(ACCEPT, HeaderValue::from_static("text/yaml;q=0.7"));
+        assert_eq!(preferred_report_media(&headers), Some(ReportMedia::Yaml));
+
+        headers.clear();
+        assert_eq!(preferred_report_media(&headers), Some(ReportMedia::Json));
+    }
+
     #[tokio::test]
     async fn policy_and_exception_validation_are_deterministic() {
         let policy = json!({
@@ -1992,9 +2133,11 @@ mod tests {
                 "finding {id} must be scored before policy evaluation"
             );
         }
+        assert_eq!(saved["policy_summary"]["allowed"], 0);
+        assert_eq!(saved["policy_summary"]["warned"], 0);
         assert_eq!(
-            saved["policy_summary"],
-            json!({"allowed": 0, "warned": 0, "denied": 1})
+            saved["policy_summary"]["denied"].as_u64(),
+            Some(findings.len() as u64)
         );
     }
 

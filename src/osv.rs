@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use futures::{StreamExt, stream};
 use reqwest::{Client, Response, Url};
@@ -21,11 +24,11 @@ const MAX_BATCH_SIZE: usize = 1_000;
 /// A conformant endpoint stops returning `next_page_token`; a mirror echoing
 /// a stable token must not loop `scan` forever.
 const MAX_PAGES_PER_PURL: usize = 100;
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound for buffering a single OSV response body, matching the 100 MiB
-/// local SBOM input bound. Client-level timeouts are validated configuration
-/// values this CLI OSV client deliberately does not wire (documented release
-/// limitation), so these in-process bounds fail closed against misbehaving
-/// endpoints instead.
+/// local SBOM input bound. This complements the client-level connection and
+/// request timeouts by bounding memory even when a peer streams continuously.
 const MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
 
 /// Upper bound for the response body retained inside `OsvError::Http`. The
@@ -80,6 +83,20 @@ pub struct OsvClient {
 
 impl OsvClient {
     pub fn new(base_url: &str, concurrency: usize) -> Result<Self, OsvError> {
+        Self::with_timeouts(
+            base_url,
+            concurrency,
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn with_timeouts(
+        base_url: &str,
+        concurrency: usize,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, OsvError> {
         let mut base_url =
             Url::parse(base_url).map_err(|error| OsvError::InvalidBaseUrl(error.to_string()))?;
 
@@ -101,6 +118,8 @@ impl OsvClient {
             // configured base URL instead of following a hostile Location.
             http: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
                 .build()?,
             base_url,
             concurrency: concurrency.max(1),
@@ -917,6 +936,40 @@ mod tests {
                 "expected {url} to be rejected"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn configured_request_timeout_bounds_osv_calls() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_json(json!({"results":[{"vulns":[]}]})),
+            )
+            .mount(&server)
+            .await;
+        let inventory = inventory([component(
+            "component:timeout",
+            "timeout",
+            "1.0.0",
+            "pkg:cargo/timeout@1.0.0",
+        )]);
+        let error = OsvClient::with_timeouts(
+            &server.uri(),
+            1,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .unwrap()
+        .scan(&inventory)
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, OsvError::Request { source, .. } if source.is_timeout()),
+            "configured request timeout must surface as a bounded request failure: {error}"
+        );
     }
 
     #[tokio::test]
