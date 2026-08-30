@@ -177,6 +177,7 @@ jobs:
           rm -rf dist
           mkdir -p "dist/$package"
           install -m 0755 target/release/hooray "dist/$package/hooray"
+          install -m 0644 LICENSE "dist/$package/LICENSE"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
           (
             cd dist
@@ -272,7 +273,7 @@ jobs:
             test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
             test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$sha"
             test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "https://github.com/openhoo/hooray"
-            test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}')" = MIT
+            test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}')" = Apache-2.0
           }
 
           if [ "$RECOVERY" = false ]; then
@@ -310,7 +311,7 @@ jobs:
             test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
             test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$sha"
             test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "https://github.com/openhoo/hooray"
-            test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}')" = MIT
+            test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}')" = Apache-2.0
 
             printf '%s' "$REGISTRY_TOKEN" | docker --config "$publish_config" login ghcr.io --username "$REGISTRY_USER" --password-stdin
             docker --config "$publish_config" push "$attempt"

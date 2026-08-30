@@ -11,7 +11,7 @@ ARG VCS_REF
 
 LABEL org.opencontainers.image.source="https://github.com/openhoo/hooray" \
       org.opencontainers.image.description="Hooray software supply-chain scanner" \
-      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.version="${VERSION}"
 

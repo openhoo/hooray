@@ -144,7 +144,7 @@ signatures include MIT, Apache-2.0, GPL-3.0-only/or-later, LGPL-3.0-only, MPL-2.
 BSD-3-Clause, ISC, BSL-1.0, and Unlicense. Detection is evidence, not legal
 advice; policy should decide which expressions are acceptable for a deployment.
 
-The Hooray repository itself is MIT licensed. Its dependency policy accepts
+The Hooray repository itself is Apache-2.0 licensed. Its dependency policy accepts
 only the explicit MIT-compatible permissive SPDX allowlist in `deny.toml`:
 Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-3-Clause,
 CDLA-Permissive-2.0, ISC, MIT, Unicode-3.0, Unlicense, Zlib, and
@@ -751,4 +751,4 @@ Linux x86_64 binary, archive, and checksums.
 
 ## License
 
-Hooray is licensed under the [MIT License](LICENSE).
+Hooray is licensed under the [Apache License 2.0](LICENSE).
