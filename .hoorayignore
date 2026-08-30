@@ -1,0 +1,2 @@
+# Test corpus intentionally contains vulnerable and malicious samples.
+tests/fixtures/
