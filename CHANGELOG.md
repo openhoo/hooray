@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.2 (2026-08-30)
+
+### Bug Fixes
+
+- **scanner:** make Hoostack dogfood reliable (c2fa797)
+- **scanner:** emit valid Swift package URLs (d80464e)
+- **actions:** default to next release (d07c069)
+
+### Other Changes
+
+- use released Hoostack actions (1f883e4)
+- test pull request head commit (1fdd4dd)
+
 ## 0.6.1 (2026-08-28)
 
 ### Bug Fixes
