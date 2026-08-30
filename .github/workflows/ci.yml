@@ -27,6 +27,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Lint commit messages
         uses: openhoo/hooversion/actions/lint@4aa43b4d775c7b03d196b06381013f4601467c57 # v1.0.3
