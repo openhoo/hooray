@@ -1,0 +1,46 @@
+version: 1
+name: repository
+release: 0.1.0
+description: Portable Git naming and repository consistency policies.
+maturity: stable
+owner: openhoo/hoolicy-maintainers
+compatibilityNotes: Rule IDs and finding keys remain stable; snapshot review exposes behavior and severity changes.
+compatibility:
+  config: '>=1 <2'
+  hoolicy: '>=0.1.3-0 <0.1.3 || >=0.2.0 <2.0.0'
+parameters:
+  branch_pattern:
+    type: string
+    required: true
+    description: RE2-compatible branch name expression.
+  commit_pattern:
+    type: string
+    required: true
+    description: RE2-compatible commit subject expression.
+  merge_request_title_pattern:
+    type: string
+    required: true
+    description: RE2-compatible merge request title expression.
+  allowed_branches:
+    type: string_list
+    required: true
+    description: Branches exempt from feature-branch naming.
+  merge_request_title_maximum:
+    type: number
+    default: 100
+    description: Maximum title length without a Draft prefix.
+rules:
+  - id: repository.git-naming
+    title: Git references use one documented naming convention
+    description: Checks branch names, commit subjects, and merge request titles from local or CI Git context.
+    rationale: A single machine-enforced convention keeps history searchable and prevents provider settings from drifting away from local checks.
+    remediation: Rename the branch or rewrite the affected title using the configured convention.
+    severity: error
+    kind: git.naming
+    spec:
+      branchPattern: "{{ branch_pattern }}"
+      allowedBranches: "{{ allowed_branches }}"
+      commitPattern: "{{ commit_pattern }}"
+      mergeRequestTitlePattern: "{{ merge_request_title_pattern }}"
+      mergeRequestTitleMaximum: "{{ merge_request_title_maximum }}"
+      message: Git name does not follow the repository convention

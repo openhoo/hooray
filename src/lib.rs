@@ -20,6 +20,7 @@ pub mod analysis;
 pub mod api;
 pub mod config;
 pub mod engine;
+mod filesystem;
 pub mod graph;
 pub mod input;
 pub mod integrations;

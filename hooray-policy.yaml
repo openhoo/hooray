@@ -1,0 +1,26 @@
+version: 1
+fail_closed:
+  unknown_applicability: false
+  unknown_licenses: false
+default_outcome: warn
+rules:
+  - id: deny-critical-findings
+    priority: 100
+    outcome: deny
+    reason: Critical security findings block delivery
+    selectors:
+      minimum_severity: critical
+  - id: deny-high-confidence-security-findings
+    priority: 90
+    outcome: deny
+    reason: High-confidence, high-severity security findings block delivery
+    selectors:
+      kinds:
+        - vulnerability
+        - secret
+        - iac
+        - sast
+        - malware
+      minimum_severity: high
+      confidence:
+        - high

@@ -1,0 +1,99 @@
+name: Scan with Hooray
+description: Install Hooray, validate policy, and scan a project with an isolated database.
+inputs:
+  version:
+    description: Hooray release version to install.
+    required: false
+    default: "0.6.1"
+  executable:
+    description: Optional Hooray executable path; skips release installation when set.
+    required: false
+    default: ""
+  working-directory:
+    description: Repository directory where Hooray should run.
+    required: false
+    default: "."
+  input:
+    description: Project path to scan, relative to the working directory.
+    required: false
+    default: "."
+  config:
+    description: Optional Hooray configuration path.
+    required: false
+    default: ""
+  policy:
+    description: Hooray policy path.
+    required: false
+    default: "hooray-policy.yaml"
+  offline:
+    description: Disable OSV network access while retaining local analysis.
+    required: false
+    default: "false"
+  format:
+    description: Hooray report format.
+    required: false
+    default: "sarif"
+  output:
+    description: Report output path.
+    required: false
+    default: "hooray.sarif"
+outputs:
+  report:
+    description: Configured report output path.
+    value: ${{ steps.scan.outputs.report }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Hooray
+      if: ${{ inputs.executable == '' }}
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        RUNNER_OS_VALUE: ${{ runner.os }}
+        RUNNER_ARCH_VALUE: ${{ runner.arch }}
+      run: bash "$GITHUB_ACTION_PATH/../setup/install.sh"
+
+    - name: Validate policy and scan project
+      id: scan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_EXECUTABLE: ${{ inputs.executable }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_PATH: ${{ inputs.input }}
+        INPUT_OFFLINE: ${{ inputs.offline }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_POLICY: ${{ inputs.policy }}
+      run: |
+        set -euo pipefail
+
+        if [[ "$INPUT_OFFLINE" != true && "$INPUT_OFFLINE" != false ]]; then
+          echo "::error::offline must be true or false."
+          exit 2
+        fi
+        if [[ -z "$INPUT_POLICY" ]]; then
+          echo "::error::A Hooray policy path is required for a gating scan."
+          exit 2
+        fi
+
+        database_dir="$(mktemp -d "${RUNNER_TEMP}/hooray-database.XXXXXXXX")"
+        export HOORAY_DATABASE_PATH="${database_dir}/hooray.db"
+        export HOORAY_OFFLINE="$INPUT_OFFLINE"
+
+        hooray_command=(hooray)
+        if [[ -n "$INPUT_EXECUTABLE" ]]; then
+          hooray_command=("$INPUT_EXECUTABLE")
+        fi
+        global=()
+        if [[ -n "$INPUT_CONFIG" ]]; then
+          global+=(--config "$INPUT_CONFIG")
+        fi
+        "${hooray_command[@]}" "${global[@]}" policy validate "$INPUT_POLICY"
+
+        args=(scan project "$INPUT_PATH" --policy "$INPUT_POLICY" --format "$INPUT_FORMAT")
+        if [[ -n "$INPUT_OUTPUT" ]]; then
+          args+=(--output "$INPUT_OUTPUT")
+        fi
+        echo "report=$INPUT_OUTPUT" >> "$GITHUB_OUTPUT"
+        "${hooray_command[@]}" "${global[@]}" "${args[@]}"

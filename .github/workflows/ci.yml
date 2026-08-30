@@ -29,9 +29,9 @@ jobs:
           fetch-depth: 0
 
       - name: Lint commit messages
-        uses: openhoo/hooversion/actions/lint@f5ee7eef255519b4ef33f4a93c7223805113c3a2 # v0.1.1
+        uses: openhoo/hooversion/actions/lint@57471be6e07c7bc1d6db07e3a3364cc25c710414 # v1.0.2
         with:
-          version: 0.1.1
+          version: 1.0.2
 
       - name: Cache Rust dependencies and tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
@@ -76,3 +76,14 @@ jobs:
 
       - name: Check dependency policy
         run: cargo deny check advisories bans licenses sources
+
+      - name: Build Hooray action executable
+        run: cargo build --locked --bin hooray
+
+      - name: Dogfood Hooray action
+        uses: ./actions/scan
+        with:
+          executable: ./target/debug/hooray
+          policy: hooray-policy.yaml
+          format: table
+          output: ""
