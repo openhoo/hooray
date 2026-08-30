@@ -1623,7 +1623,7 @@ mod tests {
         connection.read_to_string(&mut served).await.unwrap();
         assert!(
             served.starts_with("HTTP/1.1 200"),
-            "the authorized health request must be served before draining: {served}"
+            "the authorized health request must be served before draining"
         );
         assert!(served.contains("\"status\":\"ok\""));
         // The served response finished, so graceful shutdown drains and the
