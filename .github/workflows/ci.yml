@@ -29,9 +29,9 @@ jobs:
           fetch-depth: 0
 
       - name: Lint commit messages
-        uses: openhoo/hooversion/actions/lint@57471be6e07c7bc1d6db07e3a3364cc25c710414 # v1.0.2
+        uses: openhoo/hooversion/actions/lint@4aa43b4d775c7b03d196b06381013f4601467c57 # v1.0.3
         with:
-          version: 1.0.2
+          version: 1.0.3
 
       - name: Cache Rust dependencies and tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
@@ -87,3 +87,8 @@ jobs:
           policy: hooray-policy.yaml
           format: table
           output: ""
+
+      - name: Enforce Hoolicy policy
+        uses: openhoo/hoolicy/actions/check@584ed5abf673dfb9b1d5279dfaa78329a94a9ea5 # v0.2.3
+        with:
+          version: 0.2.3
