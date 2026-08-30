@@ -346,6 +346,18 @@ impl InventoryBuilder {
         licenses: BTreeSet<License>,
     ) -> Result<ComponentId, InputError> {
         let purl = package_url(ecosystem, name, version);
+        self.add_with_purl(name, version, purl, scope, path, licenses)
+    }
+
+    fn add_with_purl(
+        &mut self,
+        name: &str,
+        version: &str,
+        purl: String,
+        scope: Scope,
+        path: &str,
+        licenses: BTreeSet<License>,
+    ) -> Result<ComponentId, InputError> {
         let identity = stable_component_id(&purl).map_err(|_| InputError::InvalidIdentifier)?;
         let source = Source {
             kind: SourceKind::Lockfile,
@@ -1106,17 +1118,14 @@ mod tests {
         let resolved = tempdir().unwrap();
         fs::write(
             resolved.path().join("Package.resolved"),
-            r#"{"version":2,"pins":[{"identity":"swift-log","kind":"remoteSourceXCMerge","state":{"version":"1.5.3"}},{"identity":"swift-argument-parser","kind":"remoteSourceXCMerge","state":{"revision":"abc123","branch":"main"}}]}"#,
+            r#"{"version":2,"pins":[{"identity":"swift-log","kind":"remoteSourceControl","location":"https://github.com/apple/swift-log.git","state":{"version":"1.5.3"}},{"identity":"swift-argument-parser","kind":"remoteSourceControl","location":"https://github.com/apple/swift-argument-parser.git","state":{"revision":"abc123","branch":"main"}}]}"#,
         )
         .unwrap();
         let inventory = scan_path(resolved.path(), &config()).unwrap();
         assert_eq!(inventory.components.len(), 1);
-        assert!(
-            inventory
-                .components
-                .values()
-                .any(|c| c.name == "swift-log" && c.version == "1.5.3")
-        );
+        assert!(inventory.components.values().any(|c| c.name == "swift-log"
+            && c.version == "1.5.3"
+            && c.purl == "pkg:swift/github.com/apple/swift-log@1.5.3"));
 
         let legacy = tempdir().unwrap();
         fs::write(
@@ -1126,12 +1135,9 @@ mod tests {
         .unwrap();
         let inventory = scan_path(legacy.path(), &config()).unwrap();
         assert_eq!(inventory.components.len(), 1);
-        assert!(
-            inventory
-                .components
-                .values()
-                .any(|c| c.name == "Alamofire" && c.version == "5.8.0")
-        );
+        assert!(inventory.components.values().any(|c| c.name == "Alamofire"
+            && c.version == "5.8.0"
+            && c.purl == "pkg:swift/github.com/Alamofire/Alamofire@5.8.0"));
     }
 
     #[test]
