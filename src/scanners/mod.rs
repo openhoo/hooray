@@ -10,9 +10,9 @@ use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use walkdir::WalkDir;
 use zip::ZipArchive;
 
+use crate::filesystem::repository_walk;
 use crate::model::{
     Applicability, ApplicabilityStatus, AssetId, Confidence, Evidence, Finding, FindingKind,
     FindingStatus, Location, Position, Remediation, Risk, RuleId, Severity, stable_finding_id,
@@ -121,7 +121,7 @@ pub enum ScanError {
     Walk {
         path: PathBuf,
         #[source]
-        source: walkdir::Error,
+        source: ignore::Error,
     },
     #[error("scan root '{0}' is neither a regular file nor a directory")]
     UnsupportedRoot(PathBuf),
@@ -161,16 +161,12 @@ pub fn scan_path(
     if metadata.is_file() || (metadata.file_type().is_symlink() && config.follow_symlinks) {
         paths.push(root.to_owned());
     } else if metadata.is_dir() {
-        for entry in WalkDir::new(root)
-            .follow_links(config.follow_symlinks)
-            .max_depth(config.max_depth)
-            .sort_by_file_name()
-        {
+        for entry in repository_walk(root, config.follow_symlinks, Some(config.max_depth)) {
             let entry = entry.map_err(|source| ScanError::Walk {
-                path: source.path().unwrap_or(root).to_owned(),
+                path: root.to_owned(),
                 source,
             })?;
-            if entry.file_type().is_file() {
+            if entry.file_type().is_some_and(|kind| kind.is_file()) {
                 paths.push(entry.into_path());
                 if paths.len() > config.max_files {
                     // Sentinel early-exit stops enumeration at the cap; skipped_files is therefore only a lower bound past this point.
@@ -571,12 +567,31 @@ static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // regex crate does not support. Unseparated words like "tokenize" or
     // "tokens" still do not match.
     Regex::new(
-        r#"(?i)\b(?:[a-z0-9]+[_-])?(api[_-]?key|secret|token|password|passwd|client[_-]?secret)(?:[_-][a-z0-9]+)*\b\s*["']?\s*[:=]\s*["']([^"']{12,256})["']"#,
+        r#"(?i)\b((?:[a-z0-9]+[_-])?(?:api[_-]?key|secret|token|password|passwd|client[_-]?secret)(?:[_-][a-z0-9]+)*)\b\s*["']?\s*[:=]\s*["']([^"']{12,256})["']"#,
     )
     .expect("constant assignment regex")
 });
 
 fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
+    let package_script_values: BTreeSet<String> = if Path::new(builder.path)
+        .file_name()
+        .is_some_and(|name| name == "package.json")
+    {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("scripts")
+                    .and_then(|scripts| scripts.as_object())
+                    .cloned()
+            })
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, value)| value.as_str().map(str::to_owned))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     for (line_index, line) in text.lines().enumerate() {
         if line.len() > MAX_TEXT_LINE_BYTES || allowlisted(line) {
             continue;
@@ -596,7 +611,22 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
             }
         }
         for captures in SECRET_ASSIGNMENT_REGEX.captures_iter(line) {
+            let assignment = captures.get(0).expect("capture exists");
             let value = captures.get(2).expect("capture exists");
+            if assignment.start() > 0
+                && line.as_bytes()[assignment.start() - 1] == b':'
+                && package_script_values.contains(value.as_str())
+            {
+                continue;
+            }
+            let name = captures
+                .get(1)
+                .expect("capture exists")
+                .as_str()
+                .to_ascii_lowercase();
+            if name.ends_with("_hash") || name.ends_with("-hash") {
+                continue;
+            }
             let entropy = shannon_entropy(value.as_str()) * 1000.0;
             if looks_placeholder(value.as_str())
                 || entropy < f64::from(builder.ctx.config.secret_entropy_threshold_milli)
@@ -676,6 +706,7 @@ fn looks_placeholder(value: &str) -> bool {
         "replace_me",
         "dummy",
         "not-a-real",
+        "redacted",
         "your_",
         "<",
         "${",
@@ -1436,16 +1467,20 @@ mod tests {
             &analyze("x", "password = \"replace_me_please\""),
             "secret.high-entropy-assignment"
         ));
+        assert!(!has(
+            &analyze("x", "token = \"[github_token_redacted]\""),
+            "secret.high-entropy-assignment"
+        ));
     }
 
     #[test]
     fn high_entropy_assignment_requires_entropy_and_context() {
         assert!(has(
-            &analyze("x", "api_key = \"B7kP9vQ2mX8cR4tN6zW3\""),
+            &analyze("x", "api_key = \"B7kP9vQ2mX8cR4tN6zW3\""), // hooray:allow-secret
             "secret.high-entropy-assignment"
         ));
         assert!(!has(
-            &analyze("x", "value = \"B7kP9vQ2mX8cR4tN6zW3\""),
+            &analyze("x", "value = \"B7kP9vQ2mX8cR4tN6zW3\""), // hooray:allow-secret
             "secret.high-entropy-assignment"
         ));
     }
@@ -1453,12 +1488,12 @@ mod tests {
     #[test]
     fn high_entropy_assignment_matches_json_quoted_keys_and_compound_names() {
         for line in [
-            r#"{"password": "B7kP9vQ2mX8cR4tN6zW3"}"#,
-            r#"{"api_key": "B7kP9vQ2mX8cR4tN6zW3"}"#,
-            r#""client_secret": "B7kP9vQ2mX8cR4tN6zW3""#,
-            r#"SECRET_KEY = "B7kP9vQ2mX8cR4tN6zW3""#,
-            r#"DB_PASSWORD: "B7kP9vQ2mX8cR4tN6zW3""#,
-            r#"AUTH_TOKEN = "B7kP9vQ2mX8cR4tN6zW3""#,
+            r#"{"password": "B7kP9vQ2mX8cR4tN6zW3"}"#, // hooray:allow-secret
+            r#"{"api_key": "B7kP9vQ2mX8cR4tN6zW3"}"#,  // hooray:allow-secret
+            r#""client_secret": "B7kP9vQ2mX8cR4tN6zW3""#, // hooray:allow-secret
+            r#"SECRET_KEY = "B7kP9vQ2mX8cR4tN6zW3""#,  // hooray:allow-secret
+            r#"DB_PASSWORD: "B7kP9vQ2mX8cR4tN6zW3""#,  // hooray:allow-secret
+            r#"AUTH_TOKEN = "B7kP9vQ2mX8cR4tN6zW3""#,  // hooray:allow-secret
         ] {
             assert!(
                 has(
@@ -1478,6 +1513,24 @@ mod tests {
         ));
         assert!(!has(
             &analyze("x", "tokens = \"B7kP9vQ2mX8cR4tN6zW3\""),
+            "secret.high-entropy-assignment"
+        ));
+        assert!(!has(
+            &analyze(
+                "package.json",
+                r#"{"scripts":{"e2e:password":"HOOCLOAK_LOGIN_MODE=password playwright test"}}"# // hooray:allow-secret
+            ),
+            "secret.high-entropy-assignment"
+        ));
+        assert!(has(
+            &analyze("package.json", r#"{"foo:password":"B7kP9vQ2mX8cR4tN6zW3"}"#), // hooray:allow-secret
+            "secret.high-entropy-assignment"
+        ));
+        assert!(!has(
+            &analyze(
+                "config.yaml",
+                "password_hash: \"$2b$10$vWq8DjfdBvihgDARWb4jaOyhhRpU6Vgygi49GnwKTTVP45M8nPylW\""
+            ),
             "secret.high-entropy-assignment"
         ));
     }
@@ -1659,6 +1712,21 @@ mod tests {
         assert!(!has(
             &analyze("x.go", "exec.Command(\"git\", \"status\")"),
             "sast.go.command-shell"
+        ));
+        assert!(!has(
+            &analyze(
+                "x.rs",
+                "Command::new(\"sh\").arg(\"-c\").arg(input) // hooray:allow-sast"
+            ),
+            "sast.rust.command-shell"
+        ));
+        assert!(has(
+            &analyze("x.js", "exec(command)"),
+            "sast.javascript.exec-dynamic"
+        ));
+        assert!(!has(
+            &analyze("x.ts", "/^(?:rgba|hsla)\\(([^)]+)\\)$/.exec(computed)"),
+            "sast.javascript.exec-dynamic"
         ));
     }
 
@@ -2257,6 +2325,29 @@ mod tests {
         assert_eq!(output.scanned_files, 1);
         assert!(output.skipped_files >= 1);
         assert!(output.scanned_bytes <= 32);
+    }
+
+    #[test]
+    fn recursive_scan_honors_gitignore_and_hoorayignore() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("ignored")).unwrap();
+        fs::create_dir(directory.path().join("fixtures")).unwrap();
+        fs::write(directory.path().join(".gitignore"), "ignored/\n").unwrap();
+        fs::write(directory.path().join(".hoorayignore"), "fixtures/\n").unwrap();
+        fs::write(directory.path().join("ignored/bad.py"), "eval(user_input)").unwrap();
+        fs::write(directory.path().join("fixtures/bad.py"), "eval(user_input)").unwrap();
+        fs::write(directory.path().join("safe.py"), "print('safe')").unwrap();
+
+        let output = scan_path(
+            directory.path(),
+            &asset(),
+            &ScannerConfig::default(),
+            &MalwareSignatures::default(),
+        )
+        .unwrap();
+
+        assert_eq!(output.scanned_files, 3);
+        assert!(!has(&output, "sast.python.eval-dynamic"));
     }
 
     #[test]

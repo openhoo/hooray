@@ -1,0 +1,92 @@
+version: 1
+project: hooray
+failOn: error
+waivers: .hoolicy/waivers.yaml
+budgets:
+  maximumFiles: 100000
+  maximumDocumentBytes: 16777216
+  maximumFindings: 10000
+  maximumRuleDuration: 30s
+  maximumTotalDuration: 2m
+packs:
+  - name: repository
+    git: https://github.com/openhoo/hoolicy.git
+    ref: v0.2.2
+    subdir: packs/repository
+    with:
+      branch_pattern: '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)/[a-z0-9]+(?:-[a-z0-9]+)*$'
+      commit_pattern: '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9][a-z0-9-]*\))?!?: .+$'
+      merge_request_title_pattern: '^(Draft: )?(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9][a-z0-9-]*\))?!?: .+$'
+      allowed_branches: [main]
+      merge_request_title_maximum: 100
+rules:
+  - id: repository.required-files
+    title: Repository has required public documentation
+    description: Requires entry-point, license, and vulnerability-reporting documents.
+    rationale: Every Hoostack repository needs the same discoverable public contract.
+    remediation: Add reviewed README.md, LICENSE, and SECURITY.md files.
+    severity: error
+    kind: files
+    files: [README.md, LICENSE, SECURITY.md]
+    spec:
+      mode: count
+      minimum: 3
+      maximum: 3
+      message: README.md, LICENSE, and SECURITY.md are required
+  - id: supply-chain.approved-sources
+    title: Build inputs come only from approved artifact sources
+    description: Parses npm, NuGet, Dockerfile, JSON, and YAML source references.
+    rationale: Repository-wide source allowlists reduce dependency confusion and registry drift.
+    remediation: Mirror the dependency or image into an approved source.
+    severity: error
+    kind: sources.allowed
+    files:
+      - '**/.npmrc'
+      - '**/nuget.config'
+      - '**/{Dockerfile,Containerfile}'
+      - '**/{Dockerfile,Containerfile}.*'
+      - '**/*.{json,yaml,yml}'
+    exclude:
+      - '.hoolicy/vendor/**'
+      - '.cache/**'
+      - '.next/**'
+      - '.hooversion/**'
+      - '**/BenchmarkDotNet.Artifacts/**'
+      - '**/bin/**'
+      - '**/node_modules/**'
+      - '**/obj/**'
+      - '**/test-results/**'
+      - 'BenchmarkDotNet.Artifacts/**'
+      - 'build/**'
+      - 'charts/**/templates/**'
+      - 'coverage/**'
+      - 'dist/**'
+      - 'gitleaks-report.json'
+      - 'node_modules/**'
+      - 'target/**'
+    spec:
+      registries: [docker.io, ghcr.io, gcr.io, mcr.microsoft.com, quay.io]
+      npm: [https://registry.npmjs.org]
+      nuget: [https://api.nuget.org/v3/index.json]
+      requireDigest: false
+      message: Artifact source is outside the approved supply chain
+  - id: supply-chain.exception-lifecycle
+    title: Security exceptions are owned, justified, ticketed, and short-lived
+    description: Validates structured vulnerability exception records.
+    rationale: Temporary risk decisions need explicit ownership and expiry.
+    remediation: Add owner, HTTPS ticket, rationale, creation date, and expiry within 90 days.
+    severity: error
+    kind: exceptions.lifecycle
+    files: [.trivyignore.yaml]
+    spec:
+      format: yaml
+      collection: vulnerabilities
+      idField: id
+      reasonField: statement
+      ownerField: owner
+      ticketField: ticket
+      createdField: created_at
+      expiresField: expired_at
+      required: [id, reason, owner, ticket, created, expires]
+      maximumDays: 90
+      message: Security exception violates lifecycle policy

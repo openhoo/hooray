@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "pack": "repository",
+  "release": "0.1.0",
+  "cases": [
+    {
+      "name": "ad-hoc branch name fails",
+      "ruleId": "repository.git-naming",
+      "outcome": "fail",
+      "findings": [
+        {
+          "ruleId": "repository.git-naming",
+          "severity": "error",
+          "message": "Git name does not follow the repository convention: branch \"feature/Add_Policy\"",
+          "key": "branch:feature/Add_Policy",
+          "fingerprint": "eb6a7e397027406093150aa9426a51378836ad0fa59842444bc2f79440c01620",
+          "waived": false,
+          "hasFix": false
+        }
+      ]
+    },
+    {
+      "name": "conventional Git names pass",
+      "ruleId": "repository.git-naming",
+      "outcome": "pass",
+      "findings": []
+    }
+  ]
+}

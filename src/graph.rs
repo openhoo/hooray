@@ -21,8 +21,6 @@ pub enum GraphError {
     UnknownComponent(ComponentId),
     #[error("component {0} depends on itself")]
     SelfDependency(ComponentId),
-    #[error("dependency cycle detected: {0:?}")]
-    Cycle(Vec<ComponentId>),
     #[error("path limit must be greater than zero")]
     ZeroPathLimit,
 }
@@ -80,17 +78,13 @@ impl DependencyGraph {
             .cloned()
             .collect();
         let depth_from_root = shortest_depths(&connected_roots, &outgoing);
-        let graph = Self {
+        Ok(Self {
             nodes,
             outgoing,
             incoming,
             connected_roots,
             depth_from_root,
-        };
-        if let Some(cycle) = graph.find_cycle() {
-            return Err(GraphError::Cycle(cycle));
-        }
-        Ok(graph)
+        })
     }
 
     pub fn roots(&self) -> BTreeSet<ComponentId> {
@@ -204,6 +198,9 @@ impl DependencyGraph {
         }
         let mut outgoing = self.outgoing[node].iter();
         while let Some(next) = outgoing.next() {
+            if current.contains(next) {
+                continue;
+            }
             current.push(next.clone());
             let stop = self.collect_paths(collection, current);
             current.pop();
@@ -242,48 +239,6 @@ impl DependencyGraph {
         } else {
             Err(GraphError::UnknownComponent(component.clone()))
         }
-    }
-
-    fn find_cycle(&self) -> Option<Vec<ComponentId>> {
-        let mut visiting = BTreeSet::new();
-        let mut visited = BTreeSet::new();
-        let mut path = Vec::new();
-
-        for start in &self.nodes {
-            if visited.contains(start) {
-                continue;
-            }
-            let mut pending = vec![(start.clone(), false)];
-            while let Some((node, exiting)) = pending.pop() {
-                if exiting {
-                    path.pop();
-                    visiting.remove(&node);
-                    visited.insert(node);
-                    continue;
-                }
-                if visited.contains(&node) {
-                    continue;
-                }
-                if visiting.contains(&node) {
-                    let cycle_start = path.iter().position(|item| item == &node).unwrap();
-                    let mut cycle = path[cycle_start..].to_vec();
-                    cycle.push(node);
-                    return Some(cycle);
-                }
-
-                visiting.insert(node.clone());
-                path.push(node.clone());
-                pending.push((node.clone(), true));
-                pending.extend(
-                    self.outgoing[&node]
-                        .iter()
-                        .rev()
-                        .cloned()
-                        .map(|next| (next, false)),
-                );
-            }
-        }
-        None
     }
 }
 
@@ -334,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_self_and_cyclic_dependencies_deterministically() {
+    fn rejects_unknown_and_self_dependencies_deterministically() {
         assert_eq!(
             graph(&["a"], &[edge("a", "missing")]).unwrap_err(),
             GraphError::UnknownComponent(id("missing"))
@@ -343,14 +298,34 @@ mod tests {
             graph(&["a"], &[edge("a", "a")]).unwrap_err(),
             GraphError::SelfDependency(id("a"))
         );
+    }
+
+    #[test]
+    fn cycles_preserve_reachable_simple_paths_without_recursing_forever() {
+        let graph = graph(
+            &["root", "a", "b", "c", "target"],
+            &[
+                edge("root", "a"),
+                edge("a", "b"),
+                edge("b", "c"),
+                edge("c", "a"),
+                edge("c", "target"),
+            ],
+        )
+        .unwrap();
+        let expected = vec![id("root"), id("a"), id("b"), id("c"), id("target")];
         assert_eq!(
-            graph(
-                &["a", "b", "c"],
-                &[edge("a", "b"), edge("b", "c"), edge("c", "a")]
-            )
-            .unwrap_err(),
-            GraphError::Cycle(vec![id("a"), id("b"), id("c"), id("a")])
+            graph
+                .shortest_path(&id("target"))
+                .unwrap()
+                .unwrap()
+                .components,
+            expected
         );
+        let paths = graph.all_paths(&id("target"), 4, 10).unwrap();
+        assert_eq!(paths.paths.len(), 1);
+        assert_eq!(paths.paths[0].components, expected);
+        assert!(!paths.truncated);
     }
 
     #[test]
@@ -497,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn long_acyclic_chain_uses_iterative_cycle_detection() {
+    fn long_acyclic_chain_uses_iterative_graph_construction() {
         const NODE_COUNT: usize = 20_000;
         let nodes: Vec<_> = (0..NODE_COUNT)
             .map(|index| id(&format!("node-{index:05}")))

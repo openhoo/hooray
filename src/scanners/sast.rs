@@ -80,7 +80,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.javascript.exec-dynamic",
-                pattern: r#"\b(?:exec|execSync)\s*\(\s*(?:`[^`]*\$\{|[^"'`])"#,
+                pattern: r#"(?m)(?:^|[^.A-Za-z0-9_$])(?:exec|execSync)\s*\(\s*(?:`[^`]*\$\{|[^"'`])"#,
                 summary: "Dynamic command execution",
                 cwe: "CWE-78",
                 severity: Severity::High,
@@ -315,6 +315,18 @@ pub(super) fn scan_sast(path: &str, text: &str, builder: &mut FindingBuilder<'_>
     for rule in rules {
         for matched in rule.regex.find_iter(text) {
             if offset_in_non_code_span(&non_code, matched.start()) {
+                continue;
+            }
+            let line_end = text[matched.start()..]
+                .find('\n')
+                .map_or(text.len(), |relative| matched.start() + relative);
+            let line_start = text[..matched.start()]
+                .rfind('\n')
+                .map_or(0, |offset| offset + 1);
+            if text[line_start..line_end]
+                .to_ascii_lowercase()
+                .contains("hooray:allow-sast")
+            {
                 continue;
             }
             if matches!(

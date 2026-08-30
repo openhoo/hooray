@@ -1593,7 +1593,7 @@ mod tests {
         .unwrap();
         let artifact = generator.gitlab_ci_include().unwrap();
         let gitlab: Value = serde_yaml::from_slice(&artifact.body).unwrap();
-        let status = std::process::Command::new("sh")
+        let status = std::process::Command::new("sh") // hooray:allow-sast -- executes generated gate in isolated test directory
             .arg("-c")
             .arg(gitlab["hooray_policy"]["script"][0].as_str().unwrap())
             .current_dir(temp.path())

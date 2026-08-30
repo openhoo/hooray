@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::{
     config::Config,
+    filesystem::repository_walk,
     model::{
         Asset, AssetId, AssetKind, Component, ComponentId, DependencyEdge, Inventory, License,
         Scope, Source, SourceKind, stable_component_id,
@@ -135,10 +136,7 @@ impl ScanInput {
             if canonical.join("oci-layout").is_file() && canonical.join("index.json").is_file() {
                 return Ok(Self::OciImageLayout(canonical));
             }
-            if has_project_manifest(&canonical)? {
-                return Ok(Self::ProjectDirectory(canonical));
-            }
-            return Err(InputError::UnsupportedFormat(canonical));
+            return Ok(Self::ProjectDirectory(canonical));
         }
         if !metadata.is_file() {
             return Err(InputError::UnsupportedPath(canonical));
@@ -209,22 +207,22 @@ fn scan_directory(root: &Path, config: &Config) -> Result<Inventory, InputError>
     reject_symlink_ancestors(root)?;
     let mut files = BTreeMap::new();
     let mut total = 0_u64;
-    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+    for entry in repository_walk(root, false, None) {
         let entry = entry.map_err(|error| InputError::Io {
-            path: error.path().unwrap_or(root).to_owned(),
+            path: root.to_owned(),
             source: io::Error::other(error),
         })?;
         let relative = entry
             .path()
             .strip_prefix(root)
             .map_err(|_| InputError::PathTraversal(entry.path().display().to_string()))?;
-        if entry.file_type().is_symlink() {
-            // WalkDir does not follow links here. Ignore nested links so a
+        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            // The repository walk does not follow links here. Ignore nested links so a
             // repository containing ordinary package-manager or tooling
             // links remains scannable without admitting content outside root.
             continue;
         }
-        if !entry.file_type().is_file() || !is_inventory_file(relative) {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) || !is_inventory_file(relative) {
             continue;
         }
         let bytes = read_limited(entry.path(), config.max_input_bytes)?;
@@ -304,7 +302,7 @@ fn scan_virtual_files(
             recognized = true;
         }
     }
-    if !recognized {
+    if !recognized && kind != AssetKind::Repository {
         return Err(InputError::UnsupportedFormat(locator.to_owned()));
     }
     builder.finish()
@@ -470,16 +468,6 @@ fn tar_is_image<R: Read>(reader: R, config: &Config) -> Result<bool, InputError>
         }
     }
     Ok(is_oci_markers(has_layout, has_index, manifest.as_deref()))
-}
-
-fn has_project_manifest(root: &Path) -> Result<bool, InputError> {
-    for (name, _) in LOCKFILES {
-        let path = root.join(name);
-        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn is_inventory_file(path: &Path) -> bool {
@@ -893,8 +881,11 @@ mod tests {
         ));
         assert!(matches!(
             ScanInput::detect(dir.path(), &config()),
-            Err(InputError::UnsupportedFormat(_))
+            Ok(ScanInput::ProjectDirectory(_))
         ));
+        let empty_inventory = scan_path(dir.path(), &config()).unwrap();
+        assert!(empty_inventory.components.is_empty());
+        assert!(empty_inventory.dependencies.is_empty());
 
         let unsupported = dir.path().join("notes.txt");
         fs::write(&unsupported, "not an inventory").unwrap();

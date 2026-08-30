@@ -7,6 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::filesystem::repository_walk;
 use crate::model::{
     Confidence, Evidence, Finding, FindingKind, FindingStatus, Inventory, License, RuleId,
     Severity, salted_finding_id, stable_finding_id,
@@ -583,19 +584,19 @@ fn collect_license_files(
         return Err(LicenseError::Symlink(root.to_owned()));
     }
     let mut files = Vec::new();
-    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+    for entry in repository_walk(root, false, None) {
         let entry = entry.map_err(|error| LicenseError::Io {
-            path: error.path().unwrap_or(root).to_owned(),
+            path: root.to_owned(),
             source: io::Error::other(error),
         })?;
-        if entry.file_type().is_symlink() {
-            // WalkDir does not follow links. Skip nested links, including
+        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            // The repository walk does not follow links. Skip nested links, including
             // license-shaped names, so their external targets cannot be
             // attributed to this asset and unrelated tooling links do not
             // make an otherwise safe repository unscannable.
             continue;
         }
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
         let relative = entry
