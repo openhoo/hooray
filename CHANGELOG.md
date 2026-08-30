@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.3 (2026-08-30)
+
+### Bug Fixes
+
+- **license:** adopt Apache-2.0 (#12) (f536513)
+
+### Other Changes
+
+- standardize Hoostack dogfood (#11) (3dcdebb)
+
 ## 0.6.2 (2026-08-30)
 
 ### Bug Fixes
