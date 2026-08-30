@@ -93,3 +93,14 @@ jobs:
         uses: openhoo/hoolicy/actions/check@584ed5abf673dfb9b1d5279dfaa78329a94a9ea5 # v0.2.3
         with:
           version: 0.2.3
+
+      - name: Analyze with Hoonarqube
+        uses: openhoo/hoonarqube/actions/analyze@79e847af3edebc70685aaf90d3db7cdfcb557e97 # v0.2.2
+        with:
+          version: 0.2.2
+          paths: |
+            src
+            tests
+            benches
+          output: ${{ runner.temp }}/hoonarqube.json
+          fail-on: none
