@@ -423,7 +423,7 @@ impl IntegrationGenerator {
     pub fn github_actions_workflow(&self) -> Result<GeneratedArtifact, IntegrationError> {
         self.text_artifact(
             "text/yaml",
-            "name: Hooray\n\non:\n  pull_request:\n  push:\n    branches: [main]\n\npermissions:\n  contents: read\n  security-events: write\n  checks: write\n\njobs:\n  hooray:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-31\n      - run: cargo install hooray --version 0.6.3 --locked\n      - run: hooray scan project . --format sarif --output hooray.sarif\n      - uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v4.37.9\n        if: always()\n        with:\n          sarif_file: hooray.sarif\n",
+            "name: Hooray\n\non:\n  pull_request:\n  push:\n    branches: [main]\n\npermissions:\n  contents: read\n  security-events: write\n  checks: write\n\njobs:\n  hooray:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-31\n      - run: cargo install hooray --version 0.6.4 --locked\n      - run: hooray scan project . --format sarif --output hooray.sarif\n      - uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v4.37.9\n        if: always()\n        with:\n          sarif_file: hooray.sarif\n",
         )
     }
 
@@ -1551,7 +1551,7 @@ mod tests {
         assert!(
             github_text.contains("dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c")
         );
-        assert!(github_text.contains("cargo install hooray --version 0.6.3 --locked"));
+        assert!(github_text.contains("cargo install hooray --version 0.6.4 --locked"));
         assert!(github_text.contains("upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d"));
         assert!(github_text.contains("hooray scan project . --format sarif --output hooray.sarif"));
 

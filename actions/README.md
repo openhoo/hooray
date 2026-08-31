@@ -5,7 +5,7 @@ Use immutable action revisions in consuming repositories.
 ```yaml
 - uses: openhoo/hooray/actions/scan@<full-commit-sha>
   with:
-    version: 0.6.3
+    version: 0.6.4
     policy: hooray-policy.yaml
 ```
 

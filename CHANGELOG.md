@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.4 (2026-08-31)
+
+### Bug Fixes
+
+- align Hoostack policy and release supply chain (5726283)
+- **release:** honor protected main branch (58dbc8a)
+
 ## 0.6.3 (2026-08-30)
 
 ### Bug Fixes

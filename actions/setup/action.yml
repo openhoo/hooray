@@ -4,7 +4,7 @@ inputs:
   version:
     description: Hooray release version to install.
     required: false
-    default: "0.6.3"
+    default: "0.6.4"
 outputs:
   version:
     description: Hooray version configured by this action.
