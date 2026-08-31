@@ -1366,7 +1366,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         for (kind, marker) in [
             (IntegrationKind::PreCommit, "repos:"),
-            (IntegrationKind::GithubActions, "upload-sarif@v3"),
+            (
+                IntegrationKind::GithubActions,
+                "upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d",
+            ),
             (IntegrationKind::GitlabCi, "hooray_policy:"),
             (IntegrationKind::GitlabSecurity, "sarif:"),
         ] {

@@ -11,7 +11,7 @@ budgets:
 packs:
   - name: repository
     git: https://github.com/openhoo/hoolicy.git
-    ref: v0.2.3
+    ref: v0.2.4
     subdir: packs/repository
     with:
       branch_pattern: '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)/[a-z0-9]+(?:-[a-z0-9]+)*$'
@@ -22,17 +22,17 @@ packs:
 rules:
   - id: repository.required-files
     title: Repository has required public documentation
-    description: Requires entry-point, license, and vulnerability-reporting documents.
-    rationale: Every Hoostack repository needs the same discoverable public contract.
-    remediation: Add reviewed README.md, LICENSE, and SECURITY.md files.
+    description: Requires entry point, license, security, contribution, and conduct documents.
+    rationale: Every Hoostack repository needs a discoverable public contract.
+    remediation: Add reviewed README, LICENSE, SECURITY, CONTRIBUTING, and CODE_OF_CONDUCT files.
     severity: error
     kind: files
-    files: [README.md, LICENSE, SECURITY.md]
+    files: [README.md, LICENSE, SECURITY.md, CONTRIBUTING.md, CODE_OF_CONDUCT.md]
     spec:
       mode: count
-      minimum: 3
-      maximum: 3
-      message: README.md, LICENSE, and SECURITY.md are required
+      minimum: 5
+      maximum: 5
+      message: Public repository contract is incomplete
   - id: supply-chain.approved-sources
     title: Build inputs come only from approved artifact sources
     description: Parses npm, NuGet, Dockerfile, JSON, and YAML source references.
@@ -68,7 +68,7 @@ rules:
       registries: [docker.io, ghcr.io, gcr.io, mcr.microsoft.com, quay.io]
       npm: [https://registry.npmjs.org]
       nuget: [https://api.nuget.org/v3/index.json]
-      requireDigest: false
+      requireDigest: true
       message: Artifact source is outside the approved supply chain
   - id: supply-chain.exception-lifecycle
     title: Security exceptions are owned, justified, ticketed, and short-lived

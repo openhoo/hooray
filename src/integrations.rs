@@ -423,7 +423,7 @@ impl IntegrationGenerator {
     pub fn github_actions_workflow(&self) -> Result<GeneratedArtifact, IntegrationError> {
         self.text_artifact(
             "text/yaml",
-            "name: Hooray\n\non:\n  pull_request:\n  push:\n    branches: [main]\n\npermissions:\n  contents: read\n  security-events: write\n  checks: write\n\njobs:\n  hooray:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: dtolnay/rust-toolchain@stable\n      - run: cargo install hooray --locked\n      - run: hooray scan project . --format sarif --output hooray.sarif\n      - uses: github/codeql-action/upload-sarif@v3\n        if: always()\n        with:\n          sarif_file: hooray.sarif\n",
+            "name: Hooray\n\non:\n  pull_request:\n  push:\n    branches: [main]\n\npermissions:\n  contents: read\n  security-events: write\n  checks: write\n\njobs:\n  hooray:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-31\n      - run: cargo install hooray --version 0.6.3 --locked\n      - run: hooray scan project . --format sarif --output hooray.sarif\n      - uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v4.37.9\n        if: always()\n        with:\n          sarif_file: hooray.sarif\n",
         )
     }
 
@@ -445,7 +445,7 @@ impl IntegrationGenerator {
             ""
         };
         let template = format!(
-            "stages: [test, security-gate]\n\nhooray_security:\n  stage: test\n  image:\n    name: $HOORAY_IMAGE\n    entrypoint: [\"\"]\n  allow_failure: false\n  variables:\n    HOORAY_INPUT: \".\"\n    HOORAY_POLICY: \"hooray-policy.yaml\"\n  rules:\n    - if: '$HOORAY_DISABLED == \"true\"'\n      when: never\n    - when: on_success\n  script:\n    - |\n      set +e\n      hooray scan auto \"$HOORAY_INPUT\" --policy \"$HOORAY_POLICY\" --format gitlab-artifacts --output .hooray-gitlab\n      status=$?\n      set -e\n      test \"$status\" -le 1\n  artifacts:\n    when: always\n    expire_in: 1 week\n    paths: [.hooray-gitlab/]\n    reports:\n      codequality: .hooray-gitlab/gl-code-quality-report.json\n      junit: .hooray-gitlab/gl-junit-report.xml\n      dotenv: .hooray-gitlab/hooray.env\n{security}\nhooray_policy:\n  stage: security-gate\n  image: alpine:3.22\n  allow_failure: false\n  rules:\n    - if: '$HOORAY_DISABLED == \"true\"'\n      when: never\n    - when: always\n  needs:\n    - job: hooray_security\n      artifacts: true\n  script:\n    - |\n      file=.hooray-gitlab/hooray.env\n      test -f \"$file\"\n      test \"$(wc -l < \"$file\")\" -eq 2\n      test \"$(grep -c '^HOORAY_POLICY_DENIED=' \"$file\")\" -eq 1\n      test \"$(grep -c '^HOORAY_POLICY_DENIED_COUNT=' \"$file\")\" -eq 1\n      test -z \"$(grep -Ev '^(HOORAY_POLICY_DENIED=(true|false)|HOORAY_POLICY_DENIED_COUNT=[0-9]+)$' \"$file\")\"\n      denied=$(awk -F= '$1 == \"HOORAY_POLICY_DENIED\" {{ print $2 }}' \"$file\")\n      test \"$denied\" = false\n"
+            "stages: [test, security-gate]\n\nhooray_security:\n  stage: test\n  image:\n    name: $HOORAY_IMAGE\n    entrypoint: [\"\"]\n  allow_failure: false\n  variables:\n    HOORAY_INPUT: \".\"\n    HOORAY_POLICY: \"hooray-policy.yaml\"\n  rules:\n    - if: '$HOORAY_DISABLED == \"true\"'\n      when: never\n    - when: on_success\n  script:\n    - |\n      set +e\n      hooray scan auto \"$HOORAY_INPUT\" --policy \"$HOORAY_POLICY\" --format gitlab-artifacts --output .hooray-gitlab\n      status=$?\n      set -e\n      test \"$status\" -le 1\n  artifacts:\n    when: always\n    expire_in: 1 week\n    paths: [.hooray-gitlab/]\n    reports:\n      codequality: .hooray-gitlab/gl-code-quality-report.json\n      junit: .hooray-gitlab/gl-junit-report.xml\n      dotenv: .hooray-gitlab/hooray.env\n{security}\nhooray_policy:\n  stage: security-gate\n  image: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce\n  allow_failure: false\n  rules:\n    - if: '$HOORAY_DISABLED == \"true\"'\n      when: never\n    - when: always\n  needs:\n    - job: hooray_security\n      artifacts: true\n  script:\n    - |\n      file=.hooray-gitlab/hooray.env\n      test -f \"$file\"\n      test \"$(wc -l < \"$file\")\" -eq 2\n      test \"$(grep -c '^HOORAY_POLICY_DENIED=' \"$file\")\" -eq 1\n      test \"$(grep -c '^HOORAY_POLICY_DENIED_COUNT=' \"$file\")\" -eq 1\n      test -z \"$(grep -Ev '^(HOORAY_POLICY_DENIED=(true|false)|HOORAY_POLICY_DENIED_COUNT=[0-9]+)$' \"$file\")\"\n      denied=$(awk -F= '$1 == \"HOORAY_POLICY_DENIED\" {{ print $2 }}' \"$file\")\n      test \"$denied\" = false\n"
         );
         self.text_artifact("text/yaml", &template)
     }
@@ -1547,7 +1547,12 @@ mod tests {
         let github = generator.github_actions_workflow().unwrap();
         let github_text = github.text().unwrap();
         assert!(github_text.contains("permissions:\n  contents: read"));
-        assert!(github_text.contains("upload-sarif@v3"));
+        assert!(github_text.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"));
+        assert!(
+            github_text.contains("dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c")
+        );
+        assert!(github_text.contains("cargo install hooray --version 0.6.3 --locked"));
+        assert!(github_text.contains("upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d"));
         assert!(github_text.contains("hooray scan project . --format sarif --output hooray.sarif"));
 
         for (artifact, security) in [
@@ -1575,7 +1580,10 @@ mod tests {
             assert!(scan_script.contains("set +e\nhooray scan auto \"$HOORAY_INPUT\" --policy \"$HOORAY_POLICY\" --format gitlab-artifacts --output .hooray-gitlab\nstatus=$?\nset -e\ntest \"$status\" -le 1"));
             let gate = &gitlab["hooray_policy"];
             assert_eq!(gate["stage"], "security-gate");
-            assert_eq!(gate["image"], "alpine:3.22");
+            assert_eq!(
+                gate["image"],
+                "alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
+            );
             assert_eq!(gate["rules"][1]["when"], "always");
             assert_eq!(gate["needs"][0]["job"], "hooray_security");
             assert_eq!(gate["needs"][0]["artifacts"], true);
