@@ -30,9 +30,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Lint commit messages
-        uses: openhoo/hooversion/actions/lint@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
+        uses: openhoo/hooversion/actions/lint@d536bb45b5c2dbf9a17c866c0fe48f54216a1673 # v1.0.7
         with:
-          version: 1.0.6
+          version: 1.0.7
 
       - name: Cache Rust dependencies and tools
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
