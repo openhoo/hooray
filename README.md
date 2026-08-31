@@ -338,7 +338,7 @@ comparison.
 Hooray requires Rust 1.90 or later to build from source.
 
 ```bash
-cargo install hooray --locked
+cargo install hooray --version 0.6.3 --locked
 ```
 
 For repository development:
@@ -747,7 +747,9 @@ overlap rather than identity:
 Hooversion derives releases from Conventional Commits on `main`, updates the
 manifest, lockfile, and changelog, creates the release commit and `v<version>`
 tag, and publishes a GitHub Release. The release workflow attaches the optimized
-Linux x86_64 binary, archive, and checksums.
+Linux x86_64 archive, SPDX SBOM, checksums, Sigstore bundles, and GitHub artifact
+attestations. The GHCR image digest is independently signed and attested; release
+notes retain its immutable digest for readback and recovery.
 
 ## License
 

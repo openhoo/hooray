@@ -24,18 +24,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Lint commit messages
-        uses: openhoo/hooversion/actions/lint@4aa43b4d775c7b03d196b06381013f4601467c57 # v1.0.3
+        uses: openhoo/hooversion/actions/lint@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
         with:
-          version: 1.0.3
+          version: 1.0.6
 
       - name: Cache Rust dependencies and tools
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/cargo-deny
@@ -90,17 +90,27 @@ jobs:
           output: ""
 
       - name: Enforce Hoolicy policy
-        uses: openhoo/hoolicy/actions/check@584ed5abf673dfb9b1d5279dfaa78329a94a9ea5 # v0.2.3
+        uses: openhoo/hoolicy/actions/check@f1b9be32483e3353e38ef3b5703217d2723e735e # v0.2.4
         with:
-          version: 0.2.3
+          version: 0.2.4
 
       - name: Analyze with Hoonarqube
-        uses: openhoo/hoonarqube/actions/analyze@79e847af3edebc70685aaf90d3db7cdfcb557e97 # v0.2.2
+        uses: openhoo/hoonarqube/actions/analyze@0ed50de75e6e8c097c44e6b50a16f6d8817acedf # v0.2.3
         with:
-          version: 0.2.2
+          version: 0.2.3
           paths: |
             src
             tests
             benches
           output: ${{ runner.temp }}/hoonarqube.json
           fail-on: none
+
+      - name: Set up HooNeedsUpdates
+        uses: openhoo/hooneedsupdates/actions/setup@4a833fd00dafc8fb017d5cabec0c38dddba4bc70 # v0.1.1
+        with:
+          version: 0.1.1
+
+      - name: Audit dependency freshness
+        run: hooneedsupdates scan --fail-on unresolved .
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

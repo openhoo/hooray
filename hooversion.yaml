@@ -10,6 +10,7 @@ packages:
       - hooray
 hooks:
   afterVersion:
+    - scripts/sync-action-versions.sh
     - cargo generate-lockfile
 github:
   releases: true

@@ -1,0 +1,25 @@
+version: 1
+managers:
+  - gomod
+  - cargo
+  - npm
+  - nuget
+  - github-actions
+  - docker
+excludePaths:
+  - '(^|/)(fixtures|testdata|\.oracle)(/|$)'
+allowedUpdateTypes:
+  - patch
+  - minor
+  - major
+concurrency: 8
+requestTimeout: 15s
+includePrereleases: false
+customManagers:
+  - name: hooversion-version
+    datasource: github-releases
+    dependencyName: openhoo/hooversion
+    filePatterns:
+      - '^\.github/workflows/.*\.ya?ml$'
+    matchStrings:
+      - 'HOOVERSION_VERSION:\s*["'']?(?P<currentValue>[^\s"'']+)'

@@ -1,10 +1,10 @@
-FROM rust:1.90-bookworm AS builder
+FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS builder
 
 WORKDIR /usr/src/hooray
 COPY . .
 RUN cargo build --locked --release --bin hooray
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 
 ARG VERSION
 ARG VCS_REF
