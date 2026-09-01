@@ -338,7 +338,7 @@ comparison.
 Hooray requires Rust 1.90 or later to build from source.
 
 ```bash
-cargo install hooray --version 0.6.3 --locked
+cargo install hooray --version 0.6.4 --locked
 ```
 
 For repository development:
