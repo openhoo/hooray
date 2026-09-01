@@ -30,9 +30,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Lint commit messages
-        uses: openhoo/hooversion/actions/lint@d536bb45b5c2dbf9a17c866c0fe48f54216a1673 # v1.0.7
+        uses: openhoo/hooversion/actions/lint@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
         with:
-          version: 1.0.7
+          version: 1.1.0
 
       - name: Cache Rust dependencies and tools
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -90,14 +90,14 @@ jobs:
           output: ""
 
       - name: Enforce Hoolicy policy
-        uses: openhoo/hoolicy/actions/check@f1b9be32483e3353e38ef3b5703217d2723e735e # v0.2.4
+        uses: openhoo/hoolicy/actions/check@5b8cfb4339ba84edf96f84ddd66e30f4e19e7a80 # v0.3.0
         with:
-          version: 0.2.4
+          version: 0.3.0
 
       - name: Analyze with Hoonarqube
-        uses: openhoo/hoonarqube/actions/analyze@0ed50de75e6e8c097c44e6b50a16f6d8817acedf # v0.2.3
+        uses: openhoo/hoonarqube/actions/analyze@11e4d2d44f5e34d11a7c03e4a87eea857ceea8ed # v0.3.0
         with:
-          version: 0.2.3
+          version: 0.3.0
           paths: |
             src
             tests
@@ -106,9 +106,9 @@ jobs:
           fail-on: none
 
       - name: Set up HooNeedsUpdates
-        uses: openhoo/hooneedsupdates/actions/setup@4a833fd00dafc8fb017d5cabec0c38dddba4bc70 # v0.1.1
+        uses: openhoo/hooneedsupdates/actions/setup@9977546b1e7fa03e9601d1bb19a0f6d3adcd4acd # v0.2.0
         with:
-          version: 0.1.1
+          version: 0.2.0
 
       - name: Audit dependency freshness
         run: hooneedsupdates scan --fail-on unresolved .
