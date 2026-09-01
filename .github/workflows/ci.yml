@@ -106,9 +106,9 @@ jobs:
           fail-on: none
 
       - name: Set up HooNeedsUpdates
-        uses: openhoo/hooneedsupdates/actions/setup@9977546b1e7fa03e9601d1bb19a0f6d3adcd4acd # v0.2.0
+        uses: openhoo/hooneedsupdates/actions/setup@5f29337d0c39c47c691947aae0a201d2cfca8d64 # v0.3.0
         with:
-          version: 0.2.0
+          version: 0.3.0
 
       - name: Audit dependency freshness
         run: hooneedsupdates scan --fail-on unresolved .
