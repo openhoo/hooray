@@ -344,7 +344,7 @@ commit SHA in consuming workflows and select a published release:
 ```yaml
 - uses: openhoo/hooray/actions/setup@<full-commit-sha>
   with:
-    version: 0.6.4
+    version: 0.6.5
 ```
 
 The installer downloads the release archive, `SHA256SUMS`, and their Sigstore
