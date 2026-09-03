@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.5 (2026-09-03)
+
+### Bug Fixes
+
+- **scanner:** harden structural analysis and monitoring (0e49874)
+
+### Other Changes
+
+- **ci:** update Hoostack tool pins (#16) (d656407)
+- **ci:** adopt HooNeedsUpdates v0.3.0 (5118bfa)
+
 ## Unreleased
 
 ### Breaking Changes
