@@ -112,6 +112,15 @@ fn scanner_fixture(bytes: usize) -> String {
     source
 }
 
+fn javascript_arrow_fixture(count: usize) -> String {
+    let mut source = String::with_capacity(count * 32);
+    source.push_str("const cp = require(\"child_process\");\n");
+    for index in 0..count {
+        source.push_str(&format!("const arrow_{index} = value => value;\n"));
+    }
+    source
+}
+
 fn scanner_tree_fixture(file_count: usize) -> TempDir {
     let directory = TempDir::new().expect("scanner fixture directory");
     let source = scanner_fixture(16 * 1024);
@@ -318,6 +327,24 @@ fn main() {
         ));
     });
     report("scanner_rust_1mb", iterations, elapsed);
+
+    for arrow_count in [4_000, 8_000, 16_000] {
+        let source = javascript_arrow_fixture(arrow_count);
+        let (iterations, elapsed) = measure(|| {
+            black_box(analyze_bytes(
+                "src/arrows.js",
+                black_box(source.as_bytes()),
+                &asset,
+                &scanner_config,
+                &signatures,
+            ));
+        });
+        report(
+            &format!("scanner_javascript_arrows_{arrow_count}"),
+            iterations,
+            elapsed,
+        );
+    }
 
     let scanner_tree = scanner_tree_fixture(256);
     let scanner_tree_config = ScannerConfig {

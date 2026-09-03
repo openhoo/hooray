@@ -19,7 +19,7 @@ failures are distinct from policy denials through separate exit codes.
 
 Hooray accepts explicit input types or auto-detects them:
 
-- project directories containing supported lockfiles or manifests;
+- project directories; recognized lockfiles and manifests contribute dependency inventory;
 - CycloneDX JSON SBOMs with nested components and dependency relationships;
 - SPDX 2.x JSON SBOMs, detected by their `spdxVersion` key;
 - ZIP and TAR artifacts containing supported dependency files;
@@ -337,9 +337,22 @@ comparison.
 
 Hooray requires Rust 1.90 or later to build from source.
 
-```bash
-cargo install hooray --version 0.6.4 --locked
+For Linux x86_64, the supported binary installation path is the verified
+release installer exposed by the setup action. Pin the action to the full
+commit SHA in consuming workflows and select a published release:
+
+```yaml
+- uses: openhoo/hooray/actions/setup@<full-commit-sha>
+  with:
+    version: 0.6.4
 ```
+
+The installer downloads the release archive, `SHA256SUMS`, and their Sigstore
+bundles; it verifies both bundles against the pinned release workflow identity
+`https://github.com/openhoo/hooray/.github/workflows/release.yml@refs/heads/main`
+and OIDC issuer `https://token.actions.githubusercontent.com` before adding the
+binary to `PATH`. Hooray is not published to crates.io, so `cargo install
+hooray` is not a supported installation method.
 
 For repository development:
 
@@ -392,8 +405,10 @@ inventory; every scan loads and evaluates a policy document, so
 `ScanRequest::new` takes its path. Passing `None` as the engine's provider
 selects the built-in OSV client; supply a custom `VulnerabilityProvider`
 implementation instead for deterministic or offline behavior.
-`render_to_string` supports the same formats as the CLI, and `save_report`
-persists the completed report to SQLite history.
+`render_to_string` supports every single-report `ReportFormat` value. The CLI-only
+`gitlab-artifacts` directory bundle must be written with `write_gitlab_artifacts`
+or by using the CLI bundle path, and cannot be represented by a single `String`.
+`save_report` persists the completed report to SQLite history.
 
 ## CLI reference
 
@@ -564,10 +579,15 @@ legacy severity-only `--fail-on` interface.
 | OCI/Docker | OCI layout or OCI/Docker TAR | Layer application with whiteouts, digest validation, supported lockfiles from final filesystem |
 | Generic artifact | `.zip` or `.tar` | Supported lockfiles discovered in the bounded archive |
 
-Project-directory detection requires at least one supported lockfile. Files with
-similar names are not treated as supported inputs, and malformed supported files
-fail rather than being silently skipped. If filesystem-analysis admission bounds
-omit files, the report includes a high-severity `scanner:coverage-incomplete`
+Any existing non-symlink directory is treated as a project unless both OCI
+layout markers (`oci-layout` and `index.json`) are present. Recognized lockfiles
+and manifests contribute dependency inventory; `Cargo.toml` and `go.sum` are
+sidecars rather than standalone inventory formats. Empty or source-only
+directories therefore produce an empty dependency inventory but still receive
+bounded filesystem analysis. Files with similar names are not recognized, and
+malformed recognized inventory files fail rather than being silently skipped. If
+filesystem-analysis admission bounds omit files, the report includes a
+high-severity `scanner:coverage-incomplete`
 operational-risk finding with scanned and skipped counters.
 
 ## Quality and security verification
@@ -746,10 +766,14 @@ overlap rather than identity:
 
 Hooversion derives releases from Conventional Commits on `main`, updates the
 manifest, lockfile, and changelog, creates the release commit and `v<version>`
-tag, and publishes a GitHub Release. The release workflow attaches the optimized
-Linux x86_64 archive, SPDX SBOM, checksums, Sigstore bundles, and GitHub artifact
-attestations. The GHCR image digest is independently signed and attested; release
-notes retain its immutable digest for readback and recovery.
+tag, and publishes a GitHub Release. Each release attaches the optimized
+`hooray-<version>-x86_64-unknown-linux-gnu.tar.gz` archive containing the
+`hooray` executable, `SHA256SUMS`, and Sigstore bundles
+`<archive>.sigstore.json` and `SHA256SUMS.sigstore.json`. The setup action
+verifies both bundles with certificate identity
+`https://github.com/openhoo/hooray/.github/workflows/release.yml@refs/heads/main`
+and OIDC issuer `https://token.actions.githubusercontent.com` before checking
+the archive digest.
 
 ## License
 
