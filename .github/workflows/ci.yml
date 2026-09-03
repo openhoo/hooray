@@ -95,9 +95,9 @@ jobs:
           version: 0.3.1
 
       - name: Analyze with Hoonarqube
-        uses: openhoo/hoonarqube/actions/analyze@11e4d2d44f5e34d11a7c03e4a87eea857ceea8ed # v0.3.0
+        uses: openhoo/hoonarqube/actions/analyze@03b34bc8957995959d43531e82130a2c95bf01fa # v0.3.1
         with:
-          version: 0.3.0
+          version: 0.3.1
           paths: |
             src
             tests
