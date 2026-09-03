@@ -1731,6 +1731,407 @@ mod tests {
     }
 
     #[test]
+    fn javascript_exec_receiver_aliases_and_literals() {
+        let source = r#"
+const childProcess = require("child_process");
+childProcess.exec(command);
+childProcess.execSync(`git ${branch}`);
+const cp = require("node:child_process");
+cp.exec(input);
+require("child_process").exec(direct);
+import * as esm from "node:child_process";
+esm.execSync(value);
+import { exec as run, execSync as runSync } from "child_process";
+run(value);
+runSync(`git ${branch}`);
+const { exec: destructured, execSync: destructuredSync } = require("child_process");
+destructured(input);
+destructuredSync(`git ${branch}`);
+exec(command);
+
+/^(?:rgba|hsla)\(([^)]+)\)$/.exec(computed);
+RegExp.prototype.exec(computed);
+foo.exec(user_input);
+// cp.exec(commented);
+const text = "cp.exec(string)";
+childProcess.exec("fixed");
+childProcess.execSync(`fixed`);
+cp.exec(`fixed`);
+"#;
+        let output = analyze("x.ts", source);
+        let findings = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .count();
+        assert_eq!(
+            findings, 10,
+            "all proven dynamic child_process sinks are reported once"
+        );
+    }
+
+    #[test]
+    fn javascript_exec_receiver_aliases_respect_lexical_shadowing() {
+        assert!(has(
+            &analyze(
+                "x.js",
+                r#"const cp = require("child_process");
+cp.exec(input);"#,
+            ),
+            "sast.javascript.exec-dynamic"
+        ));
+        assert!(!has(
+            &analyze(
+                "x.js",
+                r#"const cp = require("child_process");
+function run(cp) {
+    cp.exec(input);
+}"#,
+            ),
+            "sast.javascript.exec-dynamic"
+        ));
+        assert!(!has(
+            &analyze(
+                "x.js",
+                r#"function run(require) {
+    require("child_process").exec(input);
+}"#,
+            ),
+            "sast.javascript.exec-dynamic"
+        ));
+        assert!(!has(
+            &analyze(
+                "x.js",
+                r#"const cp = require("child_process").spawn;
+cp.exec(input);
+const { exec: run } = require("child_process").exec;
+run(input);"#,
+            ),
+            "sast.javascript.exec-dynamic"
+        ));
+    }
+
+    #[test]
+    fn javascript_exec_receiver_aliases_respect_catch_shadowing() {
+        let source = r#"const cp = require("child_process");
+try {} catch (cp) {
+    cp.exec(input);
+}
+try {} catch ({ exec: cp }) {
+    cp.exec(input);
+}
+cp.exec(input);"#;
+        let findings = analyze("x.js", source)
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .count();
+        assert_eq!(
+            findings, 1,
+            "catch parameters must shadow aliases for both identifier and destructured bindings"
+        );
+    }
+
+    #[test]
+    fn javascript_exec_aliases_honor_reassignment_invalidation() {
+        let source = r#"let cp = require("child_process");
+cp.exec(before);
+cp = fallback;
+cp.exec(after);
+let { exec: run } = require("child_process");
+run(before);
+run = fallback;
+run(after);"#;
+        let findings = analyze("x.js", source)
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .count();
+        assert_eq!(
+            findings, 2,
+            "calls before reassignment remain findings while later calls are invalidated"
+        );
+    }
+
+    #[test]
+    fn javascript_exec_aliases_keep_nested_reassignments_scoped() {
+        let source = r#"let cp = require("child_process");
+function reset() {
+    cp.exec(before);
+    cp = safe;
+    cp.exec(after);
+}
+cp.exec(outside);"#;
+        let findings = analyze("x.js", source)
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .count();
+        assert_eq!(
+            findings, 2,
+            "nested reassignment invalidates only calls after it in that function"
+        );
+    }
+
+    #[test]
+    fn javascript_exec_aliases_ignore_empty_argument_lists() {
+        let source = concat!(
+            "const cp = require(\"child_process\");\n",
+            "cp.exec();\n",
+            "cp.exec( /* comment */ );\n",
+            "cp.exec(// comment\n);\n",
+            "cp.exec(// comment\r);\n",
+            "cp.exec(// comment\u{2028});\n",
+            "cp.exec(// comment\u{2029});\n",
+            "require(\"child_process\").exec(// comment\r);\n",
+            "const { exec: run } = require(\"child_process\");\n",
+            "run(// comment\u{2028});\n",
+            "cp.exec(/* comment */ input);",
+        );
+        let findings = analyze("x.js", source)
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .count();
+        assert_eq!(
+            findings, 1,
+            "empty and comment-only command calls are not dynamic sinks"
+        );
+    }
+
+    #[test]
+    fn javascript_exec_aliases_cover_declarations_without_receiver_false_positives() {
+        let source = r#"prepare(); const namespace = require("child_process"); namespace.exec(input);
+let node_namespace = require("node:child_process"); node_namespace.execSync(input);
+var { exec: run } = require("child_process"); run(input);
+const unrelated = { exec: input => input }; unrelated.exec(input);
+const filesystem = require("fs"); filesystem.exec(input);
+const { exec: not_run } = require("fs"); not_run(input);
+"#;
+        let output = analyze("x.js", source);
+        let findings = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .count();
+        assert_eq!(
+            findings, 3,
+            "only child_process aliases, including renamed destructuring, are reported"
+        );
+        assert!(!has(
+            &analyze(
+                "x.js",
+                r#"function load(require) {
+    const cp = require("child_process");
+    cp.exec(input);
+}"#,
+            ),
+            "sast.javascript.exec-dynamic"
+        ));
+    }
+
+    #[test]
+    fn javascript_exec_aliases_reject_member_properties_across_line_comments() {
+        let source = r#"const { exec: run } = require("child_process");
+const cp = require("child_process");
+const other = { run, cp, require };
+other . run(input);
+other /* comment */ . run(input);
+other .
+// comment
+run(input);
+other .
+// comment
+cp.exec(input);
+other .
+// comment
+require("child_process").exec(input);
+run(input);
+cp.exec(input);"#;
+        let findings = analyze("x.js", source)
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .count();
+        assert_eq!(
+            findings, 2,
+            "only the named alias and namespace receiver calls are executable sinks"
+        );
+    }
+
+    #[test]
+    fn javascript_exec_aliases_skip_typescript_parameter_modifiers() {
+        let source = r#"const cp = require("child_process");
+class Runner {
+    constructor(public cp: unknown) {
+        cp.exec(input);
+    }
+    method(private readonly cp: unknown) {
+        cp.exec(input);
+    }
+}
+cp.exec(input);"#;
+        let findings = analyze("x.ts", source)
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .count();
+        assert_eq!(
+            findings, 1,
+            "TypeScript parameter modifiers must not hide the shadowing identifier"
+        );
+    }
+    #[test]
+    fn javascript_exec_receiver_aliases_handle_utf8_and_concise_arrows() {
+        let source = r#"const cp = require("child_process");
+const π = 1;
+const shadowed = cp => cp.exec(input);
+const async_shadowed = async cp => cp.exec(input);
+const newline_shadowed = cp => cp.exec(input)
+const assignment_shadowed = fn = cp => cp.exec(input);
+const dynamic = value => cp.exec(input);
+childProcess.exec(input);"#;
+        let output = analyze("x.js", source);
+        let findings = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .count();
+        assert_eq!(
+            findings, 1,
+            "only the unshadowed declared child_process alias is reported"
+        );
+    }
+
+    #[test]
+    fn javascript_binding_model_handles_reviewed_edge_cases() {
+        let rule = "sast.javascript.exec-dynamic";
+        let initializer = analyze(
+            "x.js",
+            "const π = 1;\nconst cp = require(\"child_process\");\nconst fn = (value = (other, cp)) => cp.exec(input);\n",
+        );
+        assert_eq!(
+            initializer
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_id.as_str() == rule)
+                .count(),
+            1,
+            "parenthesized initializer commas must not bind cp"
+        );
+        let finding = initializer
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id.as_str() == rule)
+            .unwrap();
+        let location = initializer
+            .locations
+            .iter()
+            .find(|location| Some(&location.id) == finding.location_id.as_ref())
+            .and_then(|location| location.start.as_ref())
+            .unwrap();
+        assert_eq!((location.line, location.column), (3, 40));
+
+        assert_eq!(
+            analyze(
+                "x.js",
+                "const cp = require(\"child_process\");\nfunction run() { { var cp = local; } cp.exec(input); }\ncp.exec(input);\n",
+            )
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == rule)
+            .count(),
+            1,
+            "var must bind in the nearest function scope"
+        );
+        assert_eq!(
+            analyze(
+                "x.js",
+                "const cp = require(\"child_process\");\nconst number = cp => 1;\nconst string = cp => \"safe\";\ncp.exec(input);\n",
+            )
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == rule)
+            .count(),
+            1,
+            "literal concise-arrow bodies must end before the next line"
+        );
+        assert!(!has(
+            &analyze(
+                "x.js",
+                "const cp = require(\"child_process\");\nconst logical = cp => value\n  && cp.exec(input);\n",
+            ),
+            rule
+        ));
+        assert!(!has(
+            &analyze(
+                "x.ts",
+                "const cp = require(\"child_process\");\nfunction typed(cp): void { cp.exec(input); }\nconst typedArrow = (cp): void => { cp.exec(input); }\n",
+            ),
+            rule
+        ));
+        assert_eq!(
+            analyze(
+                "x.js",
+                "const cp = require(\"child_process\");\nconst fn = function cp() { cp.exec(input); };\nconst cls = class cp { static run() { cp.exec(input); } }\ncp.exec(input);\n",
+            )
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == rule)
+            .count(),
+            1,
+            "named expressions must scope their names to the expression"
+        );
+        assert_eq!(
+            analyze(
+                "x.js",
+                "const cp = require(\"child_process\");\nconst shadowed = cp => cp.exec(input) /* comment */\ncp.exec(input);\n",
+            )
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == rule)
+            .count(),
+            1,
+            "comment openers must not become arrow-expression tokens"
+        );
+        assert_eq!(
+            analyze(
+                "x.js",
+                "const cp = require(\"child_process\");\nfunction run(...cp) { cp.exec(input); }\ncp.exec(input);\n",
+            )
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == rule)
+            .count(),
+            1,
+            "top-level rest parameters must bind their identifier"
+        );
+        assert!(has(
+            &analyze(
+                "x.js",
+                "const { exec: run = fallback } = require(\"child_process\");\nrun(input);\n",
+            ),
+            rule
+        ));
+    }
+
+    #[test]
+    fn javascript_concise_arrow_regex_literals_do_not_corrupt_scope() {
+        let findings = analyze(
+            "x.js",
+            "const cp = require(\"child_process\");\nconst matcher = cp => /)/.test(cp);\ncp.exec(input);\n",
+        )
+        .findings
+        .iter()
+        .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+        .count();
+        assert_eq!(
+            findings, 1,
+            "regex delimiters must not underflow arrow-expression scope tracking"
+        );
+    }
+
+    #[test]
     fn sast_only_suppresses_a_single_constant_literal_argument() {
         assert!(has(
             &analyze("x.py", "eval(\"safe\" + user_input)"),

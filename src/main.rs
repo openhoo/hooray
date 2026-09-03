@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     fs::File,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -705,95 +704,17 @@ impl MonitorRunner for CliMonitorRunner {
         target: &'a hooray::monitor::MonitorTarget,
     ) -> MonitorFuture<'a, Result<String, MonitorError>> {
         Box::pin(async move {
-            use sha2::{Digest, Sha256};
-            use walkdir::WalkDir;
-
             let requested_root = PathBuf::from(target.source.as_str());
             let max_input_bytes = self.config.max_input_bytes;
             let max_archive_entries = self.config.max_archive_entries;
             let database_path = self.config.database_path.clone();
-            tokio::task::spawn_blocking(move || -> Result<String, MonitorError> {
-                let metadata = std::fs::symlink_metadata(&requested_root)
-                    .map_err(|error| MonitorError::Runner(error.to_string()))?;
-                if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
-                    return Err(MonitorError::Runner(format!(
-                        "monitor source '{}' is not a regular file or directory",
-                        requested_root.display()
-                    )));
-                }
-                let root = std::fs::canonicalize(&requested_root)
-                    .map_err(|error| MonitorError::Runner(error.to_string()))?;
-                let excluded_database_paths = std::fs::canonicalize(&database_path)
-                    .ok()
-                    .map(|database| {
-                        let mut paths = BTreeSet::from([database.clone()]);
-                        for suffix in ["-wal", "-shm", "-journal"] {
-                            if let Some(name) = database.file_name() {
-                                let mut sidecar_name = name.to_os_string();
-                                sidecar_name.push(suffix);
-                                paths.insert(database.with_file_name(sidecar_name));
-                            }
-                        }
-                        paths
-                    })
-                    .unwrap_or_default();
-                let mut paths = if metadata.is_file() {
-                    (!excluded_database_paths.contains(&root))
-                        .then(|| root.clone())
-                        .into_iter()
-                        .collect()
-                } else {
-                    WalkDir::new(&root)
-                        .follow_links(false)
-                        .sort_by_file_name()
-                        .into_iter()
-                        .filter_map(|entry| match entry {
-                            Err(error) => Some(Err(error)),
-                            Ok(entry)
-                                if entry.file_type().is_file()
-                                    && !excluded_database_paths.contains(entry.path()) =>
-                            {
-                                Some(Ok(entry.into_path()))
-                            }
-                            Ok(_) => None,
-                        })
-                        .take(max_archive_entries.saturating_add(1))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|error| {
-                            MonitorError::Runner(format!(
-                                "failed to walk source '{}': {error}",
-                                root.display()
-                            ))
-                        })?
-                };
-                if paths.len() > max_archive_entries {
-                    return Err(MonitorError::Runner(format!(
-                        "source fingerprint exceeds configured file bound of {max_archive_entries}"
-                    )));
-                }
-                paths.sort();
-                let mut digest = Sha256::new();
-                digest.update(b"hooray.source-fingerprint.v2\0");
-                let mut total = 0_u64;
-                for path in paths {
-                    let relative = path.strip_prefix(&root).unwrap_or(&path);
-                    let relative = relative.as_os_str().as_encoded_bytes();
-                    digest.update((relative.len() as u64).to_be_bytes());
-                    digest.update(relative);
-                    // Bound enforced during the read (mirrors StdinFile::take) so
-                    // an oversized file never allocates fully before rejection.
-                    let bytes = read_bounded(&path, max_input_bytes)
-                        .map_err(|error| MonitorError::Runner(error.to_string()))?;
-                    total = total.saturating_add(bytes.len() as u64);
-                    if total > max_input_bytes {
-                        return Err(MonitorError::Runner(
-                            "source fingerprint exceeds configured input bound".into(),
-                        ));
-                    }
-                    digest.update((bytes.len() as u64).to_be_bytes());
-                    digest.update(bytes);
-                }
-                Ok(format!("{:x}", digest.finalize()))
+            tokio::task::spawn_blocking(move || {
+                hooray::monitor::source_fingerprint(
+                    &requested_root,
+                    &database_path,
+                    max_input_bytes,
+                    max_archive_entries,
+                )
             })
             .await
             .map_err(|_| MonitorError::Runner("source fingerprint task was cancelled".into()))?

@@ -9,8 +9,11 @@ Use immutable action revisions in consuming repositories.
     policy: hooray-policy.yaml
 ```
 
-`actions/setup` verifies the selected Linux X64 release archive against its
-published checksum and checks the installed binary version. `actions/scan`
+`actions/setup` verifies the selected Linux X64 release archive and
+`SHA256SUMS` against their published Sigstore bundles, pinned certificate
+identity `https://github.com/openhoo/hooray/.github/workflows/release.yml@refs/heads/main`,
+and OIDC issuer `https://token.actions.githubusercontent.com`, then checks the
+installed binary version. `actions/scan`
 requires an explicit policy, validates it, uses an isolated temporary SQLite
 database, and writes a SARIF report by default. Set `offline: true` only when
 CI intentionally excludes OSV access.

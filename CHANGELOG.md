@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Breaking Changes
+
+- Reclassified the dependency graph and scanner error changes already present on
+  the released 0.6.x line for the next breaking release: `GraphError::Cycle`
+  is no longer exposed (and dependency cycles are accepted), while
+  `ScanError::Walk::source` now carries `ignore::Error` instead of
+  `walkdir::Error`. Consumers with exhaustive `GraphError` matches must remove
+  the `Cycle` arm, and consumers inspecting `Walk::source` must update the
+  concrete error type. Continue using the released 0.6.x dependency until the
+  next breaking release is published.
+
 ## 0.6.4 (2026-08-31)
 
 ### Bug Fixes
@@ -36,6 +49,19 @@
 
 - harden runtime, persistence, and monitoring (3f3e632)
 
+### Review Hardening
+
+- Activated configured OSV connection/request timeouts and monitor polling.
+- Aligned API scans with CLI inventory analyses, including offline operation.
+- Redacted sensitive free-form report values before SQLite persistence and
+  created new Unix database files with owner-only permissions.
+- Fixed quality-aware report negotiation, monitor fingerprint truncation and
+  database self-triggering, and safe handling of nested repository symlinks in
+  inventory and license passes.
+- Made filesystem scanner bound omissions visible to policy and reports.
+- Removed a tracked runtime database and stale advisory exception, and replaced
+  the yanked lock-only `chacha20` release.
+
 ## 0.6.0 (2026-08-26)
 
 ### Other Changes
@@ -50,21 +76,6 @@
 ### Bug Fixes
 
 - bound save-only bench by accumulated window (ece60ae)
-
-## Unreleased
-
-### Review Hardening
-
-- Activated configured OSV connection/request timeouts and monitor polling.
-- Aligned API scans with CLI inventory analyses, including offline operation.
-- Redacted sensitive free-form report values before SQLite persistence and
-  created new Unix database files with owner-only permissions.
-- Fixed quality-aware report negotiation, monitor fingerprint truncation and
-  database self-triggering, and safe handling of nested repository symlinks in
-  inventory and license passes.
-- Made filesystem scanner bound omissions visible to policy and reports.
-- Removed a tracked runtime database and stale advisory exception, and replaced
-  the yanked lock-only `chacha20` release.
 
 ### Major Features
 

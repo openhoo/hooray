@@ -157,7 +157,7 @@ impl DependencyGraph {
         };
         let mut roots = self.connected_roots().iter().cloned();
         while let Some(root) = roots.next() {
-            if !self.can_reach(&root, target) {
+            if !self.can_reach(&root, target, &[]) {
                 continue;
             }
             let mut current = vec![root];
@@ -165,7 +165,8 @@ impl DependencyGraph {
                 break;
             }
             if collection.paths.len() == max_paths {
-                collection.truncated = roots.any(|remaining| self.can_reach(&remaining, target));
+                collection.truncated =
+                    roots.any(|remaining| self.can_reach(&remaining, target, &[]));
                 break;
             }
         }
@@ -191,7 +192,7 @@ impl DependencyGraph {
             return collection.truncated && collection.paths.len() == collection.max_paths;
         }
         if current.len() > collection.max_depth {
-            if self.can_reach(node, collection.target) {
+            if self.can_reach(node, collection.target, current) {
                 collection.truncated = true;
             }
             return collection.truncated && collection.paths.len() == collection.max_paths;
@@ -208,7 +209,10 @@ impl DependencyGraph {
                 return true;
             }
             if collection.paths.len() == collection.max_paths {
-                if outgoing.any(|remaining| self.can_reach(remaining, collection.target)) {
+                if outgoing.any(|remaining| {
+                    !current.contains(remaining)
+                        && self.can_reach(remaining, collection.target, current)
+                }) {
                     collection.truncated = true;
                     return true;
                 }
@@ -218,9 +222,15 @@ impl DependencyGraph {
         false
     }
 
-    fn can_reach(&self, start: &ComponentId, target: &ComponentId) -> bool {
+    fn can_reach(
+        &self,
+        start: &ComponentId,
+        target: &ComponentId,
+        blocked: &[ComponentId],
+    ) -> bool {
         let mut pending = vec![start.clone()];
-        let mut seen = BTreeSet::new();
+        let mut seen: BTreeSet<_> = blocked.iter().cloned().collect();
+        seen.remove(start);
         while let Some(node) = pending.pop() {
             if !seen.insert(node.clone()) {
                 continue;
@@ -326,6 +336,61 @@ mod tests {
         assert_eq!(paths.paths.len(), 1);
         assert_eq!(paths.paths[0].components, expected);
         assert!(!paths.truncated);
+    }
+
+    #[test]
+    fn exhausted_caps_ignore_only_cyclic_non_simple_paths() {
+        let graph = graph(
+            &["root", "a", "target", "z"],
+            &[
+                edge("root", "a"),
+                edge("a", "target"),
+                edge("a", "z"),
+                edge("z", "a"),
+            ],
+        )
+        .unwrap();
+        let expected = vec![id("root"), id("a"), id("target")];
+
+        for result in [
+            graph.all_paths(&id("target"), 2, 10).unwrap(),
+            graph.all_paths(&id("target"), 2, 1).unwrap(),
+        ] {
+            assert_eq!(result.paths.len(), 1);
+            assert_eq!(result.paths[0].components, expected);
+            assert!(!result.truncated);
+        }
+    }
+
+    #[test]
+    fn count_cap_probe_ignores_active_ancestor_back_edges() {
+        let graph = graph(
+            &["root", "zancestor", "a", "b", "target"],
+            &[
+                edge("root", "zancestor"),
+                edge("zancestor", "a"),
+                edge("zancestor", "b"),
+                edge("a", "target"),
+                edge("b", "target"),
+                edge("b", "zancestor"),
+            ],
+        )
+        .unwrap();
+
+        let result = graph.all_paths(&id("target"), 4, 2).unwrap();
+
+        assert_eq!(
+            result
+                .paths
+                .iter()
+                .map(|path| path.components.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![id("root"), id("zancestor"), id("a"), id("target")],
+                vec![id("root"), id("zancestor"), id("b"), id("target")],
+            ]
+        );
+        assert!(!result.truncated);
     }
 
     #[test]

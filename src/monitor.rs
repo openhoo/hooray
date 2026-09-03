@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeSet, HashMap},
+    fs,
     future::Future,
+    io::{self, Read},
+    path::Path,
     pin::Pin,
     sync::Arc,
     time::Duration,
@@ -314,6 +317,126 @@ pub trait MonitorRunner: Send + Sync {
     ) -> MonitorFuture<'a, Result<Evaluation, MonitorError>>;
 }
 
+/// Computes the source digest used by scheduled monitor evaluations.
+///
+/// Directory sources use the same ignore-aware walker as one-shot scans.
+/// Ignore controls are added explicitly because a control file can ignore
+/// itself and therefore be absent from the walk's visible file set.
+pub fn source_fingerprint(
+    requested_root: &Path,
+    database_path: &Path,
+    max_input_bytes: u64,
+    max_files: usize,
+) -> Result<String, MonitorError> {
+    use sha2::{Digest, Sha256};
+
+    let metadata = fs::symlink_metadata(requested_root)
+        .map_err(|error| MonitorError::Runner(error.to_string()))?;
+    if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+        return Err(MonitorError::Runner(format!(
+            "monitor source '{}' is not a regular file or directory",
+            requested_root.display()
+        )));
+    }
+    let root = fs::canonicalize(requested_root)
+        .map_err(|error| MonitorError::Runner(error.to_string()))?;
+    let excluded_database_paths = fs::canonicalize(database_path)
+        .ok()
+        .map(|database| {
+            let mut paths = BTreeSet::from([database.clone()]);
+            for suffix in ["-wal", "-shm", "-journal"] {
+                if let Some(name) = database.file_name() {
+                    let mut sidecar_name = name.to_os_string();
+                    sidecar_name.push(suffix);
+                    paths.insert(database.with_file_name(sidecar_name));
+                }
+            }
+            paths
+        })
+        .unwrap_or_default();
+
+    let mut paths = if metadata.is_file() {
+        (!excluded_database_paths.contains(&root))
+            .then(|| root.clone())
+            .into_iter()
+            .collect()
+    } else {
+        let mut paths = BTreeSet::new();
+        for entry in crate::filesystem::repository_walk(&root, false, None) {
+            let entry = entry.map_err(|error| {
+                MonitorError::Runner(format!(
+                    "failed to walk source '{}': {error}",
+                    root.display()
+                ))
+            })?;
+            let entry_path = entry.path();
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                for name in crate::filesystem::IGNORE_CONTROL_NAMES {
+                    let control = entry_path.join(name);
+                    if fs::symlink_metadata(&control)
+                        .ok()
+                        .is_some_and(|metadata| metadata.file_type().is_file())
+                        && !excluded_database_paths.contains(&control)
+                    {
+                        paths.insert(control);
+                    }
+                }
+            } else if entry.file_type().is_some_and(|kind| kind.is_file())
+                && !excluded_database_paths.contains(entry_path)
+            {
+                paths.insert(entry_path.to_owned());
+            }
+            if paths.len() > max_files {
+                return Err(MonitorError::Runner(format!(
+                    "source fingerprint exceeds configured file bound of {max_files}"
+                )));
+            }
+        }
+        paths.into_iter().collect::<Vec<_>>()
+    };
+    if paths.len() > max_files {
+        return Err(MonitorError::Runner(format!(
+            "source fingerprint exceeds configured file bound of {max_files}"
+        )));
+    }
+    paths.sort();
+
+    let mut digest = Sha256::new();
+    digest.update(b"hooray.source-fingerprint.v3\0");
+    let mut total = 0_u64;
+    for path in paths {
+        let relative = path.strip_prefix(&root).unwrap_or(&path);
+        let relative = relative.as_os_str().as_encoded_bytes();
+        digest.update((relative.len() as u64).to_be_bytes());
+        digest.update(relative);
+        // Bound enforced during the read so an oversized file never allocates
+        // fully before rejection.
+        let bytes = read_fingerprint_bounded(&path, max_input_bytes)
+            .map_err(|error| MonitorError::Runner(error.to_string()))?;
+        total = total.saturating_add(bytes.len() as u64);
+        if total > max_input_bytes {
+            return Err(MonitorError::Runner(
+                "source fingerprint exceeds configured input bound".into(),
+            ));
+        }
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn read_fingerprint_bounded(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?.take(cap.saturating_add(1));
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source fingerprint exceeds configured input bound",
+        ));
+    }
+    Ok(bytes)
+}
 pub trait Notifier: Send + Sync {
     fn notify<'a>(&'a self, event: &'a AlertEvent) -> MonitorFuture<'a, Result<(), String>>;
 }
@@ -902,6 +1025,57 @@ mod tests {
             format!("{:020}", epoch as u64 ^ (1_u64 << 63))
         );
         assert!(encode_time(2) > encode_time(1));
+    }
+    #[test]
+    fn source_fingerprint_uses_visible_files_and_ignore_controls() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("ignored")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join("visible.txt"), "visible").unwrap();
+        std::fs::write(root.join("ignored/payload.txt"), "one").unwrap();
+        let database = root.join(".hooray.db");
+
+        let before = source_fingerprint(&root, &database, 1024, 2).unwrap();
+        std::fs::write(root.join("ignored/payload.txt"), "two").unwrap();
+        assert_eq!(
+            before,
+            source_fingerprint(&root, &database, 1024, 2).unwrap(),
+            "ignored payloads must not consume fingerprint inputs"
+        );
+
+        std::fs::write(root.join(".gitignore"), "ignored/\n.gitignore\n").unwrap();
+        let self_ignored = source_fingerprint(&root, &database, 1024, 2).unwrap();
+        assert_ne!(before, self_ignored);
+
+        std::fs::write(root.join(".gitignore"), "ignored/\nchanged.txt\n").unwrap();
+        let after_gitignore = source_fingerprint(&root, &database, 1024, 2).unwrap();
+        assert_ne!(self_ignored, after_gitignore);
+
+        std::fs::write(root.join(".ignore"), "other/\n").unwrap();
+        let after_ignore = source_fingerprint(&root, &database, 1024, 3).unwrap();
+        assert_ne!(after_gitignore, after_ignore);
+
+        std::fs::write(root.join(".hoorayignore"), "another/\n").unwrap();
+        let after_hoorayignore = source_fingerprint(&root, &database, 1024, 4).unwrap();
+        assert_ne!(after_ignore, after_hoorayignore);
+    }
+    #[test]
+    fn source_fingerprint_is_deterministic_for_creation_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let database = root.join("hooray.db");
+        let first = source_fingerprint(&root, &database, 1024, 8).unwrap();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        assert_eq!(
+            first,
+            source_fingerprint(&root, &database, 1024, 8).unwrap()
+        );
     }
 
     #[derive(Default)]
