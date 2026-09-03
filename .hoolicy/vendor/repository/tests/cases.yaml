@@ -1,8 +1,8 @@
 version: 1
 parameters:
-  branch_pattern: '^(feat|fix|docs|ci)/[a-z0-9]+(?:-[a-z0-9]+)*$'
+  branch_pattern: '^((feat|fix|docs|ci)/[a-z0-9]+(?:-[a-z0-9]+)*|release/v[0-9]+\.[0-9]+\.[0-9]+)$'
   commit_pattern: '^(feat|fix|docs|ci|test): .+$'
-  merge_request_title_pattern: '^(Draft: )?(feat|fix|docs|ci): .+$'
+  merge_request_title_pattern: '^(Draft: )?(feat|fix|docs|ci|chore)(\([a-z0-9][a-z0-9-]*\))?!?: .+$'
   allowed_branches: [main, develop]
   merge_request_title_maximum: 100
 cases:
@@ -11,6 +11,21 @@ cases:
     outcome: pass
     branch: feat/add-policy
     mergeRequestTitle: 'Draft: feat: Add policy'
+  - name: generated semantic release branch passes
+    rule: repository.git-naming
+    outcome: pass
+    branch: release/v0.3.1
+    mergeRequestTitle: 'chore(release): hoolicy 0.3.1'
+  - name: malformed release branch fails
+    rule: repository.git-naming
+    outcome: fail
+    branch: release/latest
+    mergeRequestTitle: 'chore(release): hoolicy latest'
+    expect:
+      - key: branch:release/latest
+        messageContains: branch
+        waived: false
+        hasFix: false
   - name: ad-hoc branch name fails
     rule: repository.git-naming
     outcome: fail

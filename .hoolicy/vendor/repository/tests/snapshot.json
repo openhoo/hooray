@@ -24,6 +24,28 @@
       "ruleId": "repository.git-naming",
       "outcome": "pass",
       "findings": []
+    },
+    {
+      "name": "generated semantic release branch passes",
+      "ruleId": "repository.git-naming",
+      "outcome": "pass",
+      "findings": []
+    },
+    {
+      "name": "malformed release branch fails",
+      "ruleId": "repository.git-naming",
+      "outcome": "fail",
+      "findings": [
+        {
+          "ruleId": "repository.git-naming",
+          "severity": "error",
+          "message": "Git name does not follow the repository convention: branch \"release/latest\"",
+          "key": "branch:release/latest",
+          "fingerprint": "4e5007da8c094dab7ee2ad2dd1728c2a1e168658c514d78f7b6f334137bbd713",
+          "waived": false,
+          "hasFix": false
+        }
+      ]
     }
   ]
 }
