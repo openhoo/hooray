@@ -11,10 +11,14 @@ use crate::{
         Finding, FindingId, FindingKind, Location, LocationId, PolicyOutcome, ScanReport, Severity,
     },
     monitor::FindingDiff,
-    report::{ReportIndex, gitlab_code_quality_entry, gitlab_finding_location, sarif_level},
+    report::{
+        ReportIndex, gitlab_code_quality_entry, gitlab_finding_location, repository_relative_path,
+        sarif_level, sarif_repository_uri,
+    },
 };
 
 const SARIF_SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
+const HOORAY_SETUP_ACTION_REVISION: &str = "f2b28d71398749142f4d9366b0427369f3af6e02";
 const WEBHOOK_SIGNATURE_VERSION: &str = "v1";
 const REDACTED: &str = "[REDACTED]";
 const MIN_WEBHOOK_SECRET_BYTES: usize = 16;
@@ -156,8 +160,10 @@ impl IntegrationGenerator {
                     "partialFingerprints": { "hoorayFindingId": finding.id.as_str() },
                     "properties": { "kind": finding.kind.as_str(), "severity": finding.severity.as_str() }
                 });
-                if let Some(location) = report_location(&locations, finding) {
-                    result["locations"] = json!([sarif_location(location)]);
+                if let Some(location) =
+                    report_location(&locations, finding).and_then(sarif_location)
+                {
+                    result["locations"] = json!([location]);
                 }
                 result
             })
@@ -185,17 +191,23 @@ impl IntegrationGenerator {
         let annotations: Vec<Value> = selected
             .items
             .iter()
-            .map(|finding| {
-                let location = report_location(&locations, finding);
-                json!({
-                    "path": location.map_or(".", |value| value.path.as_str()),
-                    "start_line": location.and_then(|value| value.start).map_or(1, |value| value.line.max(1)),
-                    "end_line": location.and_then(|value| value.end.or(value.start)).map_or(1, |value| value.line.max(1)),
+            .filter_map(|finding| {
+                let location = report_location(&locations, finding)?;
+                let path = repository_relative_path(&location.path)?;
+                let start_line = location.start.map_or(1, |value| value.line.max(1));
+                let end_line = location
+                    .end
+                    .or(location.start)
+                    .map_or(start_line, |value| value.line.max(start_line));
+                Some(json!({
+                    "path": path,
+                    "start_line": start_line,
+                    "end_line": end_line,
                     "annotation_level": github_annotation_level(finding.severity),
                     "title": self.finding_title(finding),
                     "message": self.finding_message(finding),
                     "raw_details": format!("finding_id={} rule_id={}", finding.id, finding.rule_id)
-                })
+                }))
             })
             .collect();
         let conclusion = if report.policy_summary.denied > 0 {
@@ -424,7 +436,65 @@ impl IntegrationGenerator {
         self.text_artifact(
             "text/yaml",
             &format!(
-                "name: Hooray\n\non:\n  pull_request:\n  push:\n    branches: [main]\n\npermissions:\n  contents: read\n  security-events: write\n  checks: write\n\njobs:\n  hooray:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-31\n        with:\n          toolchain: 1.90.0\n      - run: cargo install hooray --version {} --locked\n      - run: hooray scan project . --format sarif --output hooray.sarif\n      - uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v4.37.9\n        if: always()\n        with:\n          sarif_file: hooray.sarif\n",
+                r#"name: Hooray
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  checks: write
+
+jobs:
+  hooray:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: openhoo/hooray/actions/setup@{} # v0.6.5
+        with:
+          version: {}
+      - name: Scan with Hooray
+        id: scan
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          status_file="$RUNNER_TEMP/hooray-scan-status"
+          rm -f "$status_file" hooray.sarif
+          hooray scan project . --format sarif --output hooray.sarif
+          status=$?
+          set -e
+          if [[ "$status" -le 1 && -s hooray.sarif ]]; then
+            printf '%s\n' "$status" > "$status_file"
+            printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+            exit "$status"
+          fi
+          if [[ "$status" -le 1 ]]; then
+            echo "::error::Hooray did not produce hooray.sarif."
+            status=2
+          fi
+          printf '%s\n' "$status" > "$status_file"
+          printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+      - uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v4.37.9
+        if: steps.scan.outputs.status == '0' || steps.scan.outputs.status == '1'
+        with:
+          sarif_file: hooray.sarif
+      - name: Enforce Hooray scan status
+        if: always()
+        shell: bash
+        run: |
+          status_file="$RUNNER_TEMP/hooray-scan-status"
+          status="$(cat "$status_file" 2>/dev/null || printf '2')"
+          case "$status" in
+            0|1|2) exit "$status" ;;
+            *) echo "::error::Hooray scan did not report a valid exit status."; exit 2 ;;
+          esac
+"#,
+                HOORAY_SETUP_ACTION_REVISION,
                 env!("CARGO_PKG_VERSION"),
             ),
         )
@@ -658,13 +728,14 @@ fn report_location<'a>(locations: &LocationIndex<'a>, finding: &Finding) -> Opti
     locations.get(location_id).copied()
 }
 
-fn sarif_location(location: &Location) -> Value {
+fn sarif_location(location: &Location) -> Option<Value> {
+    let uri = sarif_repository_uri(&location.path)?;
     let start = location.start;
     let end = location.end.or(start);
-    json!({
+    Some(json!({
         "physicalLocation": {
             "artifactLocation": {
-                "uri": crate::util::percent_encode(&location.path, crate::util::is_path_uri_byte)
+                "uri": uri
             },
             "region": {
                 "startLine": start.map_or(1, |value| value.line.max(1)),
@@ -673,7 +744,7 @@ fn sarif_location(location: &Location) -> Value {
                 "endColumn": end.map_or(1, |value| value.column.max(1))
             }
         }
-    })
+    }))
 }
 
 fn vscode_diagnostic(
@@ -1153,6 +1224,11 @@ mod tests {
             sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["startLine"],
             7
         );
+        assert_eq!(
+            sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+                ["uri"],
+            "src/finding%3Acritical.rs"
+        );
         let check = json_artifact(
             generator(10)
                 .github_check_run(&report, Some("https://security.example/report/1"))
@@ -1164,6 +1240,35 @@ mod tests {
             check["output"]["annotations"][0]["path"],
             "src/finding:critical.rs"
         );
+    }
+
+    #[test]
+    fn github_check_run_omits_findings_without_truthful_paths() {
+        let report = report(vec![finding(
+            "finding:unlocated",
+            FindingKind::Sast,
+            Severity::High,
+            false,
+        )]);
+        let check = json_artifact(generator(10).github_check_run(&report, None).unwrap());
+        assert_eq!(check["output"]["annotations"], json!([]));
+    }
+
+    #[test]
+    fn forge_payloads_render_valid_empty_reports() {
+        let report = report(Vec::new());
+        let generator = generator(10);
+
+        let sarif = json_artifact(generator.github_sarif(&report).unwrap());
+        assert_eq!(sarif["runs"][0]["tool"]["driver"]["rules"], json!([]));
+        assert_eq!(sarif["runs"][0]["results"], json!([]));
+
+        let quality = json_artifact(generator.gitlab_code_quality(&report).unwrap());
+        assert_eq!(quality, json!([]));
+
+        let check = json_artifact(generator.github_check_run(&report, None).unwrap());
+        assert_eq!(check["conclusion"], "success");
+        assert_eq!(check["output"]["annotations"], json!([]));
     }
 
     #[test]
@@ -1553,12 +1658,10 @@ mod tests {
         assert!(github_text.contains(
             "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
         ));
-        assert!(github_text.contains(
-            "      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-31\n        with:\n          toolchain: 1.90.0"
-        ));
         let scanner_version = env!("CARGO_PKG_VERSION");
         assert!(github_text.contains(&format!(
-            "      - run: cargo install hooray --version {scanner_version} --locked"
+            "      - uses: openhoo/hooray/actions/setup@{} # v0.6.5\n        with:\n          version: {scanner_version}",
+            HOORAY_SETUP_ACTION_REVISION
         )));
         assert!(github_text.contains(
             "      - uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v4.37.9"
@@ -1568,6 +1671,13 @@ mod tests {
         assert!(!github_text.contains("cargo install hooray --locked"));
         assert!(!github_text.contains("upload-sarif@v3"));
         assert!(github_text.contains("hooray scan project . --format sarif --output hooray.sarif"));
+        assert!(github_text.contains("        continue-on-error: true\n"));
+        assert!(github_text.contains(
+            "        if: steps.scan.outputs.status == '0' || steps.scan.outputs.status == '1'\n"
+        ));
+        assert!(github_text.contains("status_file=\"$RUNNER_TEMP/hooray-scan-status\""));
+        assert!(github_text.contains("      - name: Enforce Hooray scan status"));
+        assert!(!github_text.contains("if: always()\n        with:\n          sarif_file"));
 
         for (artifact, security) in [
             (generator.gitlab_ci_include().unwrap(), false),

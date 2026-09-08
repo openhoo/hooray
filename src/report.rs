@@ -757,11 +757,14 @@ pub(crate) struct GitLabFindingLocation {
     pub(crate) line: u32,
 }
 
-pub(crate) fn gitlab_repository_path(path: &str) -> Option<String> {
+pub(crate) fn repository_relative_path(path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
     let normalized = path.replace('\\', "/");
+    if normalized.chars().any(char::is_control) {
+        return None;
+    }
     if normalized.starts_with("//")
         || normalized
             .as_bytes()
@@ -771,27 +774,6 @@ pub(crate) fn gitlab_repository_path(path: &str) -> Option<String> {
                 .as_bytes()
                 .first()
                 .is_some_and(u8::is_ascii_alphabetic)
-    {
-        return None;
-    }
-    let lower = normalized.to_ascii_lowercase();
-    if lower.starts_with("bom-ref:")
-        || lower.starts_with("purl:")
-        || lower.starts_with("pkg:")
-        || lower.split_once(':').is_some_and(|(scheme, value)| {
-            !value.is_empty()
-                && matches!(
-                    scheme,
-                    "md5"
-                        | "sha1"
-                        | "sha224"
-                        | "sha256"
-                        | "sha384"
-                        | "sha512"
-                        | "blake2"
-                        | "blake3"
-                )
-        })
     {
         return None;
     }
@@ -809,7 +791,22 @@ pub(crate) fn gitlab_repository_path(path: &str) -> Option<String> {
             }
         }
     }
-    (!parts.is_empty()).then(|| parts.join("/"))
+    let first = parts.first()?;
+    // A colon in the first normalized component denotes a URI-like locator
+    // (including package refs, hashes, and URLs). Colons in later components
+    // remain valid repository filenames and are preserved verbatim.
+    if first.contains(':') {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+pub(crate) fn gitlab_repository_path(path: &str) -> Option<String> {
+    repository_relative_path(path)
+}
+
+pub(crate) fn sarif_repository_uri(path: &str) -> Option<String> {
+    repository_relative_path(path).map(|path| path_uri(&path))
 }
 
 pub(crate) fn gitlab_finding_location(
@@ -1040,7 +1037,7 @@ fn gitlab_sarif_document(
                 "level": sarif_level(finding.severity),
                 "rank": rank,
                 "message": {"text": truncate_chars(finding.summary.as_deref().or(finding.details.as_deref()).unwrap_or(finding.rule_id.as_str()), 1024)},
-                "locations": [{"physicalLocation": {"artifactLocation": {"uri": location.path}, "region": {"startLine": location.line}}}],
+                "locations": [{"physicalLocation": {"artifactLocation": {"uri": sarif_repository_uri(&location.path).expect("GitLab location is repository-relative")}, "region": {"startLine": location.line}}}],
                 "fingerprints": {"hoorayFindingId/v1": finding.id.as_str()},
                 "partialFingerprints": {"primaryLocationLineHash": finding.id.as_str()},
                 "properties": {
@@ -1922,23 +1919,26 @@ fn is_sensitive_key(key: &str) -> bool {
 fn sarif_locations(index: &ReportIndex<'_>, finding: &Finding) -> Vec<Value> {
     let mut ids = selected_location_ids(finding);
     ids.sort_unstable();
-    ids.into_iter().filter_map(|id| {
-        let location = index.locations.get(id)?;
-        let mut region = serde_json::Map::new();
-        if let Some(start) = location.start {
-            region.insert("startLine".into(), json!(start.line.max(1)));
-            region.insert("startColumn".into(), json!(start.column.max(1)));
-        }
-        if let Some(end) = location.end {
-            region.insert("endLine".into(), json!(end.line.max(1)));
-            region.insert("endColumn".into(), json!(end.column.max(1)));
-        }
-        let mut physical = json!({"artifactLocation": {"uri": path_uri(&location.path)}});
-        if !region.is_empty() {
-            physical["region"] = Value::Object(region);
-        }
-        Some(json!({"physicalLocation": physical, "properties": {"locationId": location.id.as_str()}}))
-    }).collect()
+    ids.into_iter()
+        .filter_map(|id| {
+            let location = index.locations.get(id)?;
+            let uri = sarif_repository_uri(&location.path)?;
+            let mut region = serde_json::Map::new();
+            if let Some(start) = location.start {
+                region.insert("startLine".into(), json!(start.line.max(1)));
+                region.insert("startColumn".into(), json!(start.column.max(1)));
+            }
+            if let Some(end) = location.end {
+                region.insert("endLine".into(), json!(end.line.max(1)));
+                region.insert("endColumn".into(), json!(end.column.max(1)));
+            }
+            let mut physical = json!({"artifactLocation": {"uri": uri}});
+            if !region.is_empty() {
+                physical["region"] = Value::Object(region);
+            }
+            Some(json!({"physicalLocation": physical, "properties": {"locationId": location.id.as_str()}}))
+        })
+        .collect()
 }
 
 fn common_properties(index: &ReportIndex<'_>, finding: &Finding) -> Vec<Value> {
@@ -2463,6 +2463,11 @@ mod tests {
             "finding:stable-1"
         );
         assert_eq!(
+            value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+                ["uri"],
+            "src/a%20%26%20b.rs"
+        );
+        assert_eq!(
             value["runs"][0]["results"][0]["properties"]["policyOutcomes"][0]["outcome"],
             "deny"
         );
@@ -2750,6 +2755,10 @@ mod tests {
             "bom-ref:x",
             "purl:x",
             "sha256:abc",
+            "https://example.invalid/report",
+            "./https://example.invalid/report",
+            "./pkg:cargo/serde@1",
+            "src/\nmain.rs",
         ] {
             assert_eq!(gitlab_repository_path(invalid), None, "{invalid}");
         }
@@ -2761,6 +2770,15 @@ mod tests {
             gitlab_repository_path(" report.txt "),
             Some(" report.txt ".into())
         );
+        assert_eq!(
+            gitlab_repository_path("src/name:with-colon.rs"),
+            Some("src/name:with-colon.rs".into())
+        );
+        assert_eq!(
+            sarif_repository_uri("./src/a & b.rs"),
+            Some("src/a%20%26%20b.rs".into())
+        );
+        assert_eq!(sarif_repository_uri("/workspace/src/main.rs"), None);
         let mut report = fixture();
         let locations = report
             .inventory
@@ -2799,10 +2817,27 @@ mod tests {
         assert_eq!(run["results"][0]["rank"], 90.0);
         assert_eq!(
             run["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "src/a & b.rs"
+            "src/a%20%26%20b.rs"
         );
         assert_eq!(run["properties"]["includedFindings"], 1);
         assert_eq!(run["tool"]["driver"]["rules"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_forge_formats_render_valid_empty_reports() {
+        let mut report = fixture();
+        report.findings.clear();
+        report.policy_decisions.clear();
+        report.policy_summary = crate::model::PolicySummary::default();
+
+        for format in [ReportFormat::Sarif, ReportFormat::GitLabSarif] {
+            let value: Value = serde_json::from_slice(&render(&report, format).unwrap()).unwrap();
+            assert_eq!(value["runs"][0]["results"], json!([]));
+        }
+        let quality: Value =
+            serde_json::from_slice(&render(&report, ReportFormat::GitLabCodeQuality).unwrap())
+                .unwrap();
+        assert_eq!(quality, json!([]));
     }
 
     struct CycloneDxSchemaRetriever;
