@@ -305,6 +305,20 @@ hooray integrations generate github-actions --output hooray.yml
 hooray integrations generate gitlab-ci --output hooray.gitlab-ci.yml
 hooray integrations generate gitlab-security --output hooray.gitlab-security.yml
 ```
+The generated GitHub workflow installs the verified release binary through the
+immutable `actions/setup` revision and passes the package version explicitly;
+it does not use the unsupported `cargo install hooray` path. It grants
+`security-events: write`, uploads a non-empty SARIF file for scan statuses 0
+and 1, and runs a final status gate so policy denial remains exit 1.
+Operational failures remain failures and do not upload a partial or missing
+report. Regenerate the template only against a published setup-action revision
+and release version.
+
+GitHub SARIF locations are repository-relative URI references, so spaces and
+other URI bytes are percent-encoded. GitLab Code Quality locations remain
+repository-relative paths without a `./` prefix; findings without a truthful
+repository path are emitted without a location rather than inventing one.
+
 
 Both GitLab templates run one scan and publish Code Quality, JUnit, and dotenv
 reports before enforcing policy in a later `security-gate` stage. The

@@ -76,6 +76,14 @@ runs:
           echo "::error::offline must be true or false."
           exit 2
         fi
+        if [[ "$INPUT_OUTPUT" == "-" ]]; then
+          echo "::error::output must be a file path, not standard output ('-')."
+          exit 2
+        fi
+        if [[ "$INPUT_OUTPUT" == *$'\n'* || "$INPUT_OUTPUT" == *$'\r'* ]]; then
+          echo "::error::output must not contain newlines."
+          exit 2
+        fi
         if [[ -z "$INPUT_POLICY" ]]; then
           echo "::error::A Hooray policy path is required for a gating scan."
           exit 2

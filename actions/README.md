@@ -17,5 +17,10 @@ installed binary version. `actions/scan`
 requires an explicit policy, validates it, uses an isolated temporary SQLite
 database, and writes a SARIF report by default. Set `offline: true` only when
 CI intentionally excludes OSV access.
+The `output` input is a report file path when non-empty. The action rejects
+`-` and carriage-return/newline characters so its `report` output remains a
+safe single-line file reference; leave it empty only when the caller
+intentionally consumes CLI output instead of a report file. A policy denial
+keeps the scanner's exit status 1, while operational failures remain status 2.
 Repository self-tests may set `executable` to a freshly built local binary;
 normal consumers should omit it so the verified release installer runs.

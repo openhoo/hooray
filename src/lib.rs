@@ -12,7 +12,7 @@
 //! - [`policy`]: threshold/exception evaluation with fail-closed defaults.
 //! - [`report`]: 14 output formats; [`store`]: SQLite persistence;
 //!   [`api`]: HTTP service; [`monitor`]: scheduled re-scan daemon.
-//! - [`integrations`]: GitLab bundle artifacts.
+//! - [`integrations`]: bounded GitHub and GitLab payloads and CI templates.
 //!
 //! The `parity` module (feature-gated) is a JFrog Xray record-replay harness
 //! driven by the `hooray-parity` binary.
