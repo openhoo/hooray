@@ -22,9 +22,12 @@ mod unix {
     }
 
     fn status_for_output(output: &str) -> Option<i32> {
+        let directory = tempfile::tempdir().expect("action fixture directory");
+        let script = directory.path().join("scan.sh");
+        std::fs::write(&script, scan_script()).expect("write action scan script");
         Command::new("bash")
-            .arg("-c")
-            .arg(scan_script())
+            .arg(script)
+            .current_dir(directory.path())
             .env("INPUT_CONFIG", "")
             .env("INPUT_EXECUTABLE", "unused")
             .env("INPUT_FORMAT", "sarif")
@@ -33,7 +36,7 @@ mod unix {
             .env("INPUT_OUTPUT", output)
             .env("INPUT_POLICY", "hooray-policy.yaml")
             .env("GITHUB_OUTPUT", "unused-output")
-            .env("RUNNER_TEMP", ".")
+            .env("RUNNER_TEMP", directory.path())
             .status()
             .expect("run scan action shell")
             .code()
