@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.6 (2026-09-08)
+
+### Bug Fixes
+
+- **integrations:** make GitHub and GitLab reporting portable (8fe0ba0)
+
+### Other Changes
+
+- **ci:** converge released tool pins (3cd3646)
+- **ci:** adopt Hoonarqube v0.3.1 (9e0d686)
+
 ## 0.6.5 (2026-09-03)
 
 ### Bug Fixes
