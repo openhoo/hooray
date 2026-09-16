@@ -19,7 +19,7 @@ pub(crate) fn parse_composer_json(
         .and_then(Value::as_str)
         .filter(|v| !v.is_empty())
     {
-        out.asset.version = Some(version.to_owned());
+        out.claim_asset_identity(path, None, Some(version.to_owned()));
     }
     for (section, scope) in [
         ("require", Scope::Runtime),

@@ -312,6 +312,10 @@ struct InventoryBuilder {
     asset: Asset,
     components: BTreeMap<ComponentId, Component>,
     dependencies: BTreeSet<DependencyEdge>,
+    /// Depth (path-separator count) of the lockfile that last claimed each
+    /// asset identity field; `None` while the field is unclaimed.
+    asset_name_depth: Option<usize>,
+    asset_version_depth: Option<usize>,
 }
 
 impl InventoryBuilder {
@@ -333,6 +337,34 @@ impl InventoryBuilder {
             },
             components: BTreeMap::new(),
             dependencies: BTreeSet::new(),
+            asset_name_depth: None,
+            asset_version_depth: None,
+        }
+    }
+
+    /// Applies a lockfile's asset identity claim. Asset identity is anchored
+    /// to the lockfile closest to the scan root: a field claim applies only
+    /// when no shallower lockfile already claimed that field, so nested
+    /// lockfiles contribute components and edges but never override identity
+    /// set closer to the root. Claims at equal depth keep the first-parsed
+    /// value (lexically smallest path, since files are parsed in `BTreeMap`
+    /// order). When no root-level lockfile declares identity, the shallowest
+    /// nested declarer wins each field.
+    fn claim_asset_identity(&mut self, path: &str, name: Option<String>, version: Option<String>) {
+        let depth = path.matches('/').count();
+        if let Some(name) = name
+            && self.asset_name_depth.is_none_or(|claimed| depth < claimed)
+        {
+            self.asset.name = name;
+            self.asset_name_depth = Some(depth);
+        }
+        if version.is_some()
+            && self
+                .asset_version_depth
+                .is_none_or(|claimed| depth < claimed)
+        {
+            self.asset.version = version;
+            self.asset_version_depth = Some(depth);
         }
     }
 

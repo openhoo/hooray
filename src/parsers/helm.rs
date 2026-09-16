@@ -16,7 +16,7 @@ pub(crate) fn parse_chart_yaml(
         .and_then(Yaml::as_str)
         .filter(|v| !v.is_empty())
     {
-        out.asset.version = Some(version.to_owned());
+        out.claim_asset_identity(path, None, Some(version.to_owned()));
     }
     let Some(dependencies) = doc.get("dependencies").and_then(Yaml::as_sequence) else {
         return Ok(());
