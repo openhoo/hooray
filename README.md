@@ -50,9 +50,10 @@ and run identifiers make reports and history diffs reproducible.
   and emits ecosystem-specific upgrade guidance for Cargo, npm/pnpm/Yarn,
   pip/Poetry, Go, Maven/Gradle, and NuGet when the required data is available.
 
-`--offline` disables OSV access. Local inventory, license, filesystem, policy,
-history, and report operations remain available; vulnerability findings are not
-invented or served from an implicit cache.
+`--offline` (or `HOORAY_OFFLINE=true`, or `offline: true` in the config file)
+disables OSV access. Local inventory, license, filesystem, policy, history, and
+report operations remain available; vulnerability findings are not invented or
+served from an implicit cache.
 
 ### Policy and exceptions
 
