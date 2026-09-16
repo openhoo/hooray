@@ -24,6 +24,7 @@ mod parsers;
 
 use self::parsers::{
     archive::{read_entry_bounded, read_tar_file, read_zip_file},
+    bun::parse_bun_lock,
     cargo::parse_cargo_lock,
     conda::parse_conda_environment,
     dart::parse_pubspec_lock,
@@ -258,6 +259,7 @@ const LOCKFILES: &[(&str, Option<LockfileParser>)] = &[
     ("packages.lock.json", Some(parse_nuget_lock)),
     ("yarn.lock", Some(parse_yarn_lock)),
     ("pnpm-lock.yaml", Some(parse_pnpm_lock)),
+    ("bun.lock", Some(parse_bun_lock)),
     ("poetry.lock", Some(parse_poetry_lock)),
     ("Pipfile.lock", Some(parse_pipfile_lock)),
     ("Gemfile.lock", Some(parse_gemfile_lock)),
@@ -1075,6 +1077,7 @@ mod tests {
             "pnpm-lock.yaml" => {
                 "lockfileVersion: '9.0'\npackages:\n  a@1:\n    resolution: {integrity: sha512-x}\n"
             }
+            "bun.lock" => r#"{"lockfileVersion":1,"packages":{"a":["a@1","",{},"sha512-x"]}}"#,
             "poetry.lock" => "[[package]]\nname = 'a'\nversion = '1'\n",
             "Pipfile.lock" => "{}",
             "Gemfile.lock" => "GEM\n  specs:\n    a (1)\n",
@@ -1092,6 +1095,7 @@ mod tests {
         for name in [
             "yarn.lock",
             "pnpm-lock.yaml",
+            "bun.lock",
             "poetry.lock",
             "Pipfile.lock",
             "Gemfile.lock",

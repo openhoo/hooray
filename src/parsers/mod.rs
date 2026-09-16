@@ -2,6 +2,7 @@
 //! `input` dispatch layer.
 
 pub(crate) mod archive;
+pub(crate) mod bun;
 pub(crate) mod cargo;
 pub(crate) mod conda;
 pub(crate) mod dart;
