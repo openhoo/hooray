@@ -2545,6 +2545,39 @@ childProcess.exec(input);"#;
     }
 
     #[test]
+    fn python_weak_hash_usedforsecurity_false_is_suppressed() {
+        // Literal opt-out: the stdlib marks the digest as non-security use.
+        let opted_out = analyze(
+            "x.py",
+            "a = hashlib.md5(x, usedforsecurity=False)\n\
+             b = hashlib.sha1(x, usedforsecurity=False)\n\
+             c = hashlib.md5(usedforsecurity=False, data=x)\n\
+             d = hashlib.sha1(x, usedforsecurity = False)\n",
+        );
+        assert!(!has(&opted_out, "sast.python.weak-hash-md5"));
+        assert!(!has(&opted_out, "sast.python.weak-hash-sha1"));
+        // Bare calls and an explicit True still fire; non-literal values stay
+        // flagged because their value cannot be resolved statically.
+        let flagged = analyze(
+            "x.py",
+            "a = hashlib.md5(x)\n\
+             b = hashlib.sha1(x, usedforsecurity=True)\n\
+             c = hashlib.md5(x, usedforsecurity=flag)\n",
+        );
+        assert_eq!(
+            flagged
+                .findings
+                .iter()
+                .filter(|finding| matches!(
+                    finding.rule_id.as_str(),
+                    "sast.python.weak-hash-md5" | "sast.python.weak-hash-sha1"
+                ))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
     fn javascript_createhash_flags_only_weak_algorithms() {
         let output = analyze(
             "x.js",
