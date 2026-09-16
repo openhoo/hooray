@@ -577,6 +577,7 @@ legacy severity-only `--fail-on` interface.
 | npm | `package-lock.json` | Package graph, dev/optional scope, npm purls |
 | Yarn | `yarn.lock` classic or Berry | Locked packages with dependency edges, npm purls |
 | pnpm | `pnpm-lock.yaml` | Locked packages with dev/optional scope, npm purls |
+| Bun | `bun.lock` (text format) | Locked packages with dependency edges, npm purls |
 | Python pip | `requirements.txt` | Pinned `name==version` requirements, PyPI purls |
 | Python Poetry | `poetry.lock` | Locked PyPI packages, PyPI purls |
 | Python Pipenv | `Pipfile.lock` | Pinned default/develop packages, PyPI purls |
