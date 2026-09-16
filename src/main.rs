@@ -84,6 +84,9 @@ struct ScanTargetArgs {
     baseline: Option<RunId>,
     #[arg(long)]
     new_findings_only: bool,
+    /// Disable OSV access; equivalent to `HOORAY_OFFLINE=true` or `offline: true`.
+    #[arg(long)]
+    offline: bool,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -386,10 +389,13 @@ async fn run_scan(config: &Config, args: ScanArgs) -> Result<CommandOutcome> {
     let path = stdin
         .as_ref()
         .map_or(args.input.as_path(), |file| file.path.as_path());
+    let offline = args.offline;
     let input = detect_input(kind, path, config)?;
     let policy_path = args.policy.unwrap_or_else(|| config.policy_path.clone());
     let mut store = open_store(config)?;
-    let mut engine = Engine::new(config, &mut store, None);
+    let mut effective = config.clone();
+    effective.offline = config.offline || offline;
+    let mut engine = Engine::new(&effective, &mut store, None);
     let mut request = ScanRequest::new(input, policy_path);
     request.baseline = args.baseline;
     request.new_findings_only = args.new_findings_only;
