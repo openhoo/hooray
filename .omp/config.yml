@@ -1,0 +1,14 @@
+# Bound issue work locally; retain the user's global model-role choices.
+task:
+  maxConcurrency: 4
+  maxRecursionDepth: 1
+  prewalk: false
+  agentPrewalk:
+    task: false
+  agentAdvisor:
+    task: "off"
+  isolation:
+    enabled: true
+    apply: false
+prewalk:
+  enabled: false

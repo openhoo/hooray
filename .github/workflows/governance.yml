@@ -1,0 +1,29 @@
+name: Governance
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: governance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scripts:
+    name: Issue governance scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Issue intake regressions
+        run: node --test .github/scripts/issue-intake.test.cjs
+
+      - name: Issue queue regressions
+        run: python3 -m unittest scripts/test_issue_queue.py
