@@ -395,6 +395,13 @@ fn emit_sast_finding(context: &mut SastFindingContext<'_, '_>, start: usize, end
     {
         return;
     }
+    if matches!(
+        context.rule.rule,
+        "sast.python.weak-hash-md5" | "sast.python.weak-hash-sha1"
+    ) && python_call_marks_non_security_digest(&context.text[end..])
+    {
+        return;
+    }
     let (line, column) = indexed_line_column(context.line_starts, start);
     context.builder.add(FindingSpec {
         kind: FindingKind::Sast,
@@ -1787,7 +1794,11 @@ static YAML_RESTRICTED_LOADER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("constant YAML restricted-loader regex")
 });
 
-pub(super) fn yaml_call_specifies_loader(after_open_paren: &str) -> bool {
+/// Returns the argument text of a call given the source immediately after its
+/// opening parenthesis: everything up to the matching close parenthesis,
+/// skipping quoted strings and nested brackets, bounded so a malformed or
+/// huge call cannot scan unbounded input.
+fn call_argument_text(after_open_paren: &str) -> &str {
     const MAX_CALL_ARGUMENT_SCAN_BYTES: usize = 16 * 1024;
     let mut depth = 0_usize;
     let mut quote: Option<char> = None;
@@ -1826,7 +1837,23 @@ pub(super) fn yaml_call_specifies_loader(after_open_paren: &str) -> bool {
     while end > 0 && !after_open_paren.is_char_boundary(end) {
         end -= 1;
     }
-    YAML_RESTRICTED_LOADER_REGEX.is_match(&after_open_paren[..end])
+    &after_open_paren[..end]
+}
+
+pub(super) fn yaml_call_specifies_loader(after_open_paren: &str) -> bool {
+    YAML_RESTRICTED_LOADER_REGEX.is_match(call_argument_text(after_open_paren))
+}
+
+static PYTHON_NON_SECURITY_DIGEST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\busedforsecurity\s*=\s*False\b").expect("constant Python usedforsecurity regex")
+});
+
+/// `hashlib.md5`/`hashlib.sha1` accept `usedforsecurity=False` to mark a digest
+/// as non-security use (for example protocol-fixed RFC 7616 digest auth). Only
+/// the literal keyword argument suppresses the finding; non-literal values such
+/// as variables stay flagged because their value cannot be resolved statically.
+fn python_call_marks_non_security_digest(after_open_paren: &str) -> bool {
+    PYTHON_NON_SECURITY_DIGEST_REGEX.is_match(call_argument_text(after_open_paren))
 }
 
 #[cfg(test)]
