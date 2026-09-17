@@ -98,6 +98,8 @@ pub enum InputError {
     DigestMismatch(String),
     #[error("OCI image has no manifest")]
     MissingManifest,
+    #[error("OCI image layer uses unsupported media type {0}")]
+    UnsupportedLayerMediaType(String),
     #[error("I/O error for {path}: {source}")]
     Io {
         path: PathBuf,
