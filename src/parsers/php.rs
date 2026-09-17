@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -66,6 +66,8 @@ pub(crate) fn parse_composer_lock(
     let root = value
         .as_object()
         .ok_or_else(|| malformed_msg(path, "composer.lock", "expected a JSON object"))?;
+    let mut ids = BTreeMap::new();
+    let mut requirements = Vec::new();
     for (section, scope) in [
         ("packages", Scope::Runtime),
         ("packages-dev", Scope::Development),
@@ -119,7 +121,18 @@ pub(crate) fn parse_composer_lock(
                     url: None,
                 })
                 .collect();
-            out.add("composer", name, version, scope, path, licenses)?;
+            let id = out.add("composer", name, version, scope, path, licenses)?;
+            ids.insert(name, id.clone());
+            if let Some(require) = package.get("require").and_then(Value::as_object) {
+                requirements.push((id, scope, require));
+            }
+        }
+    }
+    for (from, scope, require) in requirements {
+        for name in require.keys().filter(|name| name.contains('/')) {
+            if let Some(to) = ids.get(name.as_str()) {
+                out.edge(&from, to, scope, false);
+            }
         }
     }
     Ok(())
@@ -131,6 +144,60 @@ mod tests {
     use crate::model::Scope;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn composer_lock_edges_resolve_only_local_locked_requirements() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("composer.lock"), r#"{"packages":[
+            {"name":"acme/app","version":"1.0","require":{"acme/lib":"^2","php":">=8","ext-json":"*","missing/package":"*"},"require-dev":{"acme/tool":"*"}},
+            {"name":"acme/lib","version":"2.0"}
+        ],"packages-dev":[
+            {"name":"acme/tool","version":"3.0","require":{"acme/app":"*"}}
+        ]}"#).unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(
+            nested.join("composer.lock"),
+            r#"{"packages":[
+            {"name":"acme/app","version":"4.0","require":{"acme/lib":"^5"}},
+            {"name":"acme/lib","version":"5.0"},
+            {"name":"missing/package","version":"1.0"}
+        ]}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let actual = inventory
+            .dependencies
+            .iter()
+            .map(|edge| {
+                let from = &inventory.components[&edge.from];
+                let to = &inventory.components[&edge.to];
+                (
+                    from.name.as_str(),
+                    from.version.as_str(),
+                    to.name.as_str(),
+                    to.version.as_str(),
+                    edge.scope,
+                    edge.optional,
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual,
+            std::collections::BTreeSet::from([
+                ("acme/app", "1.0", "acme/lib", "2.0", Scope::Runtime, false),
+                ("acme/app", "4.0", "acme/lib", "5.0", Scope::Runtime, false),
+                (
+                    "acme/tool",
+                    "3.0",
+                    "acme/app",
+                    "1.0",
+                    Scope::Development,
+                    false
+                ),
+            ])
+        );
+    }
 
     #[test]
     fn composer_lock_resolves_pinned_versions_and_dev_scope() {

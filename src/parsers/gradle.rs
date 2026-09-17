@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed_msg, utf8};
 use crate::model::Scope;
@@ -31,18 +32,24 @@ fn gradle_scope(configurations: &str) -> Scope {
     }
 }
 
-/// Parses a Gradle dependency lockfile (`*.lockfile`, Gradle 7+ `gradle
-/// lockfile`/`--write-locks` output). Each record is one line of
-/// `group:artifact:version=conf1,conf2`; `#` lines are comments and the
-/// `empty=<confs>` marker records configurations that resolved to no
-/// dependencies. Entries become `pkg:maven/<group>/<artifact>@<version>`
-/// components.
+/// Parses a Gradle dependency lockfile. Modern Gradle 7+ `--write-locks`
+/// output records `group:artifact:version=conf1,conf2` records; the pre-7.0
+/// per-configuration layout stores one configuration per file and writes
+/// bare `group:artifact:version` lines into `<configuration>.lockfile`.
+/// `#` lines are comments and the `empty=<confs>` marker records
+/// configurations that resolved to no dependencies. Entries become
+/// `pkg:maven/<group>/<artifact>@<version>` components.
 pub(crate) fn parse_gradle_lockfile(
     path: &str,
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
     const FORMAT: &str = "gradle.lockfile";
+    let configuration = Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_owned();
     let mut entries = 0_usize;
     for raw in utf8(bytes, path, FORMAT)?.lines() {
         let line = raw.trim();
@@ -50,54 +57,67 @@ pub(crate) fn parse_gradle_lockfile(
             continue;
         }
         let Some((coordinates, configurations)) = line.split_once('=') else {
-            return Err(malformed_msg(
-                path,
-                FORMAT,
-                format!("line is not a group:artifact:version=configurations record: {line}"),
-            ));
+            // Legacy per-configuration lockfiles contain bare pinned
+            // coordinates; the enclosing file name is the configuration.
+            add_locked_coordinates(path, FORMAT, line, &configuration, &mut entries, out)?;
+            continue;
         };
         if coordinates == "empty" {
             // `empty=conf1,conf2` records configurations that locked to no
             // dependencies; there is nothing to inventory.
             continue;
         }
-        let parts: Vec<&str> = coordinates.split(':').collect();
-        if parts.len() != 3 {
-            return Err(malformed_msg(
-                path,
-                FORMAT,
-                format!("lock entry is not a group:artifact:version coordinate: {coordinates}"),
-            ));
-        }
-        let (group, artifact, version) = (parts[0], parts[1], parts[2]);
-        if group.is_empty() || artifact.is_empty() || version.is_empty() {
-            return Err(malformed_msg(
-                path,
-                FORMAT,
-                format!("lock entry has an empty coordinate part: {coordinates}"),
-            ));
-        }
-        if configurations
-            .split(',')
-            .any(|configuration| configuration.trim().is_empty())
-        {
-            return Err(malformed_msg(
-                path,
-                FORMAT,
-                format!("lock entry has an empty configuration: {line}"),
-            ));
-        }
-        entries += 1;
-        entry_bound(entries, path, FORMAT)?;
-        out.add(
-            "maven",
-            &format!("{group}/{artifact}"),
-            version,
-            gradle_scope(configurations),
-            path,
-            BTreeSet::new(),
-        )?;
+        add_locked_coordinates(path, FORMAT, coordinates, configurations, &mut entries, out)?;
     }
+    Ok(())
+}
+
+/// Inventories one locked `group:artifact:version` coordinate under the
+/// scope derived from its Gradle configurations.
+fn add_locked_coordinates(
+    path: &str,
+    format: &'static str,
+    coordinates: &str,
+    configurations: &str,
+    entries: &mut usize,
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let parts: Vec<&str> = coordinates.split(':').collect();
+    if parts.len() != 3 {
+        return Err(malformed_msg(
+            path,
+            format,
+            format!("lock entry is not a group:artifact:version coordinate: {coordinates}"),
+        ));
+    }
+    let (group, artifact, version) = (parts[0], parts[1], parts[2]);
+    if group.is_empty() || artifact.is_empty() || version.is_empty() {
+        return Err(malformed_msg(
+            path,
+            format,
+            format!("lock entry has an empty coordinate part: {coordinates}"),
+        ));
+    }
+    if configurations
+        .split(',')
+        .any(|configuration| configuration.trim().is_empty())
+    {
+        return Err(malformed_msg(
+            path,
+            format,
+            format!("lock entry has an empty configuration: {coordinates}"),
+        ));
+    }
+    *entries += 1;
+    entry_bound(*entries, path, format)?;
+    out.add(
+        "maven",
+        &format!("{group}/{artifact}"),
+        version,
+        gradle_scope(configurations),
+        path,
+        BTreeSet::new(),
+    )?;
     Ok(())
 }
 
@@ -184,23 +204,64 @@ mod tests {
     }
 
     #[test]
+    fn legacy_gradle_lockfiles_preserve_coordinates_and_filename_scope() {
+        let dir = tempdir().unwrap();
+        let locks = dir.path().join("gradle/dependency-locks");
+        fs::create_dir_all(&locks).unwrap();
+        for (configuration, artifact, expected_scope) in [
+            ("compileClasspath", "runtime", Scope::Runtime),
+            ("testCompileClasspath", "test", Scope::Development),
+            ("classpath", "plugin", Scope::Build),
+        ] {
+            fs::write(
+                locks.join(format!("{configuration}.lockfile")),
+                format!("# Gradle dependency lock\norg.example:{artifact}:1.2.3\n"),
+            )
+            .unwrap();
+            let inventory = scan_path(dir.path(), &config()).unwrap();
+            let component = inventory
+                .components
+                .values()
+                .find(|c| c.name == format!("org.example/{artifact}"))
+                .unwrap();
+            assert_eq!(
+                component.purl,
+                format!("pkg:maven/org.example/{artifact}@1.2.3")
+            );
+            assert_eq!(component.scope, expected_scope);
+        }
+        fs::write(
+            locks.join("runtimeClasspath.lockfile"),
+            "org.example::1.2.3\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            scan_path(dir.path(), &config()),
+            Err(InputError::Malformed { .. })
+        ));
+    }
+
+    #[test]
     fn gradle_lockfile_fails_closed_on_malformed_lines() {
-        for contents in [
-            "not-a-lock-record\n",
-            "group:artifact=classpath\n",
-            "group:artifact:1.0\n",
-            "group::1.0=classpath\n",
-            "group:artifact:1.0=\n",
-            "group:artifact:1.0=classpath,\n",
+        for (name, contents) in [
+            ("gradle.lockfile", "not-a-lock-record\n"),
+            ("gradle.lockfile", "group:artifact=classpath\n"),
+            ("gradle.lockfile", "group::1.0=classpath\n"),
+            ("gradle.lockfile", "group:artifact:1.0=\n"),
+            ("gradle.lockfile", "group:artifact:1.0=classpath,\n"),
+            // Legacy layout: bare coordinates are valid pinned entries;
+            // malformed ones still refuse under a configuration stem.
+            ("runtimeClasspath.lockfile", "org.example::1.2.3\n"),
+            ("runtimeClasspath.lockfile", "group:artifact:1.0=\n"),
         ] {
             let dir = tempdir().unwrap();
-            fs::write(dir.path().join("gradle.lockfile"), contents).unwrap();
+            fs::write(dir.path().join(name), contents).unwrap();
             assert!(
                 matches!(
                     scan_path(dir.path(), &config()),
                     Err(InputError::Malformed { format, .. }) if format == "gradle.lockfile"
                 ),
-                "expected malformed for: {contents}"
+                "expected malformed in {name} for: {contents}"
             );
         }
     }
