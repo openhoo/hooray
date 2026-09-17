@@ -592,6 +592,7 @@ legacy severity-only `--fail-on` interface.
 | PHP | `composer.json` | Declared `require`/`require-dev` packages, composer purls; platform packages skipped |
 | Conda | `environment.yml` | Dependency list entries, conda purls |
 | Helm | `Chart.yaml` | Declared chart dependencies, Helm purls |
+| Haskell (partial) | `*.cabal`, `cabal.project.freeze` | Union of `build-depends`, Hackage purls; ranges remain versionless, exact equality and matching nearest in-tree freeze pins produce versioned purls |
 | NuGet | `packages.lock.json` | Framework dependency graph, direct/transitive hints, NuGet purls |
 | CycloneDX | JSON SBOM with versioned purls | Nested and declared dependency edges, scope, provenance |
 | SPDX | 2.x JSON detected by `spdxVersion` | Packages, checksums, declared `DEPENDS_ON` relationships |
@@ -608,6 +609,29 @@ malformed recognized inventory files fail rather than being silently skipped. If
 filesystem-analysis admission bounds omit files, the report includes a
 high-severity `scanner:coverage-incomplete`
 operational-risk finding with scanned and skipped counters.
+
+Haskell support is bounded dependency inventory, not Cabal semantic validation
+or dependency solving. It reads space/tab-indented and explicit-brace layout,
+multiline dependency fields, and the union of conditional branches and common stanzas without
+evaluating flags, conditions, or common-stanza imports. Sublibrary selectors
+retain the owning Hackage package identity. Test/benchmark dependencies have
+test scope; freeze setup-qualified constraints have build scope and do not
+resolve ordinary `build-depends`. A nearest ancestor `cabal.project.freeze`
+inside the scanned tree supplies matching exact pins; unmatched declarations
+remain in the inventory. A dependency without a range uses the existing `*`
+unconstrained specifier and a versionless purl, never the manifest's own package
+version. Pins are not checked for solver compatibility with
+manifest ranges. `cabal.project`, `stack.yaml`, and `stack.yaml.lock` are not
+parsed.
+
+Malformed dependency syntax and conflicting exact freeze pins fail closed.
+Explicit field braces delimit the field value; dependency version-set and
+sublibrary braces remain part of ordinary layout field values. Other Cabal
+syntax is still bounded: nonbreaking-space indentation, legacy compound
+`cabal-version` ranges, and `foreign-library` stanzas are not supported.
+Verification covers a valid production subtree and refusal of the unchanged
+full corpus, which includes intentionally invalid parser fixtures. A successful
+production-directory scan is not a claim of full-corpus grammar parity.
 
 ## Quality and security verification
 
