@@ -107,7 +107,19 @@ pub(crate) fn parse_composer_lock(
                     "package entry has an empty name or version",
                 ));
             }
-            out.add("composer", name, version, scope, path, BTreeSet::new())?;
+            let licenses = package
+                .get("license")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|expression| crate::model::License {
+                    expression: Some(expression.to_owned()),
+                    name: None,
+                    url: None,
+                })
+                .collect();
+            out.add("composer", name, version, scope, path, licenses)?;
         }
     }
     Ok(())
@@ -145,6 +157,60 @@ mod tests {
         assert_eq!(component("phpunit/phpunit").version, "10.3.5");
         assert_eq!(component("phpunit/phpunit").scope, Scope::Development);
         assert_eq!(inventory.components.len(), 3);
+    }
+
+    #[test]
+    fn composer_lock_preserves_declared_licenses_and_honest_unknowns() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("composer.lock"),
+            r#"{"packages":[
+                {"name":"acme/runtime","version":"1.0.0","license":["MIT","Apache-2.0","MIT"]},
+                {"name":"acme/absent","version":"1.0.0"}
+            ],"packages-dev":[
+                {"name":"acme/dev","version":"1.0.0","license":["BSD-3-Clause"]},
+                {"name":"acme/empty","version":"1.0.0","license":[]}
+            ]}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let analysis = crate::license::analyze_with_files(&inventory, Vec::new()).unwrap();
+        for (name, expected) in [
+            ("acme/runtime", vec!["Apache-2.0", "MIT"]),
+            ("acme/dev", vec!["BSD-3-Clause"]),
+            ("acme/absent", vec![]),
+            ("acme/empty", vec![]),
+        ] {
+            let component = inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .unwrap();
+            assert_eq!(
+                component
+                    .licenses
+                    .iter()
+                    .filter_map(|l| l.expression.as_deref())
+                    .collect::<Vec<_>>(),
+                expected,
+                "declared licenses for {name}"
+            );
+            let rules = analysis
+                .findings
+                .iter()
+                .filter(|f| f.component_id.as_ref() == Some(&component.identity))
+                .map(|f| f.rule_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rules,
+                if expected.is_empty() {
+                    vec!["license:unknown"]
+                } else {
+                    vec!["license:detected"; expected.len()]
+                },
+                "license findings for {name}"
+            );
+        }
     }
 
     #[test]
