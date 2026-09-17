@@ -18,89 +18,237 @@ struct Field {
     scope: Scope,
 }
 
-// Cabal's layout grammar: only whole-line -- comments are comments. In
-// particular, an inline -- must not silently truncate a dependency field.
-// Explicit-brace stanza layout is deliberately refused rather than misread.
-fn fields(text: &str, path: &str, format: &'static str) -> Result<Vec<Field>, InputError> {
-    let mut result: Vec<Field> = Vec::new();
-    let mut sections: Vec<(usize, Scope)> = Vec::new();
-    let mut active = false;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with("--") {
-            continue;
-        }
-        if raw.chars().any(|c| c.is_control() && c != '\t') {
-            return Err(malformed_msg(path, format, "control character in document"));
-        }
-        let indent = raw
-            .bytes()
-            .take_while(|c| matches!(c, b' ' | b'\t'))
-            .count();
-        if raw[..indent].contains('\t') {
-            return Err(malformed_msg(
-                path,
-                format,
-                "tab indentation is unsupported",
-            ));
-        }
-        if active
-            && let Some(field) = result.last_mut()
-            && indent > field.indent
-        {
-            field.value.push(' ');
-            field.value.push_str(line);
-            continue;
-        }
-        active = false;
-        while sections.last().is_some_and(|(level, _)| *level >= indent) {
-            sections.pop();
-        }
-        let scope = sections.last().map_or(Scope::Runtime, |(_, scope)| *scope);
-        if let Some((name, value)) = line.split_once(':')
-            && !name.is_empty()
-            && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
-        {
-            result.push(Field {
-                name: name.to_ascii_lowercase(),
-                value: value.trim().to_owned(),
-                indent,
-                scope,
-            });
-            entry_bound(result.len(), path, format)?;
-            active = true;
-            continue;
-        }
-        let (keyword, argument) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        let scope = match keyword {
-            "library" => Scope::Runtime,
-            "executable" if !argument.trim().is_empty() => Scope::Runtime,
-            "test-suite" | "benchmark" if !argument.trim().is_empty() => Scope::Test,
-            "custom-setup" if argument.is_empty() => Scope::Build,
-            "common" | "flag" | "source-repository" if !argument.trim().is_empty() => scope,
-            "if" | "elif" if !argument.trim().is_empty() => scope,
-            "else" if argument.is_empty() => scope,
-            _ => {
-                return Err(malformed_msg(
-                    path,
-                    format,
-                    "expected a field or supported layout stanza",
-                ));
-            }
-        };
-        if line.contains(['{', '}', ';']) || format == FREEZE {
-            return Err(malformed_msg(
-                path,
-                format,
-                "explicit-brace or project stanza syntax is unsupported",
-            ));
-        }
-        if sections.len() >= MAX_NESTING {
-            return Err(malformed_msg(path, format, "stanza nesting limit exceeded"));
-        }
-        sections.push((indent, scope));
+// Tabs count as one indentation character in Cabal, not as tab stops.
+// Layout field values are opaque lines (including inline -- and version-set
+// braces); explicit field bodies and inline fields use brace delimiters.
+struct Layout<'a> {
+    rest: &'a str,
+    line_start: bool,
+    path: &'a str,
+    format: &'static str,
+    fields: Vec<Field>,
+}
+
+impl Layout<'_> {
+    fn fail(&self, message: &str) -> InputError {
+        malformed_msg(self.path, self.format, message)
     }
-    Ok(result)
+
+    fn advance(&mut self, bytes: usize) {
+        self.rest = &self.rest[bytes..];
+        self.line_start = false;
+    }
+
+    fn newline(&mut self) {
+        if self.rest.starts_with("\r\n") {
+            self.rest = &self.rest[2..];
+        } else {
+            self.rest = &self.rest[1..];
+        }
+        self.line_start = true;
+    }
+
+    // Do not consume indentation: callers need it for the layout boundary.
+    fn blank_lines(&mut self) {
+        loop {
+            let trimmed = self.rest.trim_start_matches([' ', '\t']);
+            if trimmed.starts_with("--") {
+                self.rest = trimmed.trim_start_matches(|c| c != '\n' && c != '\r');
+            } else if trimmed.starts_with(['\n', '\r']) {
+                self.rest = trimmed;
+            } else {
+                return;
+            }
+            if self.rest.is_empty() {
+                return;
+            }
+            self.newline();
+        }
+    }
+
+    fn braced_value(&mut self) -> Result<String, InputError> {
+        self.advance(1);
+        let mut value = String::new();
+        loop {
+            if self.line_start {
+                self.blank_lines();
+            }
+            let end = self
+                .rest
+                .find(['{', '}', '\n', '\r'])
+                .unwrap_or(self.rest.len());
+            let line = self.rest[..end].trim();
+            if !value.is_empty() && !line.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(line);
+            self.advance(end);
+            match self.rest.as_bytes().first() {
+                Some(b'}') => {
+                    self.advance(1);
+                    return Ok(value);
+                }
+                Some(b'\n' | b'\r') => self.newline(),
+                Some(b'{') => return Err(self.fail("nested explicit field brace")),
+                _ => return Err(self.fail("unclosed explicit field brace")),
+            }
+        }
+    }
+
+    fn field_value(&mut self, indent: Option<usize>) -> Result<String, InputError> {
+        self.rest = self.rest.trim_start_matches([' ', '\t']);
+        // An opening brace may be on the next non-comment line regardless of
+        // indentation. Otherwise restore the newline for layout continuation.
+        let saved = (self.rest, self.line_start);
+        if self.rest.starts_with(['\n', '\r']) {
+            self.blank_lines();
+        }
+        let trimmed = self.rest.trim_start_matches([' ', '\t']);
+        if trimmed.starts_with('{') {
+            self.rest = trimmed;
+            return self.braced_value();
+        }
+        (self.rest, self.line_start) = saved;
+        let mut value = String::new();
+        loop {
+            let end = self
+                .rest
+                .find(|c| matches!(c, '\n' | '\r') || (indent.is_none() && matches!(c, '{' | '}')))
+                .unwrap_or(self.rest.len());
+            let line = self.rest[..end].trim();
+            if !value.is_empty() && !line.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(line);
+            self.advance(end);
+            if !self.rest.starts_with(['\n', '\r']) {
+                return Ok(value);
+            }
+            self.newline();
+            self.blank_lines();
+            let spaces = self.rest.len() - self.rest.trim_start_matches([' ', '\t']).len();
+            if indent.is_none_or(|indent| spaces <= indent) || self.rest.trim().is_empty() {
+                return Ok(value);
+            }
+            self.advance(spaces);
+        }
+    }
+
+    fn elements(&mut self, minimum: usize, scope: Scope, depth: usize) -> Result<(), InputError> {
+        if depth >= MAX_NESTING {
+            return Err(self.fail("stanza nesting limit exceeded"));
+        }
+        loop {
+            self.blank_lines();
+            let trimmed = self.rest.trim_start_matches([' ', '\t']);
+            let spaces = self.rest.len() - trimmed.len();
+            if trimmed.is_empty() || trimmed.starts_with('}') {
+                self.rest = trimmed;
+                return Ok(());
+            }
+            let indent = self.line_start.then_some(spaces);
+            if indent.is_some_and(|indent| indent < minimum) {
+                return Ok(());
+            }
+            self.advance(spaces);
+            let end = self
+                .rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .unwrap_or(self.rest.len());
+            if end == 0 {
+                return Err(self.fail("expected a field or supported layout stanza"));
+            }
+            let name = self.rest[..end].to_ascii_lowercase();
+            self.advance(end);
+            self.rest = self.rest.trim_start_matches([' ', '\t']);
+            if self.rest.starts_with(':') {
+                self.advance(1);
+                let value = self.field_value(indent)?;
+                self.fields.push(Field {
+                    name,
+                    value,
+                    indent: depth,
+                    scope,
+                });
+                entry_bound(self.fields.len(), self.path, self.format)?;
+                continue;
+            }
+            let mut quoted = false;
+            let mut escaped = false;
+            let end = self
+                .rest
+                .char_indices()
+                .find_map(|(offset, c)| {
+                    if !quoted
+                        && (matches!(c, '{' | '}' | '\n' | '\r')
+                            || self.rest[offset..].starts_with("--"))
+                    {
+                        return Some(offset);
+                    }
+                    if c == '"' && !escaped {
+                        quoted = !quoted;
+                    }
+                    escaped = quoted && c == '\\' && !escaped;
+                    None
+                })
+                .unwrap_or(self.rest.len());
+            if quoted {
+                return Err(self.fail("unclosed stanza argument quote"));
+            }
+            let argument = self.rest[..end].trim();
+            let child_scope = match name.as_str() {
+                "library" => Scope::Runtime,
+                "executable" if !argument.is_empty() => Scope::Runtime,
+                "test-suite" | "benchmark" if !argument.is_empty() => Scope::Test,
+                "custom-setup" if argument.is_empty() => Scope::Build,
+                "common" | "flag" | "source-repository" | "if" | "elif" if !argument.is_empty() => {
+                    scope
+                }
+                "else" if argument.is_empty() => scope,
+                _ => return Err(self.fail("expected a field or supported layout stanza")),
+            };
+            if self.format == FREEZE || argument.contains(';') {
+                return Err(self.fail("unsupported project stanza syntax"));
+            }
+            self.advance(end);
+            self.blank_lines();
+            let trimmed = self.rest.trim_start_matches([' ', '\t']);
+            if trimmed.starts_with('{') {
+                self.rest = trimmed;
+                self.advance(1);
+                self.elements(0, child_scope, depth + 1)?;
+                if !self.rest.starts_with('}') {
+                    return Err(self.fail("unclosed explicit stanza brace"));
+                }
+                self.advance(1);
+            } else if let Some(indent) = indent {
+                self.elements(indent + 1, child_scope, depth + 1)?;
+            } else {
+                return Err(self.fail("inline stanza requires explicit braces"));
+            }
+        }
+    }
+}
+
+fn fields(text: &str, path: &str, format: &'static str) -> Result<Vec<Field>, InputError> {
+    if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+    {
+        return Err(malformed_msg(path, format, "control character in document"));
+    }
+    let mut layout = Layout {
+        rest: text,
+        line_start: true,
+        path,
+        format,
+        fields: Vec::new(),
+    };
+    layout.elements(0, Scope::Runtime, 0)?;
+    if !layout.rest.is_empty() {
+        return Err(layout.fail("unmatched explicit stanza brace"));
+    }
+    Ok(layout.fields)
 }
 
 fn package_name(name: &str) -> bool {
@@ -310,7 +458,9 @@ fn dependency<'a>(
     }
     let constraint = rest.trim();
     if constraint.is_empty() {
-        return Ok((name, ""));
+        // An absent range means unrestricted, not an empty component version.
+        // Use the inventory's existing unconstrained specifier convention.
+        return Ok((name, "*"));
     }
     let mut range = Range {
         rest: constraint,
@@ -547,6 +697,126 @@ mod tests {
     use tempfile::tempdir;
 
     const HEADER: &str = "cabal-version: 3.0\nname: demo\nversion: 1.0\n";
+
+    #[test]
+    fn outdated_freeze_preserves_unconstrained_legacy_dependencies() {
+        let dir = tempdir().unwrap();
+        // Dependency declarations from the pinned Outdated/my.cabal pair.
+        fs::write(dir.path().join("my.cabal"), "name: my\nversion: 0.1\ncabal-version: 1.20\nlibrary\n  build-depends: base >= 3 && < 4, binary == 0.8.6.*\ntest-suite tests-Foo\n  build-depends: base, template-haskell >= 2.3.0.0 && < 2.4\n").unwrap();
+        fs::write(
+            dir.path().join("cabal.project.freeze"),
+            "constraints: base == 3.0.3.2, template-haskell ==2.3.0.0, binary ==0.8.5.0\n",
+        )
+        .unwrap();
+        // The real Outdated repo also contains old-style top-level dependency
+        // fields with bare containers. Its ancestor freeze does not pin it.
+        fs::write(
+            dir.path().join("legacy.cabal"),
+            "name: legacy\nversion: 0.1\nbuild-depends: base, containers\n",
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let components: std::collections::BTreeMap<_, _> = inventory
+            .components
+            .values()
+            .map(|component| (component.purl.as_str(), component.version.as_str()))
+            .collect();
+        assert_eq!(
+            components,
+            [
+                ("pkg:hackage/base@3.0.3.2", "3.0.3.2"),
+                ("pkg:hackage/binary@0.8.5.0", "0.8.5.0"),
+                ("pkg:hackage/template-haskell@2.3.0.0", "2.3.0.0"),
+                ("pkg:hackage/containers", "*"),
+            ]
+            .into()
+        );
+        // A standalone old-style manifest must not borrow its own version as
+        // the dependency version when no freeze file is available.
+        let standalone = tempdir().unwrap();
+        fs::copy(
+            dir.path().join("legacy.cabal"),
+            standalone.path().join("legacy.cabal"),
+        )
+        .unwrap();
+        let inventory = scan_path(standalone.path(), &config()).unwrap();
+        let components: std::collections::BTreeMap<_, _> = inventory
+            .components
+            .values()
+            .map(|component| (component.purl.as_str(), component.version.as_str()))
+            .collect();
+        assert_eq!(
+            components,
+            [("pkg:hackage/base", "*"), ("pkg:hackage/containers", "*")].into()
+        );
+    }
+
+    #[test]
+    fn explicit_and_tab_layouts_preserve_dependencies_and_scope() {
+        // Cabal's ParserTests/warnings/tab.cabal uses both tab indentation and
+        // explicit field braces. A tab has width one, even alongside spaces.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("demo.cabal"),
+            format!("{HEADER}Library\n\tbuild-depends: {{ base >=4.9 && <4.10 }}\n\t hs-source-dirs: .\nTest-Suite tests\n{{\nif flag(dev) {{ build-depends: {{ aeson ==2.2.3.0 }} }} else {{ build-depends: {{ text >=1 }} }}\n}}\n"),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let components: std::collections::BTreeMap<_, _> = inventory
+            .components
+            .values()
+            .map(|component| (component.purl.as_str(), component.scope))
+            .collect();
+        assert_eq!(
+            components,
+            [
+                ("pkg:hackage/base", crate::model::Scope::Runtime),
+                ("pkg:hackage/aeson@2.2.3.0", crate::model::Scope::Test),
+                ("pkg:hackage/text", crate::model::Scope::Test),
+            ]
+            .into()
+        );
+    }
+
+    #[test]
+    fn field_braces_do_not_capture_following_fields_or_opaque_layout_braces() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("demo.cabal"),
+            format!("{HEADER}description: example\n  > if (ready) {{ run(); }}\nlibrary\n  build-depends:\n  {{ base >=4\n     -- whole-line comment\n     && <5 }}\n    build-depends: foo:{{foo,internal}} ^>= {{1.0,2.0}}\n"),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let purls: std::collections::BTreeSet<_> = inventory
+            .components
+            .values()
+            .map(|component| component.purl.as_str())
+            .collect();
+        assert_eq!(purls, ["pkg:hackage/base", "pkg:hackage/foo"].into());
+    }
+
+    #[test]
+    fn malformed_explicit_layout_fails_closed() {
+        for body in [
+            "library { build-depends: { base >=4 }",
+            "library { build-depends: { base >=4 } }}",
+            "library { build-depends: { base >= } }",
+            "library { build-depends: { base -- inline comment } }",
+            "library { build-depends: { base == {1,2} } }",
+            "library { if flag(dev) build-depends: base }",
+            "library\n  build-depends: -- not a whole-line comment\n    base >=4\n",
+        ] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("demo.cabal"), format!("{HEADER}{body}")).unwrap();
+            assert!(
+                matches!(
+                    scan_path(dir.path(), &config()),
+                    Err(InputError::Malformed { .. })
+                ),
+                "accepted {body}"
+            );
+        }
+    }
 
     #[test]
     fn ranges_multiline_branches_and_sublibraries_keep_package_identity() {

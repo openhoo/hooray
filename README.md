@@ -611,24 +611,27 @@ high-severity `scanner:coverage-incomplete`
 operational-risk finding with scanned and skipped counters.
 
 Haskell support is bounded dependency inventory, not Cabal semantic validation
-or dependency solving. It reads space-indented layout, multiline dependency
-fields, and the union of conditional branches and common stanzas without
+or dependency solving. It reads space/tab-indented and explicit-brace layout,
+multiline dependency fields, and the union of conditional branches and common stanzas without
 evaluating flags, conditions, or common-stanza imports. Sublibrary selectors
 retain the owning Hackage package identity. Test/benchmark dependencies have
 test scope; freeze setup-qualified constraints have build scope and do not
 resolve ordinary `build-depends`. A nearest ancestor `cabal.project.freeze`
 inside the scanned tree supplies matching exact pins; unmatched declarations
-remain in the inventory. Pins are not checked for solver compatibility with
+remain in the inventory. A dependency without a range uses the existing `*`
+unconstrained specifier and a versionless purl, never the manifest's own package
+version. Pins are not checked for solver compatibility with
 manifest ranges. `cabal.project`, `stack.yaml`, and `stack.yaml.lock` are not
 parsed.
 
 Malformed dependency syntax and conflicting exact freeze pins fail closed.
-Valid Cabal tab indentation and explicit-brace stanza layout are also
-unsupported and produce input errors, rather than silently partial inventory.
-Consequently, scanning the entire upstream Cabal test corpus is not supported:
-it includes intentionally invalid parser fixtures as well as valid layouts
-outside these bounds. Support for a production package directory is not a
-claim of full-corpus acceptance.
+Explicit field braces delimit the field value; dependency version-set and
+sublibrary braces remain part of ordinary layout field values. Other Cabal
+syntax is still bounded: nonbreaking-space indentation, legacy compound
+`cabal-version` ranges, and `foreign-library` stanzas are not supported.
+Verification covers a valid production subtree and refusal of the unchanged
+full corpus, which includes intentionally invalid parser fixtures. A successful
+production-directory scan is not a claim of full-corpus grammar parity.
 
 ## Quality and security verification
 
