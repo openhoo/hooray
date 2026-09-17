@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::split_descriptor;
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::{ComponentId, Scope};
+use crate::util::jsonc_to_json;
 
 #[derive(Deserialize, Default)]
 struct BunLock {
@@ -128,84 +129,6 @@ fn bun_parent_key(key: &str) -> Option<&str> {
         return Some(parent);
     }
     Some(parent)
-}
-
-/// Removes `//` and `/* */` comments and trailing commas so strict JSON
-/// parsers accept bun.lock documents. String contents are never rewritten.
-fn jsonc_to_json(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut in_string = false;
-    while i < bytes.len() {
-        let byte = bytes[i];
-        if in_string {
-            out.push(byte);
-            match byte {
-                b'\\' => {
-                    if i + 1 < bytes.len() {
-                        out.push(bytes[i + 1]);
-                        i += 1;
-                    }
-                }
-                b'"' => in_string = false,
-                _ => {}
-            }
-            i += 1;
-            continue;
-        }
-        match byte {
-            b'"' => {
-                in_string = true;
-                out.push(byte);
-                i += 1;
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
-            b',' => {
-                let mut j = i + 1;
-                loop {
-                    match bytes.get(j) {
-                        Some(b) if b.is_ascii_whitespace() => j += 1,
-                        Some(b'/') if bytes.get(j + 1) == Some(&b'/') => {
-                            j += 2;
-                            while j < bytes.len() && bytes[j] != b'\n' {
-                                j += 1;
-                            }
-                        }
-                        Some(b'/') if bytes.get(j + 1) == Some(&b'*') => {
-                            j += 2;
-                            while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/')
-                            {
-                                j += 1;
-                            }
-                            j = (j + 2).min(bytes.len());
-                        }
-                        _ => break,
-                    }
-                }
-                if !matches!(bytes.get(j), Some(b'}') | Some(b']')) {
-                    out.push(byte);
-                }
-                i += 1;
-            }
-            _ => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).expect("JSONC sanitization only removes ASCII bytes")
 }
 
 #[cfg(test)]
