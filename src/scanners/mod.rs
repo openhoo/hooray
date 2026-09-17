@@ -18,7 +18,7 @@ use crate::model::{
     FindingStatus, Location, Position, Remediation, Risk, RuleId, Severity, stable_finding_id,
     stable_location_id,
 };
-use crate::util::sha256_hex;
+use crate::util::{jsonc_to_json, sha256_hex};
 
 mod sast;
 mod service_config;
@@ -539,7 +539,7 @@ static SECRET_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
         ),
         (
             "secret.private-key",
-            r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----",
+            r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----",
             "private key",
             Severity::Critical,
         ),
@@ -714,6 +714,94 @@ fn looks_placeholder(value: &str) -> bool {
     .iter()
     .any(|marker| lower.contains(marker))
         || value.chars().collect::<BTreeSet<_>>().len() < 5
+        || looks_like_pattern(value)
+}
+
+/// Detects values that are pattern definitions rather than credential text:
+/// regex literals such as `/ghp_[A-Za-z0-9]{36}/` or
+/// `{^([a-f0-9]{12,}|gh[a-z]_[a-zA-Z0-9_.-]+)$}` describe a token format and
+/// are not secrets themselves. A single strong metacharacter signal (a
+/// ranged/negated character class, a counted quantifier, or a parenthesized
+/// alternation) marks a pattern; weaker signals (regex escapes like `\d`,
+/// `/…/` delimiter wrapping, `^`/`$` anchors) must appear in pairs so plain
+/// secrets containing one stray metacharacter still flag.
+fn looks_like_pattern(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut strong = false;
+    let mut weak = 0_u8;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if bytes
+                    .get(i + 1)
+                    .is_some_and(|b| b"dDwWsSbBzZAZG".contains(b))
+                {
+                    weak = weak.saturating_add(1);
+                }
+                i += 2;
+                continue;
+            }
+            b'[' => {
+                let mut j = i + 1;
+                if bytes.get(j) == Some(&b'^') {
+                    j += 1;
+                }
+                while j < bytes.len() && bytes[j] != b']' {
+                    j += 1;
+                }
+                if j < bytes.len() && j > i + 1 {
+                    // A class whose body carries a range or negation is
+                    // pattern syntax; a bare "[ab]" is too common in literal
+                    // text to count on its own.
+                    if bytes[i + 1] == b'^' || bytes[i + 1..j].contains(&b'-') {
+                        strong = true;
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+            b'{' => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b'}' {
+                    j += 1;
+                }
+                if j < bytes.len()
+                    && bytes[i + 1..j]
+                        .iter()
+                        .all(|b| b.is_ascii_digit() || *b == b',')
+                    && bytes[i + 1..j].iter().any(|b| b.is_ascii_digit())
+                {
+                    strong = true;
+                }
+                i = j + 1;
+                continue;
+            }
+            b'(' => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b')' {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[i + 1..j].contains(&b'|') {
+                    strong = true;
+                }
+                i = j + 1;
+                continue;
+            }
+            _ => i += 1,
+        }
+    }
+    if value.len() >= 3 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if first == last && matches!(first, b'/' | b'#' | b'~') {
+            weak = weak.saturating_add(1);
+        }
+        if (bytes[0] == b'^' || bytes[0] == b'$') || (last == b'^' || last == b'$') {
+            weak = weak.saturating_add(1);
+        }
+    }
+    strong || weak >= 2
 }
 
 fn shannon_entropy(value: &str) -> f64 {
@@ -921,15 +1009,26 @@ fn docker_logical_lines(text: &str) -> Vec<(u32, String)> {
 
 fn scan_structured_iac(text: &str, extension: &str, builder: &mut FindingBuilder<'_>) {
     let line_starts = line_starts(text);
+    // A UTF-8 BOM is legal on the wire (RFC 8259 §8.1 receivers MAY ignore
+    // it) but rejected by serde_json; strip it for parsing only so reported
+    // offsets still map to the original text.
+    let parse_text = text.strip_prefix('\u{feff}').unwrap_or(text);
     if extension == "json" {
-        match serde_json::from_str::<serde_json::Value>(text) {
+        // .json files are JSONC by convention in several ecosystems
+        // (tsconfig, devcontainer, launch.json): retry strict-parse failures
+        // through the shared comment/trailing-comma sanitizer so those files
+        // are scanned instead of reported unparseable. Genuinely malformed
+        // JSON still fails both parses and is surfaced.
+        let document = serde_json::from_str::<serde_json::Value>(parse_text)
+            .or_else(|_| serde_json::from_str(&jsonc_to_json(parse_text)));
+        match document {
             Ok(document) => scan_structured_document(&document, text, &line_starts, builder),
             Err(_) => add_unparseable_iac_document(builder),
         }
         return;
     }
     let mut dropped_documents = 0_usize;
-    for document_text in split_yaml_documents(text) {
+    for document_text in split_yaml_documents(parse_text) {
         let parsed = serde_yaml::from_str::<serde_yaml::Value>(&document_text)
             .ok()
             .and_then(|value| serde_json::to_value(value).ok());
@@ -2915,5 +3014,87 @@ childProcess.exec(input);"#;
             "iac.unparseable-document"
         ));
         assert!(!has(&analyze("empty.yaml", ""), "iac.unparseable-document"));
+    }
+
+    #[test]
+    fn bom_prefixed_json_parses_and_yields_real_findings() {
+        // dapper xunit.runner.json regression: a UTF-8 BOM must not produce
+        // unparseable-document nor suppress the document's real findings.
+        let pod = "\u{feff}{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"spec\":{\"containers\":[{\"name\":\"app\",\"securityContext\":{\"privileged\":true}}]}}";
+        let output = analyze("pod.json", pod);
+        assert!(!has(&output, "iac.unparseable-document"));
+        assert!(has(&output, "iac.kubernetes.privileged-container"));
+        assert!(has(&output, "iac.kubernetes.privilege-escalation"));
+    }
+
+    #[test]
+    fn jsonc_style_json_files_do_not_report_unparseable() {
+        // tsconfig/devcontainer/launch.json conventionally carry comments and
+        // trailing commas; they must parse tolerantly instead of flagging.
+        let tsconfig =
+            "{\n  // compiler options\n  \"compilerOptions\": {\n    \"strict\": true,\n  },\n}\n";
+        assert!(!has(
+            &analyze("tsconfig.json", tsconfig),
+            "iac.unparseable-document"
+        ));
+        let devcontainer =
+            "{\n  /* image */\n  \"image\": \"mcr.microsoft.com/devcontainers/base:1\",\n}\n";
+        assert!(!has(
+            &analyze("devcontainer.json", devcontainer),
+            "iac.unparseable-document"
+        ));
+        // JSONC IaC content is still scanned after sanitization.
+        let pod = "{\n  // workload\n  \"apiVersion\": \"v1\",\n  \"kind\": \"Pod\",\n  \"spec\": {\"containers\": [{\"name\": \"app\", \"securityContext\": {\"privileged\": true}}]},\n}\n";
+        let output = analyze("pod.json", pod);
+        assert!(!has(&output, "iac.unparseable-document"));
+        assert!(has(&output, "iac.kubernetes.privileged-container"));
+        // Genuinely malformed JSON still reports unparseable-document.
+        assert!(has(
+            &analyze("broken.json", "{\"a\": }"),
+            "iac.unparseable-document"
+        ));
+        assert!(has(
+            &analyze("broken.json", "{not json"),
+            "iac.unparseable-document"
+        ));
+    }
+
+    #[test]
+    fn private_key_rule_covers_all_pem_labels() {
+        for label in ["", "RSA ", "EC ", "OPENSSH ", "DSA ", "ENCRYPTED "] {
+            let pem = format!(
+                "-----BEGIN {label}PRIVATE KEY-----\nMIIB\n-----END {label}PRIVATE KEY-----"
+            );
+            assert!(
+                has(&analyze("key.pem", &pem), "secret.private-key"),
+                "missed PEM label: {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn regex_literal_assignments_are_not_flagged_as_secrets() {
+        // composer GitHub.php regression: a constant holding a token-format
+        // regex is a pattern definition, not a credential.
+        for line in [
+            "const GITHUB_TOKEN_REGEX = '{^([a-f0-9]{12,}|gh[a-z]_[a-zA-Z0-9_.-]+|github_pat_[a-zA-Z0-9_]+)$}';",
+            "const GITHUB_TOKEN_REGEX = '/ghp_[A-Za-z0-9]{36}/';",
+            "token_pattern = \"\\d{4}-\\d{4}\"",
+        ] {
+            assert!(
+                !has(&analyze("x.php", line), "secret.high-entropy-assignment"),
+                "pattern definition flagged: {line}"
+            );
+        }
+        // Negative control: a literal token assignment still flags.
+        let real = format!(
+            "token = \"{}{}\"",
+            "ghp_", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"
+        );
+        assert!(has(&analyze("x", &real), "secret.github-token"));
+        assert!(has(
+            &analyze("x", "api_key = \"B7kP9vQ2mX8cR4tN6zW3\""), // hooray:allow-secret
+            "secret.high-entropy-assignment"
+        ));
     }
 }
