@@ -590,6 +590,7 @@ legacy severity-only `--fail-on` interface.
 | Dart | `pubspec.lock` | Locked pub packages, pub purls |
 | CocoaPods | `Podfile.lock` | Pod entries with nested dependency edges, CocoaPods purls |
 | PHP | `composer.json` | Declared `require`/`require-dev` packages, composer purls; platform packages skipped |
+| PHP | `composer.lock` | Pinned packages and declared licenses; lock-local `require` dependency edges with requiring-package scope |
 | Conda | `environment.yml` | Dependency list entries, conda purls |
 | Helm | `Chart.yaml` | Declared chart dependencies, Helm purls |
 | NuGet | `packages.lock.json` | Framework dependency graph, direct/transitive hints, NuGet purls |
@@ -761,13 +762,13 @@ version is kept verbatim.
 Parity is bounded by what each side can know, and the scorecard measures
 overlap rather than identity:
 
-- `composer.json` yields constraint-style versions (there is no
-  `composer.lock` support), so PHP inventory parity is specifier-level
-  rather than resolved-version-level.
+- `composer.json` yields constraint-style versions when no sibling lockfile exists.
+  `composer.lock` supplies pinned versions, declared licenses, and edges to
+  locked sibling packages; platform and unresolved requirements are not edges.
 - Formats without dependency edges (`requirements.txt`, `go.mod`,
   `Pipfile.lock`, `Package.resolved`, `pubspec.lock`, `composer.json`,
   `environment.yml`, `Chart.yaml`, `pom.xml`, `*.lockfile`) classify
-  all components as disconnected; `Gemfile.lock` and `Podfile.lock` emit
+  all components as disconnected; `Gemfile.lock`, `Podfile.lock`, and `composer.lock` emit
   edges but no declared roots, so direct/transitive parity is comparable
   only for npm, Yarn, pnpm, Poetry, Cargo, and NuGet cases.
 - Hooray derives severity as bucketed labels from OSV while Xray exposes
