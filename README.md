@@ -161,7 +161,7 @@ files, aggregate bytes, file count, traversal depth, archive metadata, and
 expanded archive inventory are subject to configured or built-in limits.
 
 Secret detection covers AWS access-key IDs, GitHub and GitLab tokens, Slack
-tokens, private-key headers, JWT-shaped values, and high-entropy credential
+tokens, private keys, JWT-shaped values, and high-entropy credential
 assignments. Placeholder-like values are ignored. Inline allowlist markers are
 `hooray:allow-secret`, `pragma: allowlist secret`, `gitleaks:allow`, and
 `nosec`. Secret values are never retained: evidence contains only redacted
@@ -173,7 +173,8 @@ IaC checks include:
 - Terraform unrestricted ingress and explicitly disabled storage encryption;
 - Dockerfile remote `ADD`, secret-like `ARG`/`ENV`, and absence of an explicit
   non-root `USER`;
-- Kubernetes host networking, privileged containers, and privilege escalation;
+- Kubernetes host networking, host ports, privileged containers, and privilege
+  escalation;
 - CloudFormation S3 buckets without public-access blocking and RDS instances
   without storage encryption;
 - nginx and Apache weak TLS protocol lists plus server-version disclosure;

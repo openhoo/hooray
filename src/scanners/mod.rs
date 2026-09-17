@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Cursor, Read},
+    mem::MaybeUninit,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -592,20 +593,40 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
     } else {
         BTreeSet::new()
     };
+    let line_starts = line_starts(text);
     for (line_index, line) in text.lines().enumerate() {
         if line.len() > MAX_TEXT_LINE_BYTES || allowlisted(line) {
             continue;
         }
+        let line_offset = line_starts[line_index];
         for secret_rule in SECRET_RULES.iter() {
             for matched in secret_rule.regex.find_iter(line) {
-                let entropy_milli = (shannon_entropy(matched.as_str()) * 1000.0).round() as u64;
+                // The private-key rule matches only the BEGIN marker line;
+                // evidence must cover the whole PEM block so fingerprints
+                // discriminate between distinct keys, and blocks without a
+                // plausible base64 body (placeholders, redactions, truncated
+                // markers) are not secrets at all.
+                let value = if secret_rule.rule == "secret.private-key" {
+                    let Some(block) = pem_block(text, line_offset + matched.start()) else {
+                        continue;
+                    };
+                    block
+                } else {
+                    matched.as_str()
+                };
+                let entropy = shannon_entropy(value) * 1000.0;
+                if looks_placeholder(value)
+                    || entropy < f64::from(builder.ctx.config.secret_entropy_threshold_milli)
+                {
+                    continue;
+                }
                 let site = SecretSite {
                     label: secret_rule.label,
                     severity: secret_rule.severity,
                     line: line_index,
                     column: matched.start(),
-                    value: matched.as_str(),
-                    entropy_milli,
+                    value,
+                    entropy_milli: entropy.round() as u64,
                 };
                 add_secret(builder, secret_rule.rule, site);
             }
@@ -628,7 +649,8 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
                 continue;
             }
             let entropy = shannon_entropy(value.as_str()) * 1000.0;
-            if looks_placeholder(value.as_str())
+            if looks_self_referential(&name, value.as_str())
+                || looks_placeholder(value.as_str())
                 || entropy < f64::from(builder.ctx.config.secret_entropy_threshold_milli)
             {
                 continue;
@@ -644,6 +666,39 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
             add_secret(builder, "secret.high-entropy-assignment", site);
         }
     }
+}
+
+/// Returns the complete `-----BEGIN …-----` … `-----END …-----` PEM block
+/// starting at `begin_offset`, but only when the body between the markers is
+/// plausible base64 key material. Placeholder bodies (`<REDACTED…>`, `…`,
+/// `XXXX`, empty) and marker-only fragments return `None` so they never
+/// produce a finding.
+fn pem_block(text: &str, begin_offset: usize) -> Option<&str> {
+    let begin_line_end = text[begin_offset..]
+        .find('\n')
+        .map_or(text.len(), |relative| begin_offset + relative);
+    let body_start = begin_line_end.saturating_add(1).min(text.len());
+    let end_marker = text[body_start..].find("-----END ")?;
+    let end_marker_start = body_start + end_marker;
+    let end_close = text[end_marker_start + "-----END ".len()..].find("-----")?;
+    let block_end = end_marker_start + "-----END ".len() + end_close + "-----".len();
+    plausible_pem_body(&text[body_start..end_marker_start])
+        .then_some(&text[begin_offset..block_end])
+}
+
+/// A PEM body is plausible key material when it is a run of base64 characters
+/// (whitespace between wrapped lines allowed) long and diverse enough to be a
+/// real key rather than a placeholder like `XXXX…` or `AAAA…`.
+fn plausible_pem_body(body: &str) -> bool {
+    let base64: Vec<u8> = body
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    base64.len() >= 16
+        && base64
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        && base64.iter().collect::<BTreeSet<_>>().len() >= 5
 }
 
 struct SecretSite<'a> {
@@ -714,7 +769,67 @@ fn looks_placeholder(value: &str) -> bool {
     .iter()
     .any(|marker| lower.contains(marker))
         || value.chars().collect::<BTreeSet<_>>().len() < 5
+        || looks_sequential_or_repeated(value)
+        || looks_like_namespaced_reference(value)
         || looks_like_pattern(value)
+}
+
+/// Detects sequential (`0123456789abcdef`, `abcdef`, `zyxwv`) and repeated
+/// (`abababab`, `abcabc`) dummy values: real credentials are never sorted or
+/// periodic, so these shapes are documentation/test constants.
+fn looks_sequential_or_repeated(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_sorted() || bytes.is_sorted_by(|left, right| left >= right) {
+        return true;
+    }
+    (1..=bytes.len() / 2)
+        .filter(|period| bytes.len().is_multiple_of(*period))
+        .any(|period| bytes.chunks(period).all(|chunk| chunk == &bytes[..period]))
+}
+
+/// Detects Kubernetes `namespace/name` object references such as
+/// `default/other-demo-secret`: two RFC 1123-style labels joined by a single
+/// slash. These are pointers to a secret object, not secret material.
+fn looks_like_namespaced_reference(value: &str) -> bool {
+    let mut parts = value.split('/');
+    let (Some(namespace), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    [namespace, name].iter().all(|part| {
+        !part.is_empty()
+            && part.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+            })
+            && part
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && part
+                .bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
+/// Detects values that merely restate the assignment key as vocabulary, such
+/// as the Android autofill hint `'password': 'current-password'` or
+/// `token = "api_token"`. The value must be a pure lowercase word list
+/// (hyphen/underscore separated) that contains the normalized key, so real
+/// secrets that happen to contain the key name plus entropy still flag.
+fn looks_self_referential(name: &str, value: &str) -> bool {
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'-' | b'_'))
+    {
+        return false;
+    }
+    let normalized_name = name.replace(['-', '_'], "");
+    let normalized_value = value.replace(['-', '_'], "");
+    !normalized_name.is_empty()
+        && (normalized_value == normalized_name
+            || (normalized_value.len() > normalized_name.len()
+                && (normalized_value.starts_with(&normalized_name)
+                    || normalized_value.ends_with(&normalized_name))))
 }
 
 /// Detects values that are pattern definitions rather than credential text:
@@ -1010,74 +1125,311 @@ fn docker_logical_lines(text: &str) -> Vec<(u32, String)> {
 fn scan_structured_iac(text: &str, extension: &str, builder: &mut FindingBuilder<'_>) {
     let line_starts = line_starts(text);
     // A UTF-8 BOM is legal on the wire (RFC 8259 §8.1 receivers MAY ignore
-    // it) but rejected by serde_json; strip it for parsing only so reported
-    // offsets still map to the original text.
+    // it) but rejected by serde_json; strip it for parsing only and shift
+    // document offsets by the BOM length so reported offsets still map to
+    // the original text.
     let parse_text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let bom_len = text.len() - parse_text.len();
     if extension == "json" {
         // .json files are JSONC by convention in several ecosystems
         // (tsconfig, devcontainer, launch.json): retry strict-parse failures
         // through the shared comment/trailing-comma sanitizer so those files
         // are scanned instead of reported unparseable. Genuinely malformed
         // JSON still fails both parses and is surfaced.
-        let document = serde_json::from_str::<serde_json::Value>(parse_text)
-            .or_else(|_| serde_json::from_str(&jsonc_to_json(parse_text)));
-        match document {
-            Ok(document) => scan_structured_document(&document, text, &line_starts, builder),
-            Err(_) => add_unparseable_iac_document(builder),
+        //
+        // IaC-shape gate: only JSON-shaped content (a leading `{`/`[`) can be
+        // a malformed IaC document. Other .json content is parsed as YAML —
+        // YAML manifests in .json files still scan, while plain-text bodies
+        // (error pages, prose) parse as inert scalars and are skipped rather
+        // than misreported as unparseable IaC.
+        let json_shaped = matches!(parse_text.trim_start().bytes().next(), Some(b'{' | b'['));
+        if json_shaped {
+            match serde_json::from_str::<serde_json::Value>(parse_text) {
+                Ok(document) => {
+                    let index = yaml_path_index(parse_text);
+                    let location = DocumentLocation {
+                        text,
+                        document_offset: bom_len,
+                        index: index.as_ref(),
+                        line_starts: &line_starts,
+                    };
+                    scan_structured_document(&document, &location, builder);
+                }
+                Err(_) => {
+                    match serde_json::from_str::<serde_json::Value>(&jsonc_to_json(parse_text)) {
+                        Ok(document) => {
+                            // Sanitized text offsets do not map back to the
+                            // original file; fall back to document-scoped
+                            // text anchoring for JSONC documents.
+                            let location = DocumentLocation {
+                                text,
+                                document_offset: 0,
+                                index: None,
+                                line_starts: &line_starts,
+                            };
+                            scan_structured_document(&document, &location, builder);
+                        }
+                        Err(_) => add_unparseable_iac_document(builder),
+                    }
+                }
+            }
+            return;
         }
-        return;
+        // Non-JSON-shaped .json: scan as YAML below; unparseable YAML is not
+        // surfaced because the file was never IaC-shaped input.
     }
     let mut dropped_documents = 0_usize;
-    for document_text in split_yaml_documents(parse_text) {
+    for (document_text, document_offset) in split_yaml_documents(parse_text) {
         let parsed = serde_yaml::from_str::<serde_yaml::Value>(&document_text)
             .ok()
             .and_then(|value| serde_json::to_value(value).ok());
         match parsed {
-            Some(document) => scan_structured_document(&document, text, &line_starts, builder),
+            Some(document) => {
+                let index = yaml_path_index(&document_text);
+                let location = DocumentLocation {
+                    text,
+                    document_offset: document_offset + bom_len,
+                    index: index.as_ref(),
+                    line_starts: &line_starts,
+                };
+                scan_structured_document(&document, &location, builder);
+            }
             None => dropped_documents += 1,
         }
     }
-    if dropped_documents > 0 {
+    if dropped_documents > 0 && extension != "json" {
         add_unparseable_iac_document(builder);
     }
 }
 
-/// Splits a YAML stream into per-document chunks on `---` separators.
-/// Parsing each chunk with a single-document parse avoids libyaml's
-/// stream iterator, which can spin forever on malformed trailing
-/// documents; behavior on well-formed streams is identical.
-fn split_yaml_documents(text: &str) -> Vec<String> {
+/// Splits a YAML stream into per-document chunks on `---` separators,
+/// returning each chunk's text and its byte offset in the original file so
+/// findings anchor into the correct document. Parsing each chunk with a
+/// single-document parse avoids libyaml's stream iterator, which can spin
+/// forever on malformed trailing documents; behavior on well-formed streams
+/// is identical.
+fn split_yaml_documents(text: &str) -> Vec<(String, usize)> {
     let mut documents = Vec::new();
     let mut current = String::new();
-    for line in text.lines() {
+    let mut current_offset = 0_usize;
+    let mut offset = 0_usize;
+    for line in text.split_inclusive('\n') {
         if line.trim_end() == "---" {
             if !current.trim().is_empty() {
-                documents.push(std::mem::take(&mut current));
+                documents.push((std::mem::take(&mut current), current_offset));
             }
+            offset += line.len();
             continue;
         }
+        if current.is_empty() {
+            current_offset = offset;
+        }
         current.push_str(line);
-        current.push('\n');
+        offset += line.len();
     }
     if !current.trim().is_empty() {
-        documents.push(current);
+        documents.push((current, current_offset));
     }
     documents
+}
+/// Per-document source context for IaC anchoring: the full file text, the
+/// document's byte offset within it, and a path→offset index built from the
+/// YAML event stream so findings land on the offending field's line rather
+/// than the first textual occurrence of an object name.
+struct DocumentLocation<'a> {
+    text: &'a str,
+    /// Byte offset of this document's text within `text`.
+    document_offset: usize,
+    /// JSON-pointer path → byte offset within the document text; `None` when
+    /// positions could not be tracked (e.g. JSONC-sanitized input).
+    index: Option<&'a BTreeMap<String, usize>>,
+    line_starts: &'a [usize],
 }
 
 /// Scans one parsed YAML/JSON document for Kubernetes and CloudFormation
 /// findings.
 fn scan_structured_document(
     document: &serde_json::Value,
-    text: &str,
-    line_starts: &[usize],
+    location: &DocumentLocation<'_>,
     builder: &mut FindingBuilder<'_>,
 ) {
     if document.get("apiVersion").is_some() && document.get("kind").is_some() {
-        scan_kubernetes_value(document, text, line_starts, builder);
+        scan_kubernetes_value(document, "", location, builder);
     }
     if document.get("AWSTemplateFormatVersion").is_some() || document.get("Resources").is_some() {
-        scan_cloudformation_value(document, text, line_starts, builder);
+        scan_cloudformation_value(document, "", location, builder);
+    }
+}
+
+/// Builds a JSON-pointer path → byte-offset index for one YAML document by
+/// walking the libyaml event stream — the same parser serde_yaml uses, so
+/// positions always agree with the parsed value tree. Mapping entries record
+/// the key's offset (the field's line); sequence items and the document root
+/// record the node's own offset. Returns `None` when the event parse fails.
+fn yaml_path_index(text: &str) -> Option<BTreeMap<String, usize>> {
+    let mut parser = MaybeUninit::<unsafe_libyaml::yaml_parser_t>::uninit();
+    let mut index = BTreeMap::new();
+    // The event walk mirrors libyaml's document structure: a stack of open
+    // collections plus the JSON-pointer path of the value currently being
+    // descended into.
+    enum Frame {
+        Mapping {
+            expecting_key: bool,
+            pending_key: Option<String>,
+        },
+        Sequence {
+            next_index: usize,
+        },
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut path: Vec<String> = Vec::new();
+    /// Registers `offset` for the value that begins here: the current path
+    /// after consuming a pending map key or the next sequence index. Scalar
+    /// values pop the segment immediately; containers keep it until their
+    /// end event. A container arriving where a mapping key is expected is a
+    /// complex key (`? [...]`): it is indexed under a `?` segment and the
+    /// mapping then expects its value.
+    fn begin_value(
+        stack: &mut [Frame],
+        path: &mut Vec<String>,
+        index: &mut BTreeMap<String, usize>,
+        offset: usize,
+    ) {
+        match stack.last_mut() {
+            Some(Frame::Mapping {
+                expecting_key,
+                pending_key,
+            }) => {
+                let key = if *expecting_key {
+                    *expecting_key = false;
+                    "?".to_owned()
+                } else {
+                    *expecting_key = true;
+                    pending_key.take().unwrap_or_else(|| "?".to_owned())
+                };
+                path.push(key);
+            }
+            Some(Frame::Sequence { next_index }) => {
+                path.push(next_index.to_string());
+                *next_index += 1;
+            }
+            None => path.clear(),
+        }
+        index.entry(pointer_join(path)).or_insert(offset);
+    }
+    // SAFETY: `parser` is initialized before use, `text` outlives the parser
+    // (libyaml reads the input in place), each event is deleted after its
+    // data is copied out, and the parser is deleted on every exit path.
+    unsafe {
+        if unsafe_libyaml::yaml_parser_initialize(parser.as_mut_ptr()).fail {
+            return None;
+        }
+        let parser = parser.as_mut_ptr();
+        unsafe_libyaml::yaml_parser_set_encoding(parser, unsafe_libyaml::YAML_UTF8_ENCODING);
+        unsafe_libyaml::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
+        let mut event = MaybeUninit::<unsafe_libyaml::yaml_event_t>::uninit();
+        loop {
+            if unsafe_libyaml::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
+                unsafe_libyaml::yaml_parser_delete(parser);
+                return None;
+            }
+            let mut parsed_event = event.assume_init();
+            let offset = parsed_event.start_mark.index as usize;
+            match parsed_event.type_ {
+                unsafe_libyaml::YAML_STREAM_END_EVENT => {
+                    unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                    break;
+                }
+                unsafe_libyaml::YAML_DOCUMENT_START_EVENT => {
+                    stack.clear();
+                    path.clear();
+                }
+                unsafe_libyaml::YAML_MAPPING_START_EVENT => {
+                    begin_value(&mut stack, &mut path, &mut index, offset);
+                    stack.push(Frame::Mapping {
+                        expecting_key: true,
+                        pending_key: None,
+                    });
+                }
+                unsafe_libyaml::YAML_SEQUENCE_START_EVENT => {
+                    begin_value(&mut stack, &mut path, &mut index, offset);
+                    stack.push(Frame::Sequence { next_index: 0 });
+                }
+                unsafe_libyaml::YAML_MAPPING_END_EVENT
+                | unsafe_libyaml::YAML_SEQUENCE_END_EVENT => {
+                    stack.pop();
+                    path.pop();
+                }
+                unsafe_libyaml::YAML_SCALAR_EVENT => {
+                    let scalar = parsed_event.data.scalar;
+                    let value = std::str::from_utf8(std::slice::from_raw_parts(
+                        scalar.value,
+                        scalar.length as usize,
+                    ))
+                    .unwrap_or("")
+                    .to_owned();
+                    match stack.last_mut() {
+                        Some(Frame::Mapping {
+                            expecting_key: expecting @ true,
+                            pending_key,
+                        }) => {
+                            *expecting = false;
+                            *pending_key = Some(pointer_escape(&value));
+                            index
+                                .entry(pointer_join_with(&path, pending_key.as_deref().unwrap()))
+                                .or_insert(offset);
+                        }
+                        _ => {
+                            begin_value(&mut stack, &mut path, &mut index, offset);
+                            path.pop();
+                        }
+                    }
+                }
+                unsafe_libyaml::YAML_ALIAS_EVENT => {
+                    begin_value(&mut stack, &mut path, &mut index, offset);
+                    path.pop();
+                }
+                _ => {}
+            }
+            unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+        }
+        unsafe_libyaml::yaml_parser_delete(parser);
+    }
+    Some(index)
+}
+
+/// Escapes one path segment per RFC 6901 so keys containing `~` or `/` still
+/// resolve unambiguously.
+fn pointer_escape(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
+fn pointer_join(path: &[String]) -> String {
+    let mut pointer = String::new();
+    for segment in path {
+        pointer.push('/');
+        pointer.push_str(segment);
+    }
+    pointer
+}
+
+fn pointer_join_with(path: &[String], segment: &str) -> String {
+    let mut pointer = pointer_join(path);
+    pointer.push('/');
+    pointer.push_str(segment);
+    pointer
+}
+
+/// Resolves a JSON-pointer path to a byte offset in the document, walking up
+/// to the nearest indexed ancestor when the exact node was not recorded
+/// (absent fields anchor to their parent object).
+fn resolve_path_offset(index: &BTreeMap<String, usize>, path: &str) -> Option<usize> {
+    let mut current = path;
+    loop {
+        if let Some(offset) = index.get(current) {
+            return Some(*offset);
+        }
+        current = current.rsplit_once('/')?.0;
     }
 }
 
@@ -1104,7 +1456,12 @@ fn add_unparseable_iac_document(builder: &mut FindingBuilder<'_>) {
 }
 
 struct StructuredIacRule<'a> {
+    /// JSON-pointer path of the offending field within the document; used
+    /// for position-indexed anchoring.
+    path: &'a str,
+    /// Object name recorded in the finding's `object` property.
     anchor: &'a str,
+    /// Fallback text needle when no position index is available.
     needle: &'a str,
     rule: &'a str,
     summary: &'a str,
@@ -1134,6 +1491,7 @@ const KUBERNETES_POD_SPEC_CHECKS: &[KubernetesIacCheck] = &[KubernetesIacCheck {
     field: "hostNetwork",
     predicate: KubernetesIacPredicate::IsTrue,
     rule: StructuredIacRule {
+        path: "",
         anchor: "",
         needle: "hostNetwork",
         rule: "iac.kubernetes.host-network",
@@ -1149,6 +1507,7 @@ const KUBERNETES_SECURITY_CONTEXT_CHECKS: &[KubernetesIacCheck] = &[
         field: "privileged",
         predicate: KubernetesIacPredicate::IsTrue,
         rule: StructuredIacRule {
+            path: "",
             anchor: "",
             needle: "privileged",
             rule: "iac.kubernetes.privileged-container",
@@ -1162,6 +1521,7 @@ const KUBERNETES_SECURITY_CONTEXT_CHECKS: &[KubernetesIacCheck] = &[
         field: "allowPrivilegeEscalation",
         predicate: KubernetesIacPredicate::IsNotFalse,
         rule: StructuredIacRule {
+            path: "",
             anchor: "",
             needle: "allowPrivilegeEscalation",
             rule: "iac.kubernetes.privilege-escalation",
@@ -1173,58 +1533,101 @@ const KUBERNETES_SECURITY_CONTEXT_CHECKS: &[KubernetesIacCheck] = &[
     },
 ];
 
+/// Container list fields that carry a securityContext and ports, matching
+/// the Kubernetes PodSpec schema (trivy scans the same three groups).
+const KUBERNETES_CONTAINER_FIELDS: &[&str] =
+    &["containers", "initContainers", "ephemeralContainers"];
+
 fn scan_kubernetes_value(
     value: &serde_json::Value,
-    text: &str,
-    line_starts: &[usize],
+    path: &str,
+    location: &DocumentLocation<'_>,
     builder: &mut FindingBuilder<'_>,
 ) {
+    // `kind: List` wraps whole objects in `items`; recurse so each item is
+    // scanned with its own path prefix instead of being invisible.
+    if value.get("kind").and_then(serde_json::Value::as_str) == Some("List") {
+        if let Some(items) = value.get("items").and_then(serde_json::Value::as_array) {
+            for (index, item) in items.iter().enumerate() {
+                scan_kubernetes_value(item, &format!("{path}/items/{index}"), location, builder);
+            }
+        }
+        return;
+    }
     let workload = value
         .pointer("/metadata/name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    for spec in pod_specs(value) {
+    for (spec, spec_path) in pod_specs(value, path) {
         run_kubernetes_iac_checks(
             KUBERNETES_POD_SPEC_CHECKS,
             spec,
+            &spec_path,
             workload,
-            text,
-            line_starts,
+            location,
             builder,
         );
-        for container in spec
-            .get("containers")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let name = container
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(workload);
-            let security = container
-                .get("securityContext")
-                .unwrap_or(&serde_json::Value::Null);
-            run_kubernetes_iac_checks(
-                KUBERNETES_SECURITY_CONTEXT_CHECKS,
-                security,
-                name,
-                text,
-                line_starts,
-                builder,
-            );
+        for container_field in KUBERNETES_CONTAINER_FIELDS {
+            let Some(containers) = spec
+                .get(*container_field)
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for (index, container) in containers.iter().enumerate() {
+                let container_path = format!("{spec_path}/{container_field}/{index}");
+                let name = container
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(workload);
+                let security = container
+                    .get("securityContext")
+                    .unwrap_or(&serde_json::Value::Null);
+                run_kubernetes_iac_checks(
+                    KUBERNETES_SECURITY_CONTEXT_CHECKS,
+                    security,
+                    &format!("{container_path}/securityContext"),
+                    name,
+                    location,
+                    builder,
+                );
+                // hostPort binds a container port onto the node interface
+                // (trivy KSV-0024); any declared hostPort is flagged.
+                if let Some(ports) = container.get("ports").and_then(serde_json::Value::as_array) {
+                    for (port_index, port) in ports.iter().enumerate() {
+                        if port.get("hostPort").is_some() {
+                            add_structured_iac(
+                                builder,
+                                location,
+                                StructuredIacRule {
+                                    path: &format!("{container_path}/ports/{port_index}/hostPort"),
+                                    anchor: name,
+                                    needle: "hostPort",
+                                    rule: "iac.kubernetes.host-port",
+                                    summary: "Kubernetes container binds a host port",
+                                    severity: Severity::Medium,
+                                    remediation: "Remove hostPort and expose the workload through a Service instead of the node interface.",
+                                    cwe: "CWE-668",
+                                },
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
 /// Applies every check from `checks` against `fields`, emitting each rule
-/// whose predicate holds.
+/// whose predicate holds. `fields_path` is the JSON-pointer path of `fields`
+/// within the document; a firing check anchors at `fields_path/field` (or the
+/// nearest indexed ancestor when the field is absent).
 fn run_kubernetes_iac_checks(
     checks: &[KubernetesIacCheck],
     fields: &serde_json::Value,
+    fields_path: &str,
     anchor: &str,
-    text: &str,
-    line_starts: &[usize],
+    location: &DocumentLocation<'_>,
     builder: &mut FindingBuilder<'_>,
 ) {
     for check in checks {
@@ -1236,9 +1639,9 @@ fn run_kubernetes_iac_checks(
         if fires {
             add_structured_iac(
                 builder,
-                text,
-                line_starts,
+                location,
                 StructuredIacRule {
+                    path: &format!("{fields_path}/{}", check.field),
                     anchor,
                     ..check.rule
                 },
@@ -1247,23 +1650,27 @@ fn run_kubernetes_iac_checks(
     }
 }
 
-fn pod_specs(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+fn pod_specs<'a>(value: &'a serde_json::Value, path: &str) -> Vec<(&'a serde_json::Value, String)> {
     let kind = value
         .get("kind")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let pointer = match kind {
+    let suffix = match kind {
         "Pod" => "/spec",
         "CronJob" => "/spec/jobTemplate/spec/template/spec",
         _ => "/spec/template/spec",
     };
-    value.pointer(pointer).into_iter().collect()
+    value
+        .pointer(suffix)
+        .into_iter()
+        .map(|spec| (spec, format!("{path}{suffix}")))
+        .collect()
 }
 
 fn scan_cloudformation_value(
     value: &serde_json::Value,
-    text: &str,
-    line_starts: &[usize],
+    path: &str,
+    location: &DocumentLocation<'_>,
     builder: &mut FindingBuilder<'_>,
 ) {
     let Some(resources) = value
@@ -1273,6 +1680,7 @@ fn scan_cloudformation_value(
         return;
     };
     for (logical_id, resource) in resources {
+        let resource_path = format!("{path}/Resources/{}", pointer_escape(logical_id));
         let resource_type = resource
             .get("Type")
             .and_then(serde_json::Value::as_str)
@@ -1285,9 +1693,9 @@ fn scan_cloudformation_value(
         {
             add_structured_iac(
                 builder,
-                text,
-                line_starts,
+                location,
                 StructuredIacRule {
+                    path: &format!("{resource_path}/Type"),
                     anchor: logical_id,
                     needle: "AWS::S3::Bucket",
                     rule: "iac.cloudformation.s3-public-access-block",
@@ -1306,9 +1714,9 @@ fn scan_cloudformation_value(
         {
             add_structured_iac(
                 builder,
-                text,
-                line_starts,
+                location,
                 StructuredIacRule {
+                    path: &format!("{resource_path}/Properties/StorageEncrypted"),
                     anchor: logical_id,
                     needle: "StorageEncrypted",
                     rule: "iac.cloudformation.rds-encryption",
@@ -1324,15 +1732,25 @@ fn scan_cloudformation_value(
 
 fn add_structured_iac(
     builder: &mut FindingBuilder<'_>,
-    text: &str,
-    line_starts: &[usize],
+    location: &DocumentLocation<'_>,
     rule: StructuredIacRule<'_>,
 ) {
-    let anchor = find_structured_scalar(text, rule.anchor).unwrap_or(0);
-    let offset = text[anchor..]
-        .find(rule.needle)
-        .map_or(anchor, |relative| anchor + relative);
-    let (line, column) = indexed_line_column(line_starts, offset);
+    // Prefer the parse-time position index: it anchors the finding to the
+    // offending field inside the correct document. The document-scoped text
+    // search remains only for inputs without a position index (JSONC).
+    let offset = location
+        .index
+        .and_then(|index| resolve_path_offset(index, rule.path))
+        .map(|offset| location.document_offset + offset)
+        .unwrap_or_else(|| {
+            let anchor =
+                find_structured_scalar(location.text, location.document_offset, rule.anchor)
+                    .unwrap_or(location.document_offset);
+            location.text[anchor..]
+                .find(rule.needle)
+                .map_or(anchor, |relative| anchor + relative)
+        });
+    let (line, column) = indexed_line_column(location.line_starts, offset);
     let mut properties = BTreeMap::new();
     if !rule.anchor.is_empty() {
         properties.insert("object".to_owned(), rule.anchor.to_owned());
@@ -1340,23 +1758,20 @@ fn add_structured_iac(
     builder.add(FindingSpec { kind: FindingKind::Iac, rule: rule.rule, line, column, summary: rule.summary, details: "A parsed IaC document contains the concrete insecure configuration described by this rule.", severity: rule.severity, confidence: Confidence::High, description: format!("Parsed configuration key: {}", rule.needle), references: &["https://kubernetes.io/docs/concepts/security/", "https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/"], properties, redacted: false, remediation: rule.remediation, cwe: Some(rule.cwe) });
 }
 
-fn find_structured_scalar(text: &str, value: &str) -> Option<usize> {
+/// Fallback anchor search used only when no parse-time position index is
+/// available: finds `value` at or after `from` — quoted first, then bare —
+/// so anchoring stays inside the current document.
+fn find_structured_scalar(text: &str, from: usize, value: &str) -> Option<usize> {
     if value.is_empty() {
         return None;
     }
     let quoted_double = format!("\"{value}\"");
     let quoted_single = format!("'{value}'");
-    text.find(&quoted_double)
-        .or_else(|| text.find(&quoted_single))
-        .or_else(|| {
-            text.lines()
-                .scan(0usize, |offset, line| {
-                    let start = *offset;
-                    *offset += line.len() + 1;
-                    Some((start, line))
-                })
-                .find_map(|(offset, line)| line.find(value).map(|column| offset + column))
-        })
+    text[from..]
+        .find(&quoted_double)
+        .or_else(|| text[from..].find(&quoted_single))
+        .or_else(|| text[from..].find(value))
+        .map(|relative| from + relative)
 }
 
 fn scan_malware(bytes: &[u8], builder: &mut FindingBuilder<'_>) {
@@ -1402,9 +1817,12 @@ fn detected_formats(bytes: &[u8]) -> Vec<&'static str> {
         if let Some(embedded_format) = embedded {
             let embedded_found = bytes
                 .windows(magic.len())
+                .enumerate()
                 .skip(magic.len())
                 .take(4096)
-                .any(|window| window == *magic);
+                .any(|(offset, window)| {
+                    window == *magic && embedded_signature_at_boundary(bytes, offset, magic.len())
+                });
             if embedded_found && !formats.contains(format) {
                 formats.push(embedded_format);
             }
@@ -1413,6 +1831,32 @@ fn detected_formats(bytes: &[u8]) -> Vec<&'static str> {
     formats.sort_unstable();
     formats.dedup();
     formats
+}
+
+/// An embedded magic signature only counts at a plausible binary boundary:
+/// `MZ`/`ELF` byte pairs inside base64 or similar encoded payloads (PDF
+/// streams, data URIs) are coincidental substrings, not embedded executables.
+/// A signature is inside an encoded run when at least
+/// [`ENCODED_RUN_LIMIT`] base64-alphabet bytes (line-wrap whitespace allowed)
+/// flank it on both sides.
+const ENCODED_RUN_LIMIT: usize = 8;
+
+fn embedded_signature_at_boundary(bytes: &[u8], offset: usize, magic_len: usize) -> bool {
+    let encoded_byte = |byte: &&u8| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'\r' | b'\n')
+    };
+    let left = bytes[..offset]
+        .iter()
+        .rev()
+        .take(ENCODED_RUN_LIMIT)
+        .take_while(encoded_byte)
+        .count();
+    let right = bytes[offset + magic_len..]
+        .iter()
+        .take(ENCODED_RUN_LIMIT)
+        .take_while(encoded_byte)
+        .count();
+    left < ENCODED_RUN_LIMIT || right < ENCODED_RUN_LIMIT
 }
 
 fn scan_zip_bomb(bytes: &[u8], builder: &mut FindingBuilder<'_>) {
@@ -3063,7 +3507,7 @@ childProcess.exec(input);"#;
     fn private_key_rule_covers_all_pem_labels() {
         for label in ["", "RSA ", "EC ", "OPENSSH ", "DSA ", "ENCRYPTED "] {
             let pem = format!(
-                "-----BEGIN {label}PRIVATE KEY-----\nMIIB\n-----END {label}PRIVATE KEY-----"
+                "-----BEGIN {label}PRIVATE KEY-----\nMIIBpjBABgkqhkiG9w0BBQ0wMzAbBgkqhkiG9w0BBQwwDgQIf8r2\n-----END {label}PRIVATE KEY-----"
             );
             assert!(
                 has(&analyze("key.pem", &pem), "secret.private-key"),
@@ -3095,6 +3539,207 @@ childProcess.exec(input);"#;
         assert!(has(
             &analyze("x", "api_key = \"B7kP9vQ2mX8cR4tN6zW3\""), // hooray:allow-secret
             "secret.high-entropy-assignment"
+        ));
+    }
+
+    #[test]
+    fn polyglot_ignores_mz_inside_encoded_payload() {
+        // fastlane pilot.ai regression: `MZ` inside a base64 PDF stream is a
+        // coincidental substring, not an embedded PE signature.
+        let mut pdf = b"%PDF-1.5\r\n1 0 obj\r<< /Length 200 >>\rstream\r".to_vec();
+        for _ in 0..800 {
+            pdf.extend_from_slice(b"QUJD");
+        }
+        pdf.extend_from_slice(b"MZCV47mpBBqadT2zKOSN04wxGrReka");
+        for _ in 0..200 {
+            pdf.extend_from_slice(b"QUJD");
+        }
+        pdf.extend_from_slice(b"\rendstream\rendobj\r%%EOF\r");
+        assert!(!has(
+            &analyze_bytes(
+                "doc.ai",
+                &pdf,
+                &asset(),
+                &ScannerConfig::default(),
+                &MalwareSignatures::default(),
+            ),
+            "malware.executable-script-polyglot"
+        ));
+        // Negative control: a real embedded PE (binary boundary) still fires.
+        let mut polyglot = b"#!/bin/sh\n".to_vec();
+        polyglot.extend_from_slice(b"MZ\x90\x00\x03\x00\x00\x00");
+        assert!(has(
+            &analyze_bytes(
+                "polyglot",
+                &polyglot,
+                &asset(),
+                &ScannerConfig::default(),
+                &MalwareSignatures::default(),
+            ),
+            "malware.executable-script-polyglot"
+        ));
+    }
+
+    #[test]
+    fn high_entropy_assignment_ignores_vocabulary_and_dummy_constants() {
+        // flutter autofill_hint.dart regression: protocol vocabulary and
+        // sequential dummy constants are not credentials.
+        let source = "const Map<String, String> autofillHints = <String, String>{\n  'password': 'current-password',\n  'newPassword': 'new-password',\n};\nconst token = '0123456789abcdef';\n";
+        let output = analyze("autofill_hint.dart", source);
+        assert!(!has(&output, "secret.high-entropy-assignment"));
+        // Kubernetes namespace/name secret references are pointers, not keys.
+        assert!(!has(
+            &analyze("deploy.yaml", "password: \"default/other-demo-secret\""),
+            "secret.high-entropy-assignment"
+        ));
+        // Negative control: a real token assignment still flags.
+        assert!(has(
+            &analyze("x", "api_key = \"B7kP9vQ2mX8cR4tN6zW3\""), // hooray:allow-secret
+            "secret.high-entropy-assignment"
+        ));
+    }
+
+    #[test]
+    fn kubernetes_findings_anchor_to_offending_field_in_correct_document() {
+        // ingress-nginx multi-tls regression: a Service named `web` in the
+        // first document must not absorb the Deployment container finding
+        // from the second document.
+        let yaml = "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  ports:\n    - port: 80\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n    spec:\n      containers:\n        - name: web\n          image: app:latest\n";
+        let output = analyze("multi.yaml", yaml);
+        let findings = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "iac.kubernetes.privilege-escalation")
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1);
+        let line = output
+            .locations
+            .iter()
+            .find(|location| Some(&location.id) == findings[0].location_id.as_ref())
+            .unwrap()
+            .start
+            .unwrap()
+            .line;
+        // The container `- name: web` sits at line 17 of the second document,
+        // not line 4 (Service metadata.name) as the old text search reported.
+        assert_eq!(line, 17);
+    }
+
+    #[test]
+    fn kubernetes_list_items_and_init_containers_are_scanned() {
+        let yaml = "apiVersion: v1\nkind: List\nitems:\n  - apiVersion: v1\n    kind: Pod\n    metadata:\n      name: listed\n    spec:\n      hostNetwork: true\n      initContainers:\n        - name: init\n          securityContext:\n            privileged: true\n      ephemeralContainers:\n        - name: debug\n          securityContext:\n            privileged: true\n      containers:\n        - name: app\n          ports:\n            - containerPort: 80\n              hostPort: 8080\n";
+        let output = analyze("list.yaml", yaml);
+        assert!(has(&output, "iac.kubernetes.host-network"));
+        assert!(has(&output, "iac.kubernetes.host-port"));
+        let privileged = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "iac.kubernetes.privileged-container")
+            .count();
+        assert_eq!(privileged, 2, "initContainers and ephemeralContainers");
+    }
+
+    #[test]
+    fn command_shell_rules_ignore_literal_command_strings() {
+        // ingress-nginx waitshutdown regression: a literal argv string is a
+        // static command, not dynamic shell execution.
+        assert!(!has(
+            &analyze(
+                "main.go",
+                "exec.Command(\"bash\", \"-c\", \"pkill -SIGTERM -f nginx-ingress-controller\")"
+            ),
+            "sast.go.command-shell"
+        ));
+        assert!(!has(
+            &analyze("x.rs", "Command::new(\"sh\").arg(\"-c\").arg( \"ls -la\" )"),
+            "sast.rust.command-shell"
+        ));
+        // Negative controls: dynamic command strings still fire.
+        assert!(has(
+            &analyze("main.go", "exec.Command(\"bash\", \"-c\", cmd)"),
+            "sast.go.command-shell"
+        ));
+        assert!(has(
+            &analyze("x.rs", "Command::new(\"sh\").arg(\"-c\").arg(input)"),
+            "sast.rust.command-shell"
+        ));
+    }
+
+    #[test]
+    fn private_key_rule_requires_plausible_pem_body() {
+        // ingress-nginx kubectl-plugin.md regression: marker-only and
+        // placeholder PEM bodies are not secrets.
+        for pem in [
+            "-----BEGIN PRIVATE KEY-----\n<REDACTED! DO NOT SHARE THIS!>\n-----END PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----\nXXXXXXXXXXXXXXXXXXXXXXXX\n-----END PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----",
+        ] {
+            assert!(
+                !has(&analyze("key.pem", pem), "secret.private-key"),
+                "placeholder PEM flagged: {pem:?}"
+            );
+        }
+        // Negative control: a real base64 body still flags.
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIBpjBABgkqhkiG9w0BBQ0wMzAbBgkqhkiG9w0BBQwwDgQIf8r2\n-----END PRIVATE KEY-----";
+        assert!(has(&analyze("key.pem", pem), "secret.private-key"));
+    }
+
+    #[test]
+    fn private_key_fingerprint_covers_the_pem_block() {
+        // gitleaks regression: same-label PEMs with different bodies must
+        // produce different fingerprints so policy exceptions pin one key.
+        let body_a = "MIIBpjBABgkqhkiG9w0BBQ0wMzAbBgkqhkiG9w0BBQwwDgQIf8r2AAAA";
+        let body_b = "BQ0wMzAbBgkqhkiG9w0BBQwwDgQIf8r2MIIBpjBABgkqhkiG9w0BBBB";
+        let pem =
+            |body: &str| format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----");
+        let fingerprints = |pem: &str| {
+            analyze("key.pem", pem)
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_id.as_str() == "secret.private-key")
+                .map(|finding| {
+                    finding.evidence.iter().next().unwrap().properties["fingerprint_sha256"].clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = fingerprints(&pem(body_a));
+        let b = fingerprints(&pem(body_b));
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_ne!(a[0], b[0]);
+    }
+
+    #[test]
+    fn secret_pattern_rules_apply_placeholder_filtering() {
+        // gitleaks self-scan regression: documented non-secrets must not flag
+        // through the pattern-rule path either.
+        let source = "key = AKIAXXXXXXXXXXXXXXXX\naws_access_key: AKIAIOSFODNN7EXAMPLE\ntoken = \"xoxb-xxxxxxxxx-xxxxxxxxxx-xxxxxxxxxxxx\"\n";
+        let output = analyze("config.txt", source);
+        assert!(!has(&output, "secret.aws-access-key"));
+        assert!(!has(&output, "secret.slack-token"));
+        // Negative control: a real-format AWS key still flags.
+        assert!(has(
+            &analyze("config.txt", "key = AKIAB7KP9VQ2MX8CR4T6"), // hooray:allow-secret
+            "secret.aws-access-key"
+        ));
+    }
+
+    #[test]
+    fn non_iac_json_files_do_not_report_unparseable() {
+        // ingress-nginx error-page regression: a .json file holding plain
+        // text is not a malformed IaC document.
+        assert!(!has(
+            &analyze(
+                "500.json",
+                "Internal Server Error\nThe server encountered an error.\n"
+            ),
+            "iac.unparseable-document"
+        ));
+        // JSON-shaped malformed content still reports the finding.
+        assert!(has(
+            &analyze("broken.json", "{not json"),
+            "iac.unparseable-document"
         ));
     }
 }

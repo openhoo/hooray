@@ -35,7 +35,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
         &[
             SastRuleSpec {
                 rule: "sast.rust.command-shell",
-                pattern: r#"\bCommand\s*::\s*new\s*\(\s*["'](?:sh|bash|cmd|powershell)["']\s*\)\s*\.\s*arg\s*\(\s*["'](?:-c|/C|Command)["']\s*\)\s*\.\s*arg\s*\([^"']"#,
+                pattern: r#"\bCommand\s*::\s*new\s*\(\s*["'](?:sh|bash|cmd|powershell)["']\s*\)\s*\.\s*arg\s*\(\s*["'](?:-c|/C|Command)["']\s*\)\s*\.\s*arg\s*\("#,
                 summary: "Dynamic shell command execution",
                 cwe: "CWE-78",
                 severity: Severity::High,
@@ -170,7 +170,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
         &[
             SastRuleSpec {
                 rule: "sast.go.command-shell",
-                pattern: r#"\bexec\.Command\s*\(\s*["'](?:sh|bash)["']\s*,\s*["']-c["']\s*,\s*[^"']"#,
+                pattern: r#"\bexec\.Command\s*\(\s*["'](?:sh|bash|cmd|powershell)["']\s*,\s*["'](?i:-c|/c|-command)["']\s*,"#,
                 summary: "Dynamic shell command execution",
                 cwe: "CWE-78",
                 severity: Severity::High,
@@ -392,6 +392,16 @@ fn emit_sast_finding(context: &mut SastFindingContext<'_, '_>, start: usize, end
     }
     if context.rule.rule == "sast.python.yaml-unsafe-load"
         && yaml_call_specifies_loader(&context.text[end..])
+    {
+        return;
+    }
+    // Command-shell rules match up to the command-string argument; a
+    // complete string literal there is a static, auditable command — only
+    // dynamic or interpolated command strings are reported.
+    if matches!(
+        context.rule.rule,
+        "sast.go.command-shell" | "sast.rust.command-shell"
+    ) && starts_with_string_literal(&context.text[end..])
     {
         return;
     }
@@ -1784,6 +1794,50 @@ fn has_single_literal_argument(after_open_paren: &str) -> bool {
             return source[offset + character.len_utf8()..]
                 .trim_start()
                 .starts_with(')');
+        }
+    }
+    false
+}
+
+/// Whether the source begins with a complete string literal followed by a
+/// `,` or `)` — i.e. the next call argument is a static literal rather than
+/// an identifier, interpolation, or concatenation. Handles Go/Rust quoted
+/// and backtick literals plus Rust raw strings (`r"…"`, `r#"…"#`).
+fn starts_with_string_literal(after_open_paren: &str) -> bool {
+    let source = after_open_paren.trim_start();
+    // Rust raw strings: r"…", r#"…"#, r##"…"## — no escapes, terminator is
+    // the quote followed by the same number of `#`.
+    if let Some(rest) = source.strip_prefix('r') {
+        let hashes = rest.bytes().take_while(|byte| *byte == b'#').count();
+        if rest.as_bytes().get(hashes) == Some(&b'"') {
+            let body_start = 1 + hashes + 1;
+            let terminator = format!("\"{}", "#".repeat(hashes));
+            return source[body_start..].find(&terminator).is_some_and(|end| {
+                source[body_start + end + terminator.len()..]
+                    .trim_start()
+                    .starts_with([',', ')'])
+            });
+        }
+    }
+    let mut chars = source.char_indices();
+    let Some((_, quote @ ('\'' | '"' | '`'))) = chars.next() else {
+        return false;
+    };
+    let mut escaped = false;
+    for (offset, character) in chars {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        // Backtick literals (Go raw strings) have no escapes.
+        if quote != '`' && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == quote {
+            return source[offset + character.len_utf8()..]
+                .trim_start()
+                .starts_with([',', ')']);
         }
     }
     false
