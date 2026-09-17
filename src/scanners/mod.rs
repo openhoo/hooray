@@ -4061,9 +4061,11 @@ childProcess.exec(input);"#;
                 "secret.private-key"
             ));
         }
-        // Negative control: a real base64 body still flags.
-        let pem = "-----BEGIN PRIVATE KEY-----\nMIIBpjBABgkqhkiG9w0BBQ0wMzAbBgkqhkiG9w0BBQwwDgQIf8r2\n-----END PRIVATE KEY-----";
-        assert!(has(&analyze("key.pem", pem), "secret.private-key"));
+        // Construct inert key-shaped text at runtime so dogfood does not
+        // mistake the regression fixture itself for an escaped private key.
+        let body = "MIIBpjBABgkqhkiG9w0BBQ0wMzAbBgkqhkiG9w0BBQwwDgQIf8r2";
+        let pem = format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----");
+        assert!(has(&analyze("key.pem", &pem), "secret.private-key"));
     }
 
     #[test]
