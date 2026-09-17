@@ -23,7 +23,9 @@ use crate::{
 mod parsers;
 
 use self::parsers::{
-    archive::{read_entry_bounded, read_tar_file, read_zip_file},
+    archive::{
+        decompress_archive, read_entry_bounded, read_tar_file, read_zip_file, tar_entry_path,
+    },
     bun::parse_bun_lock,
     cargo::parse_cargo_lock,
     conda::parse_conda_environment,
@@ -169,8 +171,15 @@ impl ScanInput {
                 format: ArchiveFormat::Zip,
             });
         }
-        if lower.ends_with(".tar") {
-            if tar_is_image(open_regular_nofollow(&canonical)?, config)? {
+        if lower.ends_with(".tar")
+            || lower.ends_with(".tar.gz")
+            || lower.ends_with(".tgz")
+            || lower.ends_with(".tar.zst")
+        {
+            if tar_is_image(
+                decompress_archive(open_regular_nofollow(&canonical)?)?,
+                config,
+            )? {
                 return Ok(Self::OciImageTar(canonical));
             }
             return Ok(Self::Archive {
@@ -524,11 +533,12 @@ fn entry_bound(count: usize, path: &str, format: &'static str) -> Result<(), Inp
     }
 }
 
-/// Streams entry names of a plain `.tar` once to decide whether it is an
-/// OCI/docker-save image archive, without buffering entry contents. Enforces
-/// the same entry-count, link, and path rules as `read_tar_with_expanded`;
-/// only `manifest.json` is materialized because its array shape decides
-/// docker-save classification (see `is_oci_markers`).
+/// Streams entry names of a (possibly gzip- or zstd-compressed) `.tar` once
+/// to decide whether it is an OCI/docker-save image archive, without
+/// buffering entry contents. Enforces the same entry-count, link, and path
+/// rules as `read_tar_with_expanded`; only `manifest.json` is materialized
+/// because its array shape decides docker-save classification (see
+/// `is_oci_markers`).
 fn tar_is_image<R: Read>(reader: R, config: &Config) -> Result<bool, InputError> {
     let mut archive = tar::Archive::new(reader);
     let mut count = 0_usize;
@@ -551,10 +561,9 @@ fn tar_is_image<R: Read>(reader: R, config: &Config) -> Result<bool, InputError>
             path: PathBuf::from("<tar>"),
             source,
         })?;
-        let path = normalize_relative(&entry.path().map_err(|source| InputError::Io {
-            path: PathBuf::from("<tar>"),
-            source,
-        })?)?;
+        let Some(path) = tar_entry_path(&entry)? else {
+            continue;
+        };
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(InputError::ArchiveLink(path));

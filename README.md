@@ -22,7 +22,7 @@ Hooray accepts explicit input types or auto-detects them:
 - project directories; recognized lockfiles and manifests contribute dependency inventory;
 - CycloneDX JSON SBOMs with nested components and dependency relationships;
 - SPDX 2.x JSON SBOMs, detected by their `spdxVersion` key;
-- ZIP and TAR artifacts containing supported dependency files;
+- ZIP and TAR artifacts (including gzip- and zstd-compressed tarballs) containing supported dependency files;
 - OCI image-layout directories;
 - OCI or Docker image TAR files; and
 - CycloneDX or SPDX 2.x JSON from standard input for `scan sbom` and `scan auto`.
@@ -593,7 +593,7 @@ legacy severity-only `--fail-on` interface.
 | CycloneDX | JSON SBOM with versioned purls | Nested and declared dependency edges, scope, provenance |
 | SPDX | 2.x JSON detected by `spdxVersion` | Packages, checksums, declared `DEPENDS_ON` relationships |
 | OCI/Docker | OCI layout or OCI/Docker TAR | Layer application with whiteouts, digest validation, supported lockfiles from final filesystem |
-| Generic artifact | `.zip` or `.tar` | Supported lockfiles discovered in the bounded archive |
+| Generic artifact | `.zip`, `.tar`, `.tar.gz`, `.tgz`, or `.tar.zst` | Supported lockfiles discovered in the bounded archive |
 
 Any existing non-symlink directory is treated as a project unless both OCI
 layout markers (`oci-layout` and `index.json`) are present. Recognized lockfiles

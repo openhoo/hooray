@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component as PathComponent, Path, PathBuf};
 
 use crate::config::Config;
 use crate::input::{InputError, malformed_msg, normalize_relative, read_limited};
@@ -58,7 +58,7 @@ pub(crate) fn read_tar_file(
     config: &Config,
 ) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
     read_tar(
-        Cursor::new(read_limited(path, config.max_input_bytes)?),
+        decompress_archive(Cursor::new(read_limited(path, config.max_input_bytes)?))?,
         config,
     )
 }
@@ -66,6 +66,64 @@ pub(crate) fn read_tar_file(
 fn read_tar<R: Read>(reader: R, config: &Config) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
     let mut expanded = 0;
     read_tar_with_expanded(reader, config, &mut expanded)
+}
+
+/// Wraps an archive byte stream in the decompressor its leading magic bytes
+/// declare (gzip `1f 8b`, zstd `28 b5 2f fd`); anything else passes through
+/// as a plain tar. The peeked prefix is chained back so no input bytes are
+/// lost, and decompressed bytes still count against `max_archive_bytes`
+/// inside the tar reader.
+pub(crate) fn decompress_archive<'a, R: Read + 'a>(
+    mut reader: R,
+) -> Result<Box<dyn Read + 'a>, InputError> {
+    const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+    let mut prefix = Vec::with_capacity(ZSTD_MAGIC.len());
+    reader
+        .by_ref()
+        .take(ZSTD_MAGIC.len() as u64)
+        .read_to_end(&mut prefix)
+        .map_err(|source| InputError::Io {
+            path: PathBuf::from("<archive>"),
+            source,
+        })?;
+    let gzip = prefix.starts_with(&GZIP_MAGIC);
+    let zstd = prefix.starts_with(&ZSTD_MAGIC);
+    let stream = Cursor::new(prefix).chain(reader);
+    if gzip {
+        Ok(Box::new(flate2::read::MultiGzDecoder::new(stream)))
+    } else if zstd {
+        zstd::stream::read::Decoder::new(stream)
+            .map(|decoder| Box::new(decoder) as Box<dyn Read>)
+            .map_err(|source| InputError::Io {
+                path: PathBuf::from("<archive>"),
+                source,
+            })
+    } else {
+        Ok(Box::new(stream))
+    }
+}
+
+/// Normalizes a tar entry path for the traversal and link checks. Entries
+/// whose path is only `.` segments (`./`, `.`, `./.`) name the archive root
+/// itself — GNU tar emits `./` for every `tar -cf out.tar -C dir .` — and
+/// carry no addressable content, so they yield `None` and are skipped like
+/// other non-file entries. Genuine traversal (`../x`) still fails closed in
+/// `normalize_relative`.
+pub(crate) fn tar_entry_path<R: Read>(
+    entry: &tar::Entry<'_, R>,
+) -> Result<Option<String>, InputError> {
+    let path = entry.path().map_err(|source| InputError::Io {
+        path: PathBuf::from("<tar>"),
+        source,
+    })?;
+    if path
+        .components()
+        .all(|component| matches!(component, PathComponent::CurDir))
+    {
+        return Ok(None);
+    }
+    normalize_relative(&path).map(Some)
 }
 
 pub(crate) fn read_tar_with_expanded<R: Read>(
@@ -91,10 +149,9 @@ pub(crate) fn read_tar_with_expanded<R: Read>(
             path: PathBuf::from("<tar>"),
             source,
         })?;
-        let path = normalize_relative(&entry.path().map_err(|source| InputError::Io {
-            path: PathBuf::from("<tar>"),
-            source,
-        })?)?;
+        let Some(path) = tar_entry_path(&entry)? else {
+            continue;
+        };
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(InputError::ArchiveLink(path));
@@ -155,6 +212,7 @@ pub(crate) fn read_entry_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     use crate::input::{config, scan_path, tar_bytes, write_tar};
@@ -181,6 +239,92 @@ mod tests {
             read_zip(Cursor::new(bytes), &config()),
             Err(InputError::PathTraversal(_))
         ));
+    }
+    #[test]
+    fn skips_curdir_root_entries_and_still_rejects_traversal() {
+        // `tar -cf out.tar -C dir .` emits a `./` root directory entry and
+        // `./`-prefixed members; both must scan like the unprefixed tar (#67).
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_cksum();
+            builder.append_data(&mut header, "./", io::empty()).unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(6);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "./requirements.txt", &b"a==1\n\n"[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let files = read_tar(Cursor::new(bytes), &config()).unwrap();
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["requirements.txt"]);
+        // A genuine traversal entry still fails closed; the tar builder
+        // rejects `..` in set_path, so the name is written into the raw
+        // GNU header field instead.
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.as_gnu_mut().unwrap().name[..7].copy_from_slice(b"../evil");
+            header.set_size(1);
+            header.set_cksum();
+            builder.append(&header, &b"x"[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        assert!(matches!(
+            read_tar(Cursor::new(bytes), &config()),
+            Err(InputError::PathTraversal(_))
+        ));
+    }
+    #[test]
+    fn reads_gzip_and_zstd_compressed_tars_within_bounds() {
+        let tar = tar_bytes(&[("requirements.txt", b"a==1\n")]);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar).unwrap();
+        let gzipped = encoder.finish().unwrap();
+        let zstded = zstd::stream::encode_all(&tar[..], 3).unwrap();
+        for compressed in [gzipped, zstded] {
+            let files = read_tar(
+                decompress_archive(Cursor::new(compressed)).unwrap(),
+                &config(),
+            )
+            .unwrap();
+            assert_eq!(files.keys().collect::<Vec<_>>(), ["requirements.txt"]);
+        }
+
+        // A gzip bomb fails closed against the expanded-size bound.
+        let fat_tar = tar_bytes(&[("big.bin", &[0u8; 4096])]);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&fat_tar).unwrap();
+        let bomb = encoder.finish().unwrap();
+        let mut tiny = config();
+        tiny.max_archive_bytes = 8;
+        assert!(matches!(
+            read_tar(decompress_archive(Cursor::new(bomb)).unwrap(), &tiny),
+            Err(InputError::ArchiveTooLarge { .. })
+        ));
+    }
+    #[test]
+    fn scan_path_accepts_compressed_tar_suffixes() {
+        let dir = tempdir().unwrap();
+        let tar = tar_bytes(&[("requirements.txt", b"safe==1\n")]);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar).unwrap();
+        let gzipped = encoder.finish().unwrap();
+        for name in ["project.tar.gz", "project.tgz"] {
+            let path = dir.path().join(name);
+            fs::write(&path, &gzipped).unwrap();
+            let inventory = scan_path(&path, &config()).unwrap();
+            assert!(inventory.components.values().any(|c| c.name == "safe"));
+        }
+        let path = dir.path().join("project.tar.zst");
+        fs::write(&path, zstd::stream::encode_all(&tar[..], 3).unwrap()).unwrap();
+        let inventory = scan_path(&path, &config()).unwrap();
+        assert!(inventory.components.values().any(|c| c.name == "safe"));
     }
     #[test]
     fn rejects_tar_links_and_expansion_limit() {
