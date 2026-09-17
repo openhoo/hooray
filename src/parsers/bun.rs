@@ -19,6 +19,8 @@ struct BunLock {
 struct BunWorkspace {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 /// Text `bun.lock` ingestion. The file is JSONC (comments and trailing
@@ -78,12 +80,11 @@ pub(crate) fn parse_bun_lock(
             }
         }
     }
-    if let Some(name) = lock
-        .workspaces
-        .get("")
-        .and_then(|workspace| workspace.name.clone())
-    {
-        out.asset.name = name;
+    if let Some(workspace) = lock.workspaces.get("") {
+        // Root-anchored identity: the builder applies this claim only when no
+        // shallower lockfile already claimed the field, so a nested bun.lock
+        // contributes packages but never overrides root identity.
+        out.claim_asset_identity(path, workspace.name.clone(), workspace.version.clone());
     }
     Ok(())
 }
@@ -267,5 +268,39 @@ mod tests {
         .unwrap();
         let inventory = scan_path(dir.path(), &config()).unwrap();
         assert!(inventory.components.is_empty());
+    }
+
+    #[test]
+    fn nested_bun_lock_does_not_override_root_asset_identity() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{"name":"axios","version":"1.20.0","packages":{"":{"name":"axios","version":"1.20.0"}}}"#,
+        )
+        .unwrap();
+        let nested = dir.path().join("tests/smoke/bun");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("bun.lock"),
+            r#"{"workspaces":{"":{"name":"@axios/bun-smoke-tests"}},"packages":{}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.name, "axios");
+        assert_eq!(inventory.asset.version.as_deref(), Some("1.20.0"));
+    }
+
+    #[test]
+    fn bun_lock_workspace_name_wins_without_shallower_identity() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("packages/app");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("bun.lock"),
+            r#"{"workspaces":{"":{"name":"nested-app"}},"packages":{}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.name, "nested-app");
     }
 }
