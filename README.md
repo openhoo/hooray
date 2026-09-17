@@ -583,7 +583,9 @@ legacy severity-only `--fail-on` interface.
 | Python Poetry | `poetry.lock` | Locked PyPI packages, PyPI purls |
 | Python Pipenv | `Pipfile.lock` | Pinned default/develop packages, PyPI purls |
 | Ruby | `Gemfile.lock` | `GEM`/`GIT`/`PATH`-section specs with nested dependency edges, gem purls |
-| Go | `go.mod` requirements | Module/version entries, Go purls |
+| Go | `go.mod` requirements | Module/version entries plus a `pkg:golang/stdlib` toolchain component from the `go`/`toolchain` directive, Go purls |
+| Maven | `pom.xml` | Direct dependencies; versions resolve via `<properties>`, `<dependencyManagement>`, and in-tree `<parent>` POMs; unresolvable versions skipped, Maven purls |
+| Gradle | `*.lockfile` (Gradle 7+ lock format) | Locked `group:artifact:version` entries with configuration-derived scope, Maven purls |
 | Swift | `Package.resolved` v1 or v2 | Pinned identities and versions, Swift purls |
 | Dart | `pubspec.lock` | Locked pub packages, pub purls |
 | CocoaPods | `Podfile.lock` | Pod entries with nested dependency edges, CocoaPods purls |
@@ -764,10 +766,10 @@ overlap rather than identity:
   rather than resolved-version-level.
 - Formats without dependency edges (`requirements.txt`, `go.mod`,
   `Pipfile.lock`, `Package.resolved`, `pubspec.lock`, `composer.json`,
-  `environment.yml`, `Chart.yaml`) classify all components as disconnected;
-  `Gemfile.lock` and `Podfile.lock` emit edges but no declared roots, so
-  direct/transitive parity is comparable only for npm, Yarn, pnpm, Poetry,
-  Cargo, and NuGet cases.
+  `environment.yml`, `Chart.yaml`, `pom.xml`, `*.lockfile`) classify
+  all components as disconnected; `Gemfile.lock` and `Podfile.lock` emit
+  edges but no declared roots, so direct/transitive parity is comparable
+  only for npm, Yarn, pnpm, Poetry, Cargo, and NuGet cases.
 - Hooray derives severity as bucketed labels from OSV while Xray exposes
   numeric CVSS scores; severity agreement compares label buckets only.
 - Vulnerability sets can never be identical because OSV and Xray curate
