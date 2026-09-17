@@ -29,11 +29,13 @@ use self::parsers::{
     conda::parse_conda_environment,
     dart::parse_pubspec_lock,
     go::parse_go_mod,
-    helm::parse_chart_yaml,
+    helm::{parse_chart_lock, parse_chart_yaml},
     image::{scan_oci_layout, scan_oci_tar},
     npm::parse_package_lock,
-    nuget::parse_nuget_lock,
-    php::parse_composer_json,
+    nuget::{
+        parse_csproj, parse_directory_packages_props, parse_nuget_lock, parse_packages_config,
+    },
+    php::{parse_composer_json, parse_composer_lock},
     pnpm::parse_pnpm_lock,
     python::{parse_pipfile_lock, parse_poetry_lock, parse_requirements},
     ruby::{parse_gemfile_lock, parse_podfile_lock},
@@ -246,41 +248,96 @@ fn scan_directory(root: &Path, config: &Config) -> Result<Inventory, InputError>
 
 type LockfileParser = fn(&str, &[u8], &mut InventoryBuilder) -> Result<(), InputError>;
 
+type ManifestParser =
+    fn(&str, &[u8], Option<&Vec<u8>>, &mut InventoryBuilder) -> Result<(), InputError>;
+
+/// How a recognized inventory file is dispatched.
+enum LockfileRoute {
+    /// Plain lockfile parser.
+    Lock(LockfileParser),
+    /// `Cargo.lock`, which additionally consumes the sibling `Cargo.toml`
+    /// manifest for license inheritance.
+    CargoLock,
+    /// Manifest whose dependency declarations are superseded by a sibling
+    /// lockfile (`composer.json`/`composer.lock`, `Chart.yaml`/`Chart.lock`).
+    Manifest {
+        parse: ManifestParser,
+        lock_name: &'static str,
+    },
+}
+
 /// Single registry of recognized ecosystem lockfiles. Virtual-file dispatch,
 /// directory inventory detection, and project-manifest detection all derive
 /// from this table so the filename set cannot drift between them.
-/// `Cargo.lock` carries `None` because it additionally consumes the sibling
-/// `Cargo.toml` manifest for license inheritance.
-const LOCKFILES: &[(&str, Option<LockfileParser>)] = &[
-    ("Cargo.lock", None),
-    ("package-lock.json", Some(parse_package_lock)),
-    ("requirements.txt", Some(parse_requirements)),
-    ("go.mod", Some(parse_go_mod)),
-    ("packages.lock.json", Some(parse_nuget_lock)),
-    ("yarn.lock", Some(parse_yarn_lock)),
-    ("pnpm-lock.yaml", Some(parse_pnpm_lock)),
-    ("bun.lock", Some(parse_bun_lock)),
-    ("poetry.lock", Some(parse_poetry_lock)),
-    ("Pipfile.lock", Some(parse_pipfile_lock)),
-    ("Gemfile.lock", Some(parse_gemfile_lock)),
-    ("Package.resolved", Some(parse_package_resolved)),
-    ("pubspec.lock", Some(parse_pubspec_lock)),
-    ("Podfile.lock", Some(parse_podfile_lock)),
-    ("composer.json", Some(parse_composer_json)),
-    ("environment.yml", Some(parse_conda_environment)),
-    ("Chart.yaml", Some(parse_chart_yaml)),
+const LOCKFILES: &[(&str, LockfileRoute)] = &[
+    ("Cargo.lock", LockfileRoute::CargoLock),
+    ("package-lock.json", LockfileRoute::Lock(parse_package_lock)),
+    ("requirements.txt", LockfileRoute::Lock(parse_requirements)),
+    ("go.mod", LockfileRoute::Lock(parse_go_mod)),
+    ("packages.lock.json", LockfileRoute::Lock(parse_nuget_lock)),
+    ("yarn.lock", LockfileRoute::Lock(parse_yarn_lock)),
+    ("pnpm-lock.yaml", LockfileRoute::Lock(parse_pnpm_lock)),
+    ("bun.lock", LockfileRoute::Lock(parse_bun_lock)),
+    ("poetry.lock", LockfileRoute::Lock(parse_poetry_lock)),
+    ("Pipfile.lock", LockfileRoute::Lock(parse_pipfile_lock)),
+    ("Gemfile.lock", LockfileRoute::Lock(parse_gemfile_lock)),
+    (
+        "Package.resolved",
+        LockfileRoute::Lock(parse_package_resolved),
+    ),
+    ("pubspec.lock", LockfileRoute::Lock(parse_pubspec_lock)),
+    ("Podfile.lock", LockfileRoute::Lock(parse_podfile_lock)),
+    (
+        "composer.json",
+        LockfileRoute::Manifest {
+            parse: parse_composer_json,
+            lock_name: "composer.lock",
+        },
+    ),
+    ("composer.lock", LockfileRoute::Lock(parse_composer_lock)),
+    (
+        "environment.yml",
+        LockfileRoute::Lock(parse_conda_environment),
+    ),
+    (
+        "Chart.yaml",
+        LockfileRoute::Manifest {
+            parse: parse_chart_yaml,
+            lock_name: "Chart.lock",
+        },
+    ),
+    ("Chart.lock", LockfileRoute::Lock(parse_chart_lock)),
+    (
+        "Directory.Packages.props",
+        LockfileRoute::Lock(parse_directory_packages_props),
+    ),
+    (
+        "packages.config",
+        LockfileRoute::Lock(parse_packages_config),
+    ),
 ];
 
 /// Repository files collected as inventory inputs that have no dedicated
 /// parser of their own.
 const MANIFEST_SIDECARS: &[&str] = &["Cargo.toml", "go.sum"];
 
-fn lockfile_parser(name: &str) -> Option<Option<LockfileParser>> {
-    LOCKFILES
+/// Resolves an inventory file to its route. Most lockfiles match by exact
+/// base name; MSBuild project files are recognized by their `.csproj`
+/// extension because the project name is part of the filename.
+fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
+    if let Some(route) = LOCKFILES
         .iter()
         .find(|(candidate, _)| *candidate == name)
-        .map(|(_, parser)| *parser)
+        .map(|(_, route)| route)
+    {
+        return Some(route);
+    }
+    name.ends_with(".csproj").then_some(&CS_PROJ_ROUTE)
 }
+
+/// Route for `*.csproj` files, stored as a static so `lockfile_route` can
+/// return a shared reference.
+static CS_PROJ_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_csproj);
 
 fn scan_virtual_files(
     locator: &Path,
@@ -291,18 +348,25 @@ fn scan_virtual_files(
     let mut builder = InventoryBuilder::new(asset_id, locator, kind);
     let mut recognized = false;
     for (path, bytes) in &files {
-        if let Some(parser) = lockfile_parser(base_name(path)) {
-            match parser {
-                Some(parse) => parse(path, bytes, &mut builder)?,
-                None => parse_cargo_lock(
-                    path,
-                    bytes,
-                    files.get(&sibling(path, "Cargo.toml")),
-                    &mut builder,
-                )?,
-            }
-            recognized = true;
+        let Some(route) = lockfile_route(base_name(path)) else {
+            continue;
+        };
+        match route {
+            LockfileRoute::Lock(parse) => parse(path, bytes, &mut builder)?,
+            LockfileRoute::CargoLock => parse_cargo_lock(
+                path,
+                bytes,
+                files.get(&sibling(path, "Cargo.toml")),
+                &mut builder,
+            )?,
+            LockfileRoute::Manifest { parse, lock_name } => parse(
+                path,
+                bytes,
+                files.get(&sibling(path, lock_name)),
+                &mut builder,
+            )?,
         }
+        recognized = true;
     }
     if !recognized && kind != AssetKind::Repository {
         return Err(InputError::UnsupportedFormat(locator.to_owned()));
@@ -517,9 +581,9 @@ fn tar_is_image<R: Read>(reader: R, config: &Config) -> Result<bool, InputError>
 }
 
 fn is_inventory_file(path: &Path) -> bool {
-    path.file_name().and_then(|v| v.to_str()).is_some_and(|v| {
-        MANIFEST_SIDECARS.contains(&v) || LOCKFILES.iter().any(|(name, _)| *name == v)
-    })
+    path.file_name()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| lockfile_route(v).is_some() || MANIFEST_SIDECARS.contains(&v))
 }
 /// Decides image classification from archive markers. Only an array-shaped
 /// `manifest.json` marks a docker-save archive; object-shaped manifests are
@@ -768,7 +832,11 @@ fn stable_asset(locator: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<Ass
 fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{}", crate::util::sha256_hex(bytes))
 }
+/// Decodes bytes as UTF-8, tolerating a leading byte-order mark (real-world
+/// YAML/XML/JSON files — including Helm's own `frobnitz_with_bom` testdata —
+/// are BOM-prefixed) and failing closed on any other invalid sequence.
 fn utf8<'a>(bytes: &'a [u8], path: &str, format: &'static str) -> Result<&'a str, InputError> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     std::str::from_utf8(bytes).map_err(|e| malformed(path, format, e))
 }
 fn malformed(
@@ -1085,6 +1153,11 @@ mod tests {
             "pubspec.lock" => "packages: {}\n",
             "Podfile.lock" => "PODS:\n  - A (1)\n",
             "composer.json" => "{}",
+            "composer.lock" => r#"{"packages":[]}"#,
+            "Directory.Packages.props" => "<Project/>",
+            "packages.config" => "<packages/>",
+            "App.csproj" => "<Project/>",
+            "Chart.lock" => "dependencies: []\n",
             "environment.yml" => "dependencies: []\n",
             _ => "apiVersion: v2\n",
         }
@@ -1105,6 +1178,11 @@ mod tests {
             "composer.json",
             "environment.yml",
             "Chart.yaml",
+            "composer.lock",
+            "Chart.lock",
+            "Directory.Packages.props",
+            "packages.config",
+            "App.csproj",
         ] {
             let dir = tempdir().unwrap();
             fs::write(dir.path().join(name), new_ecosystem_fixture(name)).unwrap();
@@ -1360,6 +1438,15 @@ mod tests {
             ("composer.json", "[1]", "composer.json"),
             ("environment.yml", "dependencies: 42\n", "environment.yml"),
             ("Chart.yaml", "dependencies: [unclosed\n", "Chart.yaml"),
+            ("composer.lock", "{}", "composer.lock"),
+            ("Chart.lock", "digest: sha256:abc\n", "Chart.lock"),
+            (
+                "Directory.Packages.props",
+                "<Project>",
+                "Directory.Packages.props",
+            ),
+            ("packages.config", "<packages>", "packages.config"),
+            ("App.csproj", "<Project", "csproj"),
         ];
         for (name, contents, expected_format) in cases {
             let dir = tempdir().unwrap();
