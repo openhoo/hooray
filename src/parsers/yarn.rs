@@ -216,10 +216,10 @@ fn yarn_name<'a>(path: &str, descriptor: &'a str) -> Result<&'a str, InputError>
 }
 
 fn yarn_berry_descriptor(descriptor: &str) -> String {
-    if let Some((name, locator)) = split_descriptor(descriptor) {
-        if let Some(locator) = locator.strip_prefix("npm:") {
-            return format!("{name}@{locator}");
-        }
+    if let Some((name, locator)) = split_descriptor(descriptor)
+        && let Some(locator) = locator.strip_prefix("npm:")
+    {
+        return format!("{name}@{locator}");
     }
     descriptor.to_owned()
 }
@@ -293,14 +293,14 @@ fn add_yarn_entries(
             BTreeSet::new(),
         )?;
         for descriptor in &entry.descriptors {
-            if let Some(previous) = ids.insert(descriptor, id.clone()) {
-                if previous != id {
-                    return Err(malformed_msg(
-                        path,
-                        "yarn.lock",
-                        format!("conflicting descriptor {descriptor:?}"),
-                    ));
-                }
+            if let Some(previous) = ids.insert(descriptor, id.clone())
+                && previous != id
+            {
+                return Err(malformed_msg(
+                    path,
+                    "yarn.lock",
+                    format!("conflicting descriptor {descriptor:?}"),
+                ));
             }
         }
         resolved.push(id);
