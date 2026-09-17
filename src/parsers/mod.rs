@@ -9,6 +9,7 @@ pub(crate) mod dart;
 pub(crate) mod elixir;
 pub(crate) mod go;
 pub(crate) mod gradle;
+pub(crate) mod gradle_catalog;
 pub(crate) mod haskell;
 pub(crate) mod helm;
 pub(crate) mod image;
