@@ -30,6 +30,7 @@ use self::parsers::{
     cargo::parse_cargo_lock,
     conda::parse_conda_environment,
     dart::parse_pubspec_lock,
+    elixir::parse_mix_lock,
     go::parse_go_mod,
     gradle::parse_gradle_lockfile,
     helm::{parse_chart_lock, parse_chart_yaml},
@@ -300,6 +301,7 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
     ("poetry.lock", LockfileRoute::Lock(parse_poetry_lock)),
     ("Pipfile.lock", LockfileRoute::Lock(parse_pipfile_lock)),
     ("Gemfile.lock", LockfileRoute::Lock(parse_gemfile_lock)),
+    ("mix.lock", LockfileRoute::Lock(parse_mix_lock)),
     (
         "Package.resolved",
         LockfileRoute::Lock(parse_package_resolved),

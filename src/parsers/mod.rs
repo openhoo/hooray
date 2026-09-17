@@ -6,6 +6,7 @@ pub(crate) mod bun;
 pub(crate) mod cargo;
 pub(crate) mod conda;
 pub(crate) mod dart;
+pub(crate) mod elixir;
 pub(crate) mod go;
 pub(crate) mod gradle;
 pub(crate) mod helm;
