@@ -479,7 +479,12 @@ impl InventoryBuilder {
             .and_modify(|component| {
                 component.provenance.insert(source.clone());
                 component.licenses.extend(licenses.clone());
-                if component.scope == Scope::Unknown {
+                // Cross-file scope merge: when the same component is declared
+                // under different scopes by different lockfiles, keep the
+                // most-exposed scope rather than whichever file parsed first
+                // — a `default`/`runtime` declaration must never be downgraded
+                // by a `develop`/`test` one that sorted earlier.
+                if scope_exposure(scope) > scope_exposure(component.scope) {
                     component.scope = scope;
                 }
             })
@@ -516,6 +521,22 @@ impl InventoryBuilder {
         };
         inventory.validate()?;
         Ok(inventory)
+    }
+}
+
+/// Exposure rank for cross-file scope merges in
+/// `InventoryBuilder::add_with_purl`: mirrors the risk model's ordering
+/// (runtime > build > optional > development > test) with `Unknown` ranked
+/// lowest — it carries no information and is always overwritten by a
+/// declared scope.
+fn scope_exposure(scope: Scope) -> u8 {
+    match scope {
+        Scope::Runtime => 5,
+        Scope::Build => 4,
+        Scope::Optional => 3,
+        Scope::Development => 2,
+        Scope::Test => 1,
+        Scope::Unknown => 0,
     }
 }
 
@@ -1073,7 +1094,7 @@ mod tests {
         let cases = [
             ("Cargo.lock", "not = [toml", "Cargo.lock"),
             ("package-lock.json", "{", "package-lock.json"),
-            ("requirements.txt", "unpinned>=1\n", "requirements.txt"),
+            ("requirements.txt", "==1.0\n", "requirements.txt"),
             ("go.mod", "require (\nmodule version\n", "go.mod"),
             ("packages.lock.json", "{}", "packages.lock.json"),
         ];
@@ -1341,6 +1362,155 @@ mod tests {
     }
 
     #[test]
+    fn gemfile_lock_nested_dependencies_become_edges_not_components() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Gemfile.lock"),
+            concat!(
+                "GEM\n",
+                "  remote: https://rubygems.org/\n",
+                "  specs:\n",
+                "    aws-sdk-core (3.241.4)\n",
+                "      base64\n",
+                "      jmespath (~> 1, >= 1.6.1)\n",
+                "    base64 (0.3.0)\n",
+                "    jmespath (1.6.2)\n",
+                "\n",
+                "PATH\n",
+                "  remote: .\n",
+                "  specs:\n",
+                "    fastlane (2.228.0)\n",
+                "\n",
+                "PLATFORMS\n",
+                "  ruby\n",
+                "\n",
+                "DEPENDENCIES\n",
+                "  aws-sdk-core\n",
+                "  fastlane!\n",
+                "\n",
+                "BUNDLED WITH\n",
+                "   2.6.9\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let version_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.version.clone())
+        };
+        assert_eq!(version_of("aws-sdk-core").as_deref(), Some("3.241.4"));
+        assert_eq!(version_of("base64").as_deref(), Some("0.3.0"));
+        assert_eq!(version_of("jmespath").as_deref(), Some("1.6.2"));
+        // PATH-sourced gems are real components.
+        assert_eq!(version_of("fastlane").as_deref(), Some("2.228.0"));
+        // Nested dep lines never become components or phantom versions.
+        assert_eq!(inventory.components.len(), 4);
+        assert!(
+            inventory
+                .components
+                .values()
+                .all(|c| !c.version.contains('~') && !c.version.contains('>'))
+        );
+        // Nested deps resolve to edges against the locked specs.
+        let name_of = |id: &ComponentId| inventory.components[id].name.as_str();
+        assert!(
+            inventory
+                .dependencies
+                .iter()
+                .any(|e| { name_of(&e.from) == "aws-sdk-core" && name_of(&e.to) == "base64" })
+        );
+        assert!(
+            inventory
+                .dependencies
+                .iter()
+                .any(|e| { name_of(&e.from) == "aws-sdk-core" && name_of(&e.to) == "jmespath" })
+        );
+        assert_eq!(inventory.dependencies.len(), 2);
+    }
+
+    #[test]
+    fn podfile_lock_nested_dependencies_become_edges_not_components() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Podfile.lock"),
+            concat!(
+                "PODS:\n",
+                "  - libwebp (1.5.0):\n",
+                "    - libwebp/webp (= 1.5.0)\n",
+                "  - libwebp/demux (1.5.0):\n",
+                "    - libwebp/webp\n",
+                "  - libwebp/webp (1.5.0)\n",
+                "  - SDWebImageWebPCoder (0.14.6):\n",
+                "    - libwebp (~> 1.0)\n",
+                "\n",
+                "DEPENDENCIES:\n",
+                "  - libwebp\n",
+                "  - SDWebImageWebPCoder\n",
+                "\n",
+                "COCOAPODS: 1.15.2\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        // Subspecs collapse to the parent pod; nested deps add no components.
+        assert_eq!(inventory.components.len(), 2);
+        let version_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.version.clone())
+        };
+        // Parent specs with children keep a clean version (no trailing `):`).
+        assert_eq!(version_of("libwebp").as_deref(), Some("1.5.0"));
+        assert_eq!(version_of("SDWebImageWebPCoder").as_deref(), Some("0.14.6"));
+        let name_of = |id: &ComponentId| inventory.components[id].name.as_str();
+        assert!(
+            inventory.dependencies.iter().any(|e| {
+                name_of(&e.from) == "SDWebImageWebPCoder" && name_of(&e.to) == "libwebp"
+            })
+        );
+        // `libwebp` -> `libwebp` self-edges collapse; only the cross-pod
+        // edge remains.
+        assert_eq!(inventory.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn cross_file_scope_merge_prefers_runtime_over_development() {
+        // The same purl declared `develop` in the root lockfile and
+        // `default` in a nested one must resolve to runtime regardless of
+        // lexical walk order.
+        for nested_dir in ["aaa", "zzz"] {
+            let dir = tempdir().unwrap();
+            fs::write(
+                dir.path().join("Pipfile.lock"),
+                r#"{"_meta":{"requires":{}},"default":{},"develop":{"idna":{"version":"==3.15","hashes":["sha256:aaa"]}}}"#,
+            )
+            .unwrap();
+            let sub = dir.path().join(nested_dir);
+            fs::create_dir(&sub).unwrap();
+            fs::write(
+                sub.join("Pipfile.lock"),
+                r#"{"_meta":{"requires":{}},"default":{"idna":{"version":"==3.15","hashes":["sha256:bbb"]}},"develop":{}}"#,
+            )
+            .unwrap();
+            let inventory = scan_path(dir.path(), &config()).unwrap();
+            assert_eq!(inventory.components.len(), 1);
+            let component = inventory.components.values().next().unwrap();
+            assert_eq!(component.purl, "pkg:pypi/idna@3.15");
+            assert_eq!(
+                component.scope,
+                Scope::Runtime,
+                "nested dir {nested_dir}: runtime declaration must win over develop"
+            );
+            assert_eq!(component.provenance.len(), 2);
+        }
+    }
+
+    #[test]
     fn scans_composer_conda_and_chart_inputs() {
         let dir = tempdir().unwrap();
         fs::write(
@@ -1393,9 +1563,21 @@ mod tests {
         };
         assert_eq!(version_of("python").as_deref(), Some("3.11"));
         assert_eq!(version_of("numpy").as_deref(), Some("1.24.*"));
-        assert_eq!(version_of("pytorch").as_deref(), Some("2.0"));
+        assert_eq!(version_of("pytorch").as_deref(), Some(">=2.0,<3"));
+        assert_eq!(version_of("pip").as_deref(), Some("*"));
         assert_eq!(version_of("requests").as_deref(), Some("2.31.0"));
-        assert_eq!(inventory.components.len(), 4);
+        assert_eq!(inventory.components.len(), 5);
+        let purl_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.purl.clone())
+        };
+        assert_eq!(purl_of("python").as_deref(), Some("pkg:conda/python@3.11"));
+        assert_eq!(purl_of("numpy").as_deref(), Some("pkg:conda/numpy"));
+        assert_eq!(purl_of("pytorch").as_deref(), Some("pkg:conda/pytorch"));
+        assert_eq!(purl_of("pip").as_deref(), Some("pkg:conda/pip"));
 
         let chart = tempdir().unwrap();
         fs::write(

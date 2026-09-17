@@ -69,9 +69,9 @@
       "kind": "project-directory",
       "description": "Gemfile.lock GEM/specs with rails 6.0.0 (CVE-2022-21831 era), nokogiri 1.10.10 and a consistent actionpack/activesupport/railties/rack graph.",
       "expected_ecosystems": ["gem"],
-      "min_components": 17,
+      "min_components": 9,
       "directness_comparable": false,
-      "notes": "hooray emits both specs entries and their referenced dependency rows as components (hence 17); ecosystem string is 'gem'."
+      "notes": "hooray emits the 9 GEM specs entries as components; nested dependency rows become edges, never components; ecosystem string is 'gem'."
     },
     {
       "case_id": "swift-package-resolved",
@@ -96,9 +96,9 @@
       "kind": "project-directory",
       "description": "Podfile.lock PODS/DEPENDENCIES/SPEC CHECKSUMS sections with AFNetworking 3.2.1 and SDWebImage 4.4.8 -> FLAnimatedImage 1.2.0.",
       "expected_ecosystems": ["cocoapods"],
-      "min_components": 4,
+      "min_components": 3,
       "directness_comparable": false,
-      "notes": "Ecosystem string is 'cocoapods'."
+      "notes": "Nested dep rows become edges, not components; ecosystem string is 'cocoapods'."
     },
     {
       "case_id": "composer-json-basic",

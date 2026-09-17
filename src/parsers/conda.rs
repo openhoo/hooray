@@ -49,15 +49,20 @@ fn add_conda_spec(path: &str, spec: &str, out: &mut InventoryBuilder) -> Result<
     if name.is_empty() {
         return Ok(());
     }
-    let version = spec[name_end..]
-        .trim_start_matches(|c: char| "=<>!~ ".contains(c))
-        .split([',', ';', ' ', '\t'])
-        .next()
-        .unwrap_or_default();
-    // Versionless specs such as `- pip` are valid environment.yml content
-    // hooray cannot pin to a version, so they remain a deliberate lenient
-    // skip; only specs yielding both a name and a version reach `out.add`
-    // below.
+    // Conda matchspecs pin with `=`/`==`; everything else (`>=2,<3`, `1.24.*`,
+    // bare names) is a constraint, not a resolved version. Recording the raw
+    // constraint text — or `*` when the spec carries none — lets
+    // `concrete_version_specifier` emit a versionless `pkg:conda/<name>` purl
+    // instead of fabricating a floor version (composer.json precedent).
+    let constraint = spec[name_end..].trim();
+    let version = match constraint
+        .strip_prefix("==")
+        .or_else(|| constraint.strip_prefix('='))
+    {
+        Some(pinned) => pinned.trim().to_owned(),
+        None if constraint.is_empty() => "*".to_owned(),
+        None => constraint.to_owned(),
+    };
     if version.is_empty() {
         return Ok(());
     }
@@ -65,7 +70,7 @@ fn add_conda_spec(path: &str, spec: &str, out: &mut InventoryBuilder) -> Result<
     out.add(
         "conda",
         name,
-        version,
+        &version,
         Scope::Runtime,
         path,
         BTreeSet::new(),
@@ -84,5 +89,7 @@ pub(crate) fn clean_pip_requirement(line: &str) -> Option<String> {
         return None;
     }
     let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim();
-    trimmed.contains("==").then(|| trimmed.to_owned())
+    // parse_requirements accepts unpinned and constrained lines, so every
+    // non-option pip line is forwarded verbatim.
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
