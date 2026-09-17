@@ -1,3 +1,4 @@
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed_msg, utf8};
@@ -222,6 +223,20 @@ fn interpolate(value: &str, properties: &BTreeMap<String, String>) -> Option<Str
     (!result.contains("${")).then_some(result)
 }
 
+/// Resource-filtered and mustache templates are not concrete versions, even
+/// when `${...}` interpolation itself succeeds. Match paired delimiters, not
+/// arbitrary punctuation in otherwise valid Maven versions.
+fn resolved_version(value: &str, properties: &BTreeMap<String, String>) -> Option<String> {
+    let value = interpolate(value, properties)?;
+    let filtered = value
+        .find('@')
+        .is_some_and(|start| value[start + 1..].contains('@'));
+    let mustache = value
+        .find("{{")
+        .is_some_and(|start| value[start + 2..].contains("}}"));
+    (!value.is_empty() && !filtered && !mustache).then_some(value)
+}
+
 /// Maps a resolved Maven scope to a dependency scope. `compile`/`runtime`
 /// ship with the artifact; `test` is development-only; `provided`/`system`
 /// are compile-time inputs supplied by the runtime environment (build
@@ -257,7 +272,8 @@ fn dependency_key(dependency: &RawDependency) -> Option<String> {
 /// first), with `${property}` interpolation against merged `<properties>`
 /// (child wins over in-tree parents). Dependencies whose version cannot be
 /// statically resolved — external parents, repository BOM imports — are
-/// skipped rather than inventoried with a fabricated version.
+/// recorded in per-POM asset metadata rather than inventoried with a fabricated
+/// version. Imported BOMs are not followed and are recorded as unresolved sources.
 pub(crate) fn parse_pom_xml(
     path: &str,
     bytes: &[u8],
@@ -355,22 +371,50 @@ pub(crate) fn parse_pom_xml(
     properties.insert("project.artifactId".to_owned(), artifact_id.clone());
     properties.insert("pom.artifactId".to_owned(), artifact_id.clone());
 
+    let asset_version = version
+        .as_deref()
+        .and_then(|value| resolved_version(value, &properties));
+    let unresolved_asset_version = version.as_ref().filter(|_| asset_version.is_none());
     out.claim_asset_identity(
         path,
         Some(match &group_id {
             Some(group) => format!("{group}:{artifact_id}"),
             None => artifact_id.clone(),
         }),
-        version.and_then(|value| interpolate(&value, &properties)),
+        asset_version,
     );
 
+    let mut unresolved = Vec::new();
+    let mut inventoried = 0usize;
+    let mut imported_boms = Vec::new();
+    for dependency in managed.values() {
+        if dependency
+            .scope
+            .as_deref()
+            .and_then(|value| interpolate(value, &properties))
+            .as_deref()
+            == Some("import")
+        {
+            imported_boms.push(json!({
+                "identity": dependency_key(dependency),
+                "declaredVersion": dependency.version,
+                "reason": "imported BOM not followed",
+            }));
+        }
+    }
+
     entry_bound(dependencies.len(), path, FORMAT)?;
-    for dependency in dependencies.values() {
+    for (identity, dependency) in &dependencies {
         let Some(group) = dependency
             .group_id
             .as_deref()
             .and_then(|value| interpolate(value, &properties))
         else {
+            unresolved.push(json!({
+                "identity": identity,
+                "declaredVersion": dependency.version,
+                "reason": "groupId cannot be statically resolved",
+            }));
             continue;
         };
         let Some(artifact) = dependency
@@ -378,6 +422,11 @@ pub(crate) fn parse_pom_xml(
             .as_deref()
             .and_then(|value| interpolate(value, &properties))
         else {
+            unresolved.push(json!({
+                "identity": identity,
+                "declaredVersion": dependency.version,
+                "reason": "artifactId cannot be statically resolved",
+            }));
             continue;
         };
         let managed_entry = managed.get(&format!("{group}:{artifact}"));
@@ -389,18 +438,29 @@ pub(crate) fn parse_pom_xml(
             .or_else(|| managed_entry.and_then(|entry| entry.scope.as_deref()))
             .and_then(|value| interpolate(value, &properties));
         if scope.as_deref() == Some("import") {
+            let diagnostic = json!({
+                "identity": format!("{group}:{artifact}"),
+                "declaredVersion": dependency.version,
+                "reason": "imported BOM not followed",
+            });
+            imported_boms.push(diagnostic.clone());
+            unresolved.push(diagnostic);
             continue;
         }
         // An explicitly declared version wins; otherwise the nearest
-        // dependencyManagement entry supplies it. Either way the version
-        // must resolve statically — an unresolvable `${...}` skips the
-        // dependency instead of fabricating one.
-        let version = dependency
+        // dependencyManagement entry supplies it. Unresolved declarations
+        // remain visible in metadata, never as components sent to OSV.
+        let declared_version = dependency
             .version
             .as_deref()
-            .or_else(|| managed_entry.and_then(|entry| entry.version.as_deref()))
-            .and_then(|value| interpolate(value, &properties));
-        let Some(version) = version.filter(|version| !version.is_empty()) else {
+            .or_else(|| managed_entry.and_then(|entry| entry.version.as_deref()));
+        let Some(version) = declared_version.and_then(|value| resolved_version(value, &properties))
+        else {
+            unresolved.push(json!({
+                "identity": format!("{group}:{artifact}"),
+                "declaredVersion": declared_version,
+                "reason": "version cannot be statically resolved",
+            }));
             continue;
         };
         let optional = dependency
@@ -415,7 +475,26 @@ pub(crate) fn parse_pom_xml(
             path,
             BTreeSet::new(),
         )?;
+        inventoried += 1;
     }
+    let diagnostic = json!({
+        "path": path,
+        // Counts describe effective declarations after parent/child merging,
+        // not globally deduplicated components across the scanned tree.
+        "declared": dependencies.len(),
+        "inventoried": inventoried,
+        "unresolved": unresolved.len(),
+        "unresolvedDependencies": unresolved,
+        "unresolvedManagedSources": imported_boms,
+        "unresolvedAssetVersion": unresolved_asset_version,
+    });
+    out.asset
+        .metadata
+        .entry("maven.poms".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("maven.poms is an array")
+        .push(diagnostic);
     Ok(())
 }
 
@@ -445,6 +524,8 @@ mod tests {
         "      <artifactId>junit-jupiter</artifactId>\n",
         "      <scope>test</scope>\n",
         "    </dependency>\n",
+        "    <dependency><groupId>org.junit-pioneer</groupId><artifactId>junit-pioneer</artifactId><scope>test</scope></dependency>\n",
+        "    <dependency><groupId>org.mockito</groupId><artifactId>mockito-inline</artifactId><scope>test</scope></dependency>\n",
         "    <dependency>\n",
         "      <groupId>org.easymock</groupId>\n",
         "      <artifactId>easymock</artifactId>\n",
@@ -463,6 +544,7 @@ mod tests {
         "      <version>${commons.jmh.version}</version>\n",
         "      <scope>test</scope>\n",
         "    </dependency>\n",
+        "    <dependency><groupId>org.openjdk.jmh</groupId><artifactId>jmh-generator-annprocess</artifactId><version>${commons.jmh.version}</version><scope>test</scope></dependency>\n",
         "  </dependencies>\n",
         "  <properties>\n",
         "    <commons.text.version>1.15.0</commons.text.version>\n",
@@ -491,12 +573,33 @@ mod tests {
             component("org.apache.commons/commons-text").version,
             "1.15.0"
         );
-        // junit-jupiter (parent-managed, parent not in tree) and jmh-core
-        // (unresolvable ${commons.jmh.version}) are skipped, not fabricated.
+        // The external parent cannot supply three managed versions and two
+        // property-interpolated JMH versions. All five remain visible.
         assert_eq!(inventory.components.len(), 2);
         // The project itself is asset identity, never a component.
         assert_eq!(inventory.asset.name, "org.apache.commons:commons-lang3");
         assert_eq!(inventory.asset.version.as_deref(), Some("3.21.0-SNAPSHOT"));
+        let pom = &inventory.asset.metadata["maven.poms"][0];
+        assert_eq!(pom["path"], "pom.xml");
+        assert_eq!(pom["declared"], 7);
+        assert_eq!(pom["inventoried"], 2);
+        assert_eq!(pom["unresolved"], 5);
+        let identities: Vec<_> = pom["unresolvedDependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["identity"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                "org.junit-pioneer:junit-pioneer",
+                "org.junit.jupiter:junit-jupiter",
+                "org.mockito:mockito-inline",
+                "org.openjdk.jmh:jmh-core",
+                "org.openjdk.jmh:jmh-generator-annprocess",
+            ]
+        );
     }
 
     #[test]
@@ -624,6 +727,94 @@ mod tests {
         assert_eq!(
             inventory.components.values().next().unwrap().purl,
             "pkg:maven/com.acme/resolved@4.2"
+        );
+    }
+
+    #[test]
+    fn pom_xml_templates_are_diagnostics_not_component_or_asset_versions() {
+        for template in [
+            "@project.version@",
+            "{{version}}",
+            "${missing}",
+            "1-@revision@",
+            "1-{{revision}}",
+        ] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("pom.xml"), format!(r#"
+                <project><groupId>g</groupId><artifactId>app</artifactId>
+                <version>{template}</version>
+                <properties><filtered>{template}</filtered><literal>5.0.5.RELEASE</literal></properties>
+                <dependencyManagement><dependencies>
+                  <dependency><groupId>g</groupId><artifactId>managed</artifactId><version>${{filtered}}</version></dependency>
+                </dependencies></dependencyManagement>
+                <dependencies>
+                  <dependency><groupId>g</groupId><artifactId>direct</artifactId><version>{template}</version></dependency>
+                  <dependency><groupId>g</groupId><artifactId>managed</artifactId></dependency>
+                  <dependency><groupId>g</groupId><artifactId>resolved</artifactId><version>${{literal}}</version><scope>test</scope></dependency>
+                </dependencies></project>"#)).unwrap();
+            let inventory = scan_path(dir.path(), &config()).unwrap();
+            assert_eq!(inventory.asset.version, None, "{template}");
+            assert_eq!(inventory.components.len(), 1, "{template}");
+            let resolved = inventory.components.values().next().unwrap();
+            assert_eq!(resolved.purl, "pkg:maven/g/resolved@5.0.5.RELEASE");
+            assert_eq!(resolved.scope, Scope::Development);
+            let pom = &inventory.asset.metadata["maven.poms"][0];
+            assert_eq!(pom["declared"], 3);
+            assert_eq!(pom["inventoried"], 1);
+            assert_eq!(pom["unresolved"], 2);
+            assert_eq!(pom["unresolvedAssetVersion"], template);
+            assert_eq!(pom["unresolvedDependencies"][0]["identity"], "g:direct");
+            assert_eq!(pom["unresolvedDependencies"][1]["identity"], "g:managed");
+            // Rejecting a shallow placeholder must leave the identity field
+            // available to a deeper, concrete declarer.
+            fs::create_dir(dir.path().join("child")).unwrap();
+            fs::write(dir.path().join("child/pom.xml"),
+                "<project><artifactId>child</artifactId><properties><release>1.0-SNAPSHOT</release></properties><version>${release}</version></project>").unwrap();
+            let inventory = scan_path(dir.path(), &config()).unwrap();
+            assert_eq!(inventory.asset.version.as_deref(), Some("1.0-SNAPSHOT"));
+        }
+    }
+
+    #[test]
+    fn pom_xml_records_unfollowed_boms_and_preserves_resolved_management() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("pom.xml"), r#"
+            <project><groupId>g</groupId><artifactId>app</artifactId><version>1</version>
+            <properties><bom.scope>import</bom.scope><lib.version>2.1</lib.version></properties>
+            <dependencyManagement><dependencies>
+              <dependency><groupId>g</groupId><artifactId>bom</artifactId><version>[1,2)</version><type>pom</type><scope>${bom.scope}</scope></dependency>
+              <dependency><groupId>g</groupId><artifactId>managed</artifactId><version>${lib.version}</version><scope>provided</scope></dependency>
+            </dependencies></dependencyManagement>
+            <dependencies>
+              <dependency><groupId>g</groupId><artifactId>external</artifactId></dependency>
+              <dependency><groupId>g</groupId><artifactId>managed</artifactId></dependency>
+              <dependency><groupId>g</groupId><artifactId>explicit</artifactId><version>3</version><optional>true</optional></dependency>
+            </dependencies></project>"#).unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 2);
+        let managed = inventory
+            .components
+            .values()
+            .find(|c| c.name == "g/managed")
+            .unwrap();
+        assert_eq!(managed.version, "2.1");
+        assert_eq!(managed.scope, Scope::Build);
+        let explicit = inventory
+            .components
+            .values()
+            .find(|c| c.name == "g/explicit")
+            .unwrap();
+        assert_eq!(explicit.scope, Scope::Optional);
+        let pom = &inventory.asset.metadata["maven.poms"][0];
+        assert_eq!(pom["declared"], 3);
+        assert_eq!(pom["inventoried"], 2);
+        assert_eq!(pom["unresolved"], 1);
+        assert_eq!(pom["unresolvedDependencies"][0]["identity"], "g:external");
+        assert_eq!(pom["unresolvedManagedSources"].as_array().unwrap().len(), 1);
+        assert_eq!(pom["unresolvedManagedSources"][0]["identity"], "g:bom");
+        assert_eq!(
+            pom["unresolvedManagedSources"][0]["declaredVersion"],
+            "[1,2)"
         );
     }
 

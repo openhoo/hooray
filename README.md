@@ -584,7 +584,7 @@ legacy severity-only `--fail-on` interface.
 | Python Pipenv | `Pipfile.lock` | Pinned default/develop packages, PyPI purls |
 | Ruby | `Gemfile.lock` | `GEM`/`GIT`/`PATH`-section specs with nested dependency edges, gem purls |
 | Go | `go.mod` requirements | Module/version entries plus a `pkg:golang/stdlib` toolchain component from the `go`/`toolchain` directive, Go purls |
-| Maven | `pom.xml` | Direct dependencies; versions resolve via `<properties>`, `<dependencyManagement>`, and in-tree `<parent>` POMs; unresolvable versions skipped, Maven purls |
+| Maven | `pom.xml` | Direct dependencies; versions resolve via `<properties>`, `<dependencyManagement>`, and in-tree `<parent>` POMs; unresolvable/template versions excluded from components and asset version claims, with per-POM counts, skipped dependency identities, and unfollowed BOM sources recorded in `asset.metadata["maven.poms"]` (counts describe effective parent/child-merged declarations; no external parent/BOM fetch) |
 | Gradle | `*.lockfile` (Gradle 7+ lock format) | Locked `group:artifact:version` entries with configuration-derived scope, Maven purls |
 | Gradle catalogs | `*.versions.toml` | Declared `[libraries]` coordinates with inline/ref/rich versions (`strictly` > `require` > `prefer`), Maven purls; constraints, dynamic selectors, and versionless declarations stay versionless — not resolved lockfile pins. Scope is unknown; raw declarations and explicitly skipped plugins are recorded in `asset.metadata["gradle.catalogs"]`. Bundles add no components; no Gradle script/accessor, transitive graph, or BOM version resolution |
 | Swift | `Package.resolved` v1 or v2 | Pinned identities and versions, Swift purls |
