@@ -586,6 +586,7 @@ legacy severity-only `--fail-on` interface.
 | Go | `go.mod` requirements | Module/version entries plus a `pkg:golang/stdlib` toolchain component from the `go`/`toolchain` directive, Go purls |
 | Maven | `pom.xml` | Direct dependencies; versions resolve via `<properties>`, `<dependencyManagement>`, and in-tree `<parent>` POMs; unresolvable versions skipped, Maven purls |
 | Gradle | `*.lockfile` (Gradle 7+ lock format) | Locked `group:artifact:version` entries with configuration-derived scope, Maven purls |
+| Gradle catalogs | `*.versions.toml` | Declared `[libraries]` coordinates with inline/ref/rich versions (`strictly` > `require` > `prefer`), Maven purls; constraints, dynamic selectors, and versionless declarations stay versionless — not resolved lockfile pins. Scope is unknown; raw declarations and explicitly skipped plugins are recorded in `asset.metadata["gradle.catalogs"]`. Bundles add no components; no Gradle script/accessor, transitive graph, or BOM version resolution |
 | Swift | `Package.resolved` v1 or v2 | Pinned identities and versions, Swift purls |
 | Dart | `pubspec.lock` | Locked pub packages, pub purls |
 | CocoaPods | `Podfile.lock` | Pod entries with nested dependency edges, CocoaPods purls |
