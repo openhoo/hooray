@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Cursor, Read},
@@ -612,8 +613,9 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
                     };
                     block
                 } else {
-                    matched.as_str()
+                    Cow::Borrowed(matched.as_str())
                 };
+                let value = value.as_ref();
                 let entropy = shannon_entropy(value) * 1000.0;
                 if looks_placeholder(value)
                     || entropy < f64::from(builder.ctx.config.secret_entropy_threshold_milli)
@@ -651,6 +653,7 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
             let entropy = shannon_entropy(value.as_str()) * 1000.0;
             if looks_self_referential(&name, value.as_str())
                 || looks_placeholder(value.as_str())
+                || looks_like_noncredential_assignment(value.as_str())
                 || entropy < f64::from(builder.ctx.config.secret_entropy_threshold_milli)
             {
                 continue;
@@ -673,32 +676,64 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
 /// plausible base64 key material. Placeholder bodies (`<REDACTED…>`, `…`,
 /// `XXXX`, empty) and marker-only fragments return `None` so they never
 /// produce a finding.
-fn pem_block(text: &str, begin_offset: usize) -> Option<&str> {
-    let begin_line_end = text[begin_offset..]
-        .find('\n')
-        .map_or(text.len(), |relative| begin_offset + relative);
-    let body_start = begin_line_end.saturating_add(1).min(text.len());
-    let end_marker = text[body_start..].find("-----END ")?;
-    let end_marker_start = body_start + end_marker;
-    let end_close = text[end_marker_start + "-----END ".len()..].find("-----")?;
-    let block_end = end_marker_start + "-----END ".len() + end_close + "-----".len();
-    plausible_pem_body(&text[body_start..end_marker_start])
-        .then_some(&text[begin_offset..block_end])
+fn pem_block(text: &str, begin_offset: usize) -> Option<Cow<'_, str>> {
+    let block = text.get(begin_offset..)?;
+    let label_start = "-----BEGIN ".len();
+    let label_end = label_start + block.get(label_start..)?.find("-----")?;
+    let body_start = label_end + 5;
+    let end_start = body_start + block[body_start..].find("-----END ")?;
+    let end_label_start = end_start + "-----END ".len();
+    let end_label_end = end_label_start + block[end_label_start..].find("-----")?;
+    if block[label_start..label_end] != block[end_label_start..end_label_end] {
+        return None;
+    }
+    let block = &block[..end_label_end + 5];
+    // Only PEM newline escapes are decoded, not arbitrary host-language escapes.
+    // Ordinary raw PEMs remain borrowed, preserving their existing fingerprints.
+    let normalized = if block.as_bytes().contains(&b'\\') {
+        let mut normalized = String::with_capacity(block.len());
+        let mut chars = block.chars();
+        while let Some(ch) = chars.next() {
+            normalized.push(if ch == '\\' {
+                match chars.next()? {
+                    'n' => '\n',
+                    'r' => '\r',
+                    _ => return None,
+                }
+            } else {
+                ch
+            });
+        }
+        Cow::Owned(normalized)
+    } else {
+        Cow::Borrowed(block)
+    };
+    let body_end = normalized.len() - (block.len() - end_start);
+    let body = &normalized[body_start..body_end];
+    if !(body.starts_with('\n') || body.starts_with("\r\n")) {
+        return None;
+    }
+    plausible_pem_body(body).then_some(normalized)
 }
 
 /// A PEM body is plausible key material when it is a run of base64 characters
 /// (whitespace between wrapped lines allowed) long and diverse enough to be a
 /// real key rather than a placeholder like `XXXX…` or `AAAA…`.
 fn plausible_pem_body(body: &str) -> bool {
-    let base64: Vec<u8> = body
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect();
-    base64.len() >= 16
-        && base64
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
-        && base64.iter().collect::<BTreeSet<_>>().len() >= 5
+    let mut length = 0;
+    let mut alphabet = [false; 128];
+    let mut distinct = 0;
+    for byte in body.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        if !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')) {
+            return false;
+        }
+        length += 1;
+        if !alphabet[usize::from(byte)] {
+            alphabet[usize::from(byte)] = true;
+            distinct += 1;
+        }
+    }
+    length >= 16 && distinct >= 5
 }
 
 struct SecretSite<'a> {
@@ -772,6 +807,41 @@ fn looks_placeholder(value: &str) -> bool {
         || looks_sequential_or_repeated(value)
         || looks_like_namespaced_reference(value)
         || looks_like_pattern(value)
+}
+
+/// These shapes belong only to the generic entropy heuristic. Specific token
+/// signatures still run even when an assignment's value resembles vocabulary.
+fn looks_like_noncredential_assignment(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let uuid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    let query_key = value
+        .strip_prefix(['&', '?'])
+        .and_then(|fragment| fragment.strip_suffix('='))
+        .is_some_and(|key| {
+            !key.is_empty()
+                && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+    let protocol_prefix = value.strip_suffix('.').is_some_and(|prefix| {
+        let mut words = prefix.split('.');
+        matches!(words.next(), Some("base64" | "base64url"))
+            && words.next() == Some("bearer")
+            && words.all(|word| {
+                !word.is_empty() && word.len() <= 16 && word.bytes().all(|b| b.is_ascii_lowercase())
+            })
+    });
+    let mut words = value.split_ascii_whitespace();
+    let placeholder_phrase = matches!(words.next(), Some("new" | "old" | "current" | "test"))
+        && matches!(words.next(), Some("valid" | "invalid" | "test"))
+        && matches!(words.next(), Some("password" | "token" | "secret"))
+        && words.next().is_none();
+    uuid || query_key || protocol_prefix || placeholder_phrase
 }
 
 /// Detects sequential (`0123456789abcdef`, `abcdef`, `zyxwv`) and repeated
@@ -1807,7 +1877,7 @@ const MAGIC_FORMATS: &[(&[u8], &str, Option<&str>)] = &[
 fn detected_formats(bytes: &[u8]) -> Vec<&'static str> {
     let mut formats: Vec<&'static str> = Vec::new();
     for (magic, format, embedded) in MAGIC_FORMATS {
-        if bytes.starts_with(magic) {
+        if bytes.starts_with(magic) && executable_structure(bytes, magic) {
             formats.push(format);
         }
         // An embedded signature identical to the container's own format is
@@ -1821,7 +1891,7 @@ fn detected_formats(bytes: &[u8]) -> Vec<&'static str> {
                 .skip(magic.len())
                 .take(4096)
                 .any(|(offset, window)| {
-                    window == *magic && embedded_signature_at_boundary(bytes, offset, magic.len())
+                    window == *magic && executable_structure(&bytes[offset..], magic)
                 });
             if embedded_found && !formats.contains(format) {
                 formats.push(embedded_format);
@@ -1833,30 +1903,106 @@ fn detected_formats(bytes: &[u8]) -> Vec<&'static str> {
     formats
 }
 
-/// An embedded magic signature only counts at a plausible binary boundary:
-/// `MZ`/`ELF` byte pairs inside base64 or similar encoded payloads (PDF
-/// streams, data URIs) are coincidental substrings, not embedded executables.
-/// A signature is inside an encoded run when at least
-/// [`ENCODED_RUN_LIMIT`] base64-alphabet bytes (line-wrap whitespace allowed)
-/// flank it on both sides.
-const ENCODED_RUN_LIMIT: usize = 8;
+/// Inspect bounded headers/tables, not container type or surrounding bytes.
+/// Coincidental magic (including encoded runs) cannot establish an executable.
+fn executable_structure(bytes: &[u8], magic: &[u8]) -> bool {
+    match magic {
+        b"MZ" => plausible_pe_or_dos(bytes).unwrap_or(false),
+        b"\x7fELF" => plausible_elf(bytes).unwrap_or(false),
+        _ => true,
+    }
+}
 
-fn embedded_signature_at_boundary(bytes: &[u8], offset: usize, magic_len: usize) -> bool {
-    let encoded_byte = |byte: &&u8| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'\r' | b'\n')
+fn header_u16(bytes: &[u8], offset: usize, little: bool) -> Option<u16> {
+    let value = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
+    Some(if little { u16::from_le_bytes(value) } else { u16::from_be_bytes(value) })
+}
+
+fn header_u32(bytes: &[u8], offset: usize, little: bool) -> Option<u32> {
+    let value = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(if little { u32::from_le_bytes(value) } else { u32::from_be_bytes(value) })
+}
+
+fn header_u64(bytes: &[u8], offset: usize, little: bool) -> Option<u64> {
+    let value = bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
+    Some(if little { u64::from_le_bytes(value) } else { u64::from_be_bytes(value) })
+}
+
+fn plausible_pe_or_dos(bytes: &[u8]) -> Option<bool> {
+    let pe = usize::try_from(header_u32(bytes, 0x3c, true)?).ok()?;
+    if pe >= 64 && bytes.get(pe..pe.checked_add(4)?) == Some(b"PE\0\0") {
+        let coff = bytes.get(pe.checked_add(4)?..)?;
+        let sections = usize::from(header_u16(coff, 2, true)?);
+        let optional_size = usize::from(header_u16(coff, 16, true)?);
+        let optional = coff.get(20..20_usize.checked_add(optional_size)?)?;
+        let minimum = match header_u16(optional, 0, true)? {
+            0x10b => 96,
+            0x20b => 112,
+            _ => return Some(false),
+        };
+        if header_u16(coff, 0, true)? == 0
+            || header_u16(coff, 18, true)? & 2 == 0
+            || !(1..=96).contains(&sections)
+            || optional_size < minimum
+        {
+            return Some(false);
+        }
+        let table = coff.get(20 + optional_size..20 + optional_size + sections * 40)?;
+        return Some(table.chunks_exact(40).all(|section| {
+            let size = header_u32(section, 16, true).unwrap_or(0);
+            let offset = header_u32(section, 20, true).unwrap_or(0);
+            size == 0 || (offset > 0 && u64::from(offset) + u64::from(size) <= bytes.len() as u64)
+        }));
+    }
+    // DOS-only executables have no PE signature. Retain the meaningful stub
+    // case only with a coherent DOS image header and its in-image stub text.
+    let last_page = usize::from(header_u16(bytes, 2, true)?);
+    let pages = usize::from(header_u16(bytes, 4, true)?);
+    let header_size = usize::from(header_u16(bytes, 8, true)?) * 16;
+    if pages == 0 || last_page >= 512 || header_size < 28 {
+        return Some(false);
+    }
+    let image_size = (pages - 1) * 512 + if last_page == 0 { 512 } else { last_page };
+    let entry = header_size
+        + usize::from(header_u16(bytes, 22, true)?) * 16
+        + usize::from(header_u16(bytes, 20, true)?);
+    if header_size >= image_size || image_size > bytes.len() || entry >= image_size {
+        return Some(false);
+    }
+    let stub = &bytes[header_size..image_size.min(header_size + 4096)];
+    Some(stub.windows(b"This program cannot be run in DOS mode".len())
+        .any(|window| window == b"This program cannot be run in DOS mode"))
+}
+
+fn plausible_elf(bytes: &[u8]) -> Option<bool> {
+    let class = *bytes.get(4)?;
+    let little = match bytes.get(5)? {
+        1 => true,
+        2 => false,
+        _ => return Some(false),
     };
-    let left = bytes[..offset]
-        .iter()
-        .rev()
-        .take(ENCODED_RUN_LIMIT)
-        .take_while(encoded_byte)
-        .count();
-    let right = bytes[offset + magic_len..]
-        .iter()
-        .take(ENCODED_RUN_LIMIT)
-        .take_while(encoded_byte)
-        .count();
-    left < ENCODED_RUN_LIMIT || right < ENCODED_RUN_LIMIT
+    if bytes.get(6) != Some(&1)
+        || !(1..=3).contains(&header_u16(bytes, 16, little)?)
+        || header_u16(bytes, 18, little)? == 0
+        || header_u32(bytes, 20, little)? != 1
+    {
+        return Some(false);
+    }
+    let (header_size, ph_offset, sh_offset, sizes, ph_size, sh_size) = match class {
+        1 => (52, u64::from(header_u32(bytes, 28, little)?), u64::from(header_u32(bytes, 32, little)?), 40, 32, 40),
+        2 => (64, header_u64(bytes, 32, little)?, header_u64(bytes, 40, little)?, 52, 56, 64),
+        _ => return Some(false),
+    };
+    let ph_count = u64::from(header_u16(bytes, sizes + 4, little)?);
+    let sh_count = u64::from(header_u16(bytes, sizes + 8, little)?);
+    let table_fits = |offset: u64, count: u64, size: u16, expected: u16| {
+        count == 0 || (size == expected && offset >= u64::from(header_size)
+            && offset.checked_add(count * u64::from(size)).is_some_and(|end| end <= bytes.len() as u64))
+    };
+    Some(header_u16(bytes, sizes, little)? == header_size
+        && ph_count + sh_count > 0
+        && table_fits(ph_offset, ph_count, header_u16(bytes, sizes + 2, little)?, ph_size)
+        && table_fits(sh_offset, sh_count, header_u16(bytes, sizes + 6, little)?, sh_size))
 }
 
 fn scan_zip_bomb(bytes: &[u8], builder: &mut FindingBuilder<'_>) {
@@ -1940,6 +2086,134 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.rule_id.as_str() == rule)
+    }
+
+    // Minimal inert header fixtures: no executable instructions or external files.
+    fn pe_fixture() -> Vec<u8> {
+        let mut bytes = vec![0; 512];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&64_u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(b"PE\0\0");
+        bytes[68..70].copy_from_slice(&0x8664_u16.to_le_bytes());
+        bytes[70..72].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[84..86].copy_from_slice(&240_u16.to_le_bytes());
+        bytes[86..88].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[88..90].copy_from_slice(&0x20b_u16.to_le_bytes());
+        bytes[328..333].copy_from_slice(b".text");
+        bytes[344..348].copy_from_slice(&16_u32.to_le_bytes());
+        bytes[348..352].copy_from_slice(&496_u32.to_le_bytes());
+        bytes
+    }
+
+    fn elf_fixture(class: u8, little: bool) -> Vec<u8> {
+        let mut bytes = vec![0; 128];
+        bytes[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', class, if little { 1 } else { 2 }, 1]);
+        let put16 = |bytes: &mut [u8], offset, value: u16| {
+            bytes[offset..offset + 2].copy_from_slice(&if little { value.to_le_bytes() } else { value.to_be_bytes() });
+        };
+        put16(&mut bytes, 16, 2);
+        put16(&mut bytes, 18, 62);
+        bytes[if little { 20 } else { 23 }] = 1;
+        let (header, sizes, ph_size) = if class == 1 { (52, 40, 32) } else { (64, 52, 56) };
+        bytes[match (class, little) { (1, true) => 28, (1, false) => 31, (_, true) => 32, _ => 39 }] = header;
+        put16(&mut bytes, sizes, u16::from(header));
+        put16(&mut bytes, sizes + 2, ph_size);
+        put16(&mut bytes, sizes + 4, 1);
+        bytes
+    }
+
+    #[test]
+    fn polyglot_requires_structure_inside_binary_containers() {
+        let mut dos = vec![0; 128];
+        dos[..2].copy_from_slice(b"MZ");
+        dos[2..4].copy_from_slice(&128_u16.to_le_bytes());
+        dos[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        dos[8..10].copy_from_slice(&4_u16.to_le_bytes());
+        let message = b"This program cannot be run in DOS mode";
+        dos[64..64 + message.len()].copy_from_slice(message);
+        let mut cases = vec![(pe_fixture(), true), (dos, true)];
+        for class in [1, 2] {
+            for little in [false, true] {
+                cases.push((elf_fixture(class, little), true));
+            }
+        }
+        let mut bad_pe = pe_fixture();
+        bad_pe[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push((bad_pe, false));
+        let mut bad_section = pe_fixture();
+        bad_section[348..352].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push((bad_section, false));
+        let mut bad_elf = elf_fixture(2, true);
+        bad_elf[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        cases.push((bad_elf, false));
+        cases.push((b"\x80MZ\xff\0\x7fELF\x89\x01\x02".to_vec(), false));
+        cases.push((pe_fixture()[..80].to_vec(), false));
+        for (payload, expected) in cases {
+            let mut pdf = b"%PDF-1.5\n<< /Filter /FlateDecode >>\nstream\n\x80\xff".to_vec();
+            pdf.extend_from_slice(&payload);
+            pdf.extend_from_slice(b"\nendstream\n%%EOF");
+            let output = analyze_bytes("embedded.pdf", &pdf, &asset(), &ScannerConfig::default(), &MalwareSignatures::default());
+            assert_eq!(has(&output, "malware.executable-script-polyglot"), expected);
+        }
+    }
+
+    #[test]
+    fn private_key_escaped_forms_preserve_normalized_metadata() {
+        // Generate inert, diverse base64 text locally; never copy secret material.
+        // Real ephemeral OpenSSL key coverage belongs to the CLI smoke recipe.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let body: String = (0..192).map(|index| char::from(alphabet[(index * 37 + index / 64) % 64])).collect();
+        let raw = format!("-----BEGIN PRIVATE KEY-----\n{}\n{}\n{}\n-----END PRIVATE KEY-----", &body[..64], &body[64..128], &body[128..]);
+        let metadata = |source: &str| {
+            let output = analyze("fixture.txt", source);
+            let keys: Vec<_> = output.findings.iter().filter(|finding| finding.rule_id.as_str() == "secret.private-key").collect();
+            assert_eq!(keys.len(), 1);
+            let serialized = serde_json::to_string(&output.findings).unwrap();
+            assert!(!serialized.contains(&body[..64]));
+            keys[0].evidence.iter().next().unwrap().properties.clone()
+        };
+        let expected = metadata(&raw);
+        assert_eq!(expected["fingerprint_sha256"], sha256_hex(raw.as_bytes()));
+        assert_eq!(expected["length_bytes"], raw.len().to_string());
+        let quoted = serde_json::to_string(&raw).unwrap();
+        for escaped in [
+            format!("{{\"key\": {quoted}}}"),
+            format!("package fixture\nvar key = {quoted}"),
+            format!("key = {quoted}"),
+        ] {
+            assert_eq!(metadata(&escaped), expected);
+        }
+        let crlf = raw.replace('\n', "\r\n");
+        assert_eq!(metadata(&serde_json::to_string(&crlf).unwrap()), metadata(&crlf));
+        let mismatched = raw.replace("END PRIVATE KEY", "END RSA PRIVATE KEY");
+        let bad_escape = raw.replace('\n', "\\t");
+        for invalid in [mismatched, bad_escape] {
+            assert!(!has(&analyze("fixture.txt", &invalid), "secret.private-key"));
+        }
+    }
+
+    #[test]
+    fn generic_secret_assignment_excludes_only_narrow_noncredential_shapes() {
+        let rule = "secret.high-entropy-assignment";
+        for value in ["base64url.bearer.phx.", "&_csrf_token=", "new valid password", "7488a646-e31f-11e4-aace-600308960662"] {
+            // No extension or directory-context exemption: these are value shapes.
+            for path in ["src/config.ex", "test/config.exs", "guides/config.md"] {
+                assert!(!has(&analyze(path, &format!("token = \"{value}\"")), rule));
+            }
+        }
+        for value in [
+            "base64url.bearer.B7kP9vQ2mX8cR4tN6zW3.",
+            "&_csrf_token=B7kP9vQ2mX8cR4tN6zW3",
+            "new valid B7kP9vQ2mX8cR4tN6zW3 password",
+            "B7kP9vQ2 mX8cR4tN6 zW3",
+            "7488a646-e31f-11e4-aace-60030896066Z",
+        ] {
+            assert!(has(&analyze("guides/config.md", &format!("token = \"{value}\"")), rule));
+        }
+        let token = format!("{}{}", "ghp_", (0..36).map(|index| char::from(b"aB7kP9vQ2mX8cR4tN6zW3"[(index * 8) % 21])).collect::<String>());
+        assert!(has(&analyze("guides/config.md", &format!("token = \"{token}\"")), "secret.github-token"));
+        let uuid_token = format!("{}{}", "glpat-", "7488a646-e31f-11e4-aace-600308960662");
+        assert!(has(&analyze("guides/config.md", &uuid_token), "secret.gitlab-token"));
     }
 
     #[test]
@@ -2819,7 +3093,7 @@ childProcess.exec(input);"#;
     #[test]
     fn polyglot_is_labeled_low_confidence() {
         let mut bytes = b"#!/bin/sh\n".to_vec();
-        bytes.extend_from_slice(b"padding MZ payload");
+        bytes.extend_from_slice(&pe_fixture());
         let output = analyze_bytes(
             "polyglot",
             &bytes,
@@ -2837,9 +3111,8 @@ childProcess.exec(input);"#;
 
     #[test]
     fn monomorphic_pe_is_not_flagged_as_polyglot() {
-        let mut bytes = b"MZ".to_vec();
-        bytes.resize(300, 0);
-        bytes.extend_from_slice(b"MZ");
+        let mut bytes = pe_fixture();
+        bytes.extend_from_slice(&pe_fixture());
         bytes.resize(4096, 0);
         assert_eq!(detected_formats(&bytes), vec!["pe"]);
         assert!(!has(
@@ -2854,7 +3127,7 @@ childProcess.exec(input);"#;
         ));
         // A genuinely distinct second format still raises the indicator.
         let mut polyglot = b"#!/bin/sh\n".to_vec();
-        polyglot.extend_from_slice(b"MZ padding");
+        polyglot.extend_from_slice(&pe_fixture());
         assert_eq!(detected_formats(&polyglot), vec!["embedded-pe", "script"]);
     }
 
@@ -3567,7 +3840,7 @@ childProcess.exec(input);"#;
         ));
         // Negative control: a real embedded PE (binary boundary) still fires.
         let mut polyglot = b"#!/bin/sh\n".to_vec();
-        polyglot.extend_from_slice(b"MZ\x90\x00\x03\x00\x00\x00");
+        polyglot.extend_from_slice(&pe_fixture());
         assert!(has(
             &analyze_bytes(
                 "polyglot",
@@ -3673,12 +3946,15 @@ childProcess.exec(input);"#;
             "-----BEGIN PRIVATE KEY-----\n<REDACTED! DO NOT SHARE THIS!>\n-----END PRIVATE KEY-----",
             "-----BEGIN PRIVATE KEY-----\nXXXXXXXXXXXXXXXXXXXXXXXX\n-----END PRIVATE KEY-----",
             "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----\nfewfawefawfe\n-----END PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----\ninvalid!base64bodyhere\n-----END PRIVATE KEY-----",
             "-----BEGIN PRIVATE KEY-----",
         ] {
             assert!(
                 !has(&analyze("key.pem", pem), "secret.private-key"),
                 "placeholder PEM flagged: {pem:?}"
             );
+            assert!(!has(&analyze("key.json", &serde_json::to_string(pem).unwrap()), "secret.private-key"));
         }
         // Negative control: a real base64 body still flags.
         let pem = "-----BEGIN PRIVATE KEY-----\nMIIBpjBABgkqhkiG9w0BBQ0wMzAbBgkqhkiG9w0BBQwwDgQIf8r2\n-----END PRIVATE KEY-----";
