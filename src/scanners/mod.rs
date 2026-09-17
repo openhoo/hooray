@@ -826,7 +826,9 @@ fn looks_like_noncredential_assignment(value: &str) -> bool {
         .and_then(|fragment| fragment.strip_suffix('='))
         .is_some_and(|key| {
             !key.is_empty()
-                && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         });
     let protocol_prefix = value.strip_suffix('.').is_some_and(|prefix| {
         let mut words = prefix.split('.');
@@ -1915,17 +1917,29 @@ fn executable_structure(bytes: &[u8], magic: &[u8]) -> bool {
 
 fn header_u16(bytes: &[u8], offset: usize, little: bool) -> Option<u16> {
     let value = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
-    Some(if little { u16::from_le_bytes(value) } else { u16::from_be_bytes(value) })
+    Some(if little {
+        u16::from_le_bytes(value)
+    } else {
+        u16::from_be_bytes(value)
+    })
 }
 
 fn header_u32(bytes: &[u8], offset: usize, little: bool) -> Option<u32> {
     let value = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
-    Some(if little { u32::from_le_bytes(value) } else { u32::from_be_bytes(value) })
+    Some(if little {
+        u32::from_le_bytes(value)
+    } else {
+        u32::from_be_bytes(value)
+    })
 }
 
 fn header_u64(bytes: &[u8], offset: usize, little: bool) -> Option<u64> {
     let value = bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
-    Some(if little { u64::from_le_bytes(value) } else { u64::from_be_bytes(value) })
+    Some(if little {
+        u64::from_le_bytes(value)
+    } else {
+        u64::from_be_bytes(value)
+    })
 }
 
 fn plausible_pe_or_dos(bytes: &[u8]) -> Option<bool> {
@@ -1970,8 +1984,10 @@ fn plausible_pe_or_dos(bytes: &[u8]) -> Option<bool> {
         return Some(false);
     }
     let stub = &bytes[header_size..image_size.min(header_size + 4096)];
-    Some(stub.windows(b"This program cannot be run in DOS mode".len())
-        .any(|window| window == b"This program cannot be run in DOS mode"))
+    Some(
+        stub.windows(b"This program cannot be run in DOS mode".len())
+            .any(|window| window == b"This program cannot be run in DOS mode"),
+    )
 }
 
 fn plausible_elf(bytes: &[u8]) -> Option<bool> {
@@ -1989,20 +2005,50 @@ fn plausible_elf(bytes: &[u8]) -> Option<bool> {
         return Some(false);
     }
     let (header_size, ph_offset, sh_offset, sizes, ph_size, sh_size) = match class {
-        1 => (52, u64::from(header_u32(bytes, 28, little)?), u64::from(header_u32(bytes, 32, little)?), 40, 32, 40),
-        2 => (64, header_u64(bytes, 32, little)?, header_u64(bytes, 40, little)?, 52, 56, 64),
+        1 => (
+            52,
+            u64::from(header_u32(bytes, 28, little)?),
+            u64::from(header_u32(bytes, 32, little)?),
+            40,
+            32,
+            40,
+        ),
+        2 => (
+            64,
+            header_u64(bytes, 32, little)?,
+            header_u64(bytes, 40, little)?,
+            52,
+            56,
+            64,
+        ),
         _ => return Some(false),
     };
     let ph_count = u64::from(header_u16(bytes, sizes + 4, little)?);
     let sh_count = u64::from(header_u16(bytes, sizes + 8, little)?);
     let table_fits = |offset: u64, count: u64, size: u16, expected: u16| {
-        count == 0 || (size == expected && offset >= u64::from(header_size)
-            && offset.checked_add(count * u64::from(size)).is_some_and(|end| end <= bytes.len() as u64))
+        count == 0
+            || (size == expected
+                && offset >= u64::from(header_size)
+                && offset
+                    .checked_add(count * u64::from(size))
+                    .is_some_and(|end| end <= bytes.len() as u64))
     };
-    Some(header_u16(bytes, sizes, little)? == header_size
-        && ph_count + sh_count > 0
-        && table_fits(ph_offset, ph_count, header_u16(bytes, sizes + 2, little)?, ph_size)
-        && table_fits(sh_offset, sh_count, header_u16(bytes, sizes + 6, little)?, sh_size))
+    Some(
+        header_u16(bytes, sizes, little)? == header_size
+            && ph_count + sh_count > 0
+            && table_fits(
+                ph_offset,
+                ph_count,
+                header_u16(bytes, sizes + 2, little)?,
+                ph_size,
+            )
+            && table_fits(
+                sh_offset,
+                sh_count,
+                header_u16(bytes, sizes + 6, little)?,
+                sh_size,
+            ),
+    )
 }
 
 fn scan_zip_bomb(bytes: &[u8], builder: &mut FindingBuilder<'_>) {
@@ -2109,13 +2155,26 @@ mod tests {
         let mut bytes = vec![0; 128];
         bytes[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', class, if little { 1 } else { 2 }, 1]);
         let put16 = |bytes: &mut [u8], offset, value: u16| {
-            bytes[offset..offset + 2].copy_from_slice(&if little { value.to_le_bytes() } else { value.to_be_bytes() });
+            bytes[offset..offset + 2].copy_from_slice(&if little {
+                value.to_le_bytes()
+            } else {
+                value.to_be_bytes()
+            });
         };
         put16(&mut bytes, 16, 2);
         put16(&mut bytes, 18, 62);
         bytes[if little { 20 } else { 23 }] = 1;
-        let (header, sizes, ph_size) = if class == 1 { (52, 40, 32) } else { (64, 52, 56) };
-        bytes[match (class, little) { (1, true) => 28, (1, false) => 31, (_, true) => 32, _ => 39 }] = header;
+        let (header, sizes, ph_size) = if class == 1 {
+            (52, 40, 32)
+        } else {
+            (64, 52, 56)
+        };
+        bytes[match (class, little) {
+            (1, true) => 28,
+            (1, false) => 31,
+            (_, true) => 32,
+            _ => 39,
+        }] = header;
         put16(&mut bytes, sizes, u16::from(header));
         put16(&mut bytes, sizes + 2, ph_size);
         put16(&mut bytes, sizes + 4, 1);
@@ -2152,7 +2211,13 @@ mod tests {
             let mut pdf = b"%PDF-1.5\n<< /Filter /FlateDecode >>\nstream\n\x80\xff".to_vec();
             pdf.extend_from_slice(&payload);
             pdf.extend_from_slice(b"\nendstream\n%%EOF");
-            let output = analyze_bytes("embedded.pdf", &pdf, &asset(), &ScannerConfig::default(), &MalwareSignatures::default());
+            let output = analyze_bytes(
+                "embedded.pdf",
+                &pdf,
+                &asset(),
+                &ScannerConfig::default(),
+                &MalwareSignatures::default(),
+            );
             assert_eq!(has(&output, "malware.executable-script-polyglot"), expected);
         }
     }
@@ -2162,11 +2227,22 @@ mod tests {
         // Generate inert, diverse base64 text locally; never copy secret material.
         // Real ephemeral OpenSSL key coverage belongs to the CLI smoke recipe.
         let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let body: String = (0..192).map(|index| char::from(alphabet[(index * 37 + index / 64) % 64])).collect();
-        let raw = format!("-----BEGIN PRIVATE KEY-----\n{}\n{}\n{}\n-----END PRIVATE KEY-----", &body[..64], &body[64..128], &body[128..]);
+        let body: String = (0..192)
+            .map(|index| char::from(alphabet[(index * 37 + index / 64) % 64]))
+            .collect();
+        let raw = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n{}\n{}\n-----END PRIVATE KEY-----",
+            &body[..64],
+            &body[64..128],
+            &body[128..]
+        );
         let metadata = |source: &str| {
             let output = analyze("fixture.txt", source);
-            let keys: Vec<_> = output.findings.iter().filter(|finding| finding.rule_id.as_str() == "secret.private-key").collect();
+            let keys: Vec<_> = output
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_id.as_str() == "secret.private-key")
+                .collect();
             assert_eq!(keys.len(), 1);
             let serialized = serde_json::to_string(&output.findings).unwrap();
             assert!(!serialized.contains(&body[..64]));
@@ -2184,18 +2260,29 @@ mod tests {
             assert_eq!(metadata(&escaped), expected);
         }
         let crlf = raw.replace('\n', "\r\n");
-        assert_eq!(metadata(&serde_json::to_string(&crlf).unwrap()), metadata(&crlf));
+        assert_eq!(
+            metadata(&serde_json::to_string(&crlf).unwrap()),
+            metadata(&crlf)
+        );
         let mismatched = raw.replace("END PRIVATE KEY", "END RSA PRIVATE KEY");
         let bad_escape = raw.replace('\n', "\\t");
         for invalid in [mismatched, bad_escape] {
-            assert!(!has(&analyze("fixture.txt", &invalid), "secret.private-key"));
+            assert!(!has(
+                &analyze("fixture.txt", &invalid),
+                "secret.private-key"
+            ));
         }
     }
 
     #[test]
     fn generic_secret_assignment_excludes_only_narrow_noncredential_shapes() {
         let rule = "secret.high-entropy-assignment";
-        for value in ["base64url.bearer.phx.", "&_csrf_token=", "new valid password", "7488a646-e31f-11e4-aace-600308960662"] {
+        for value in [
+            "base64url.bearer.phx.",
+            "&_csrf_token=",
+            "new valid password",
+            "7488a646-e31f-11e4-aace-600308960662",
+        ] {
             // No extension or directory-context exemption: these are value shapes.
             for path in ["src/config.ex", "test/config.exs", "guides/config.md"] {
                 assert!(!has(&analyze(path, &format!("token = \"{value}\"")), rule));
@@ -2208,12 +2295,27 @@ mod tests {
             "B7kP9vQ2 mX8cR4tN6 zW3",
             "7488a646-e31f-11e4-aace-60030896066Z",
         ] {
-            assert!(has(&analyze("guides/config.md", &format!("token = \"{value}\"")), rule));
+            assert!(has(
+                &analyze("guides/config.md", &format!("token = \"{value}\"")),
+                rule
+            ));
         }
-        let token = format!("{}{}", "ghp_", (0..36).map(|index| char::from(b"aB7kP9vQ2mX8cR4tN6zW3"[(index * 8) % 21])).collect::<String>());
-        assert!(has(&analyze("guides/config.md", &format!("token = \"{token}\"")), "secret.github-token"));
+        let token = format!(
+            "{}{}",
+            "ghp_",
+            (0..36)
+                .map(|index| char::from(b"aB7kP9vQ2mX8cR4tN6zW3"[(index * 8) % 21]))
+                .collect::<String>()
+        );
+        assert!(has(
+            &analyze("guides/config.md", &format!("token = \"{token}\"")),
+            "secret.github-token"
+        ));
         let uuid_token = format!("{}{}", "glpat-", "7488a646-e31f-11e4-aace-600308960662");
-        assert!(has(&analyze("guides/config.md", &uuid_token), "secret.gitlab-token"));
+        assert!(has(
+            &analyze("guides/config.md", &uuid_token),
+            "secret.gitlab-token"
+        ));
     }
 
     #[test]
@@ -3954,7 +4056,10 @@ childProcess.exec(input);"#;
                 !has(&analyze("key.pem", pem), "secret.private-key"),
                 "placeholder PEM flagged: {pem:?}"
             );
-            assert!(!has(&analyze("key.json", &serde_json::to_string(pem).unwrap()), "secret.private-key"));
+            assert!(!has(
+                &analyze("key.json", &serde_json::to_string(pem).unwrap()),
+                "secret.private-key"
+            ));
         }
         // Negative control: a real base64 body still flags.
         let pem = "-----BEGIN PRIVATE KEY-----\nMIIBpjBABgkqhkiG9w0BBQ0wMzAbBgkqhkiG9w0BBQwwDgQIf8r2\n-----END PRIVATE KEY-----";
