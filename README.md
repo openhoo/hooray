@@ -592,6 +592,7 @@ legacy severity-only `--fail-on` interface.
 | PHP | `composer.json` | Declared `require`/`require-dev` packages, composer purls; platform packages skipped |
 | Conda | `environment.yml` | Dependency list entries, conda purls |
 | Helm | `Chart.yaml` | Declared chart dependencies, Helm purls |
+| Haskell (partial) | `*.cabal`, `cabal.project.freeze` | Union of `build-depends`, Hackage purls; ranges remain versionless, exact equality and matching nearest in-tree freeze pins produce versioned purls |
 | NuGet | `packages.lock.json` | Framework dependency graph, direct/transitive hints, NuGet purls |
 | CycloneDX | JSON SBOM with versioned purls | Nested and declared dependency edges, scope, provenance |
 | SPDX | 2.x JSON detected by `spdxVersion` | Packages, checksums, declared `DEPENDS_ON` relationships |
@@ -608,6 +609,26 @@ malformed recognized inventory files fail rather than being silently skipped. If
 filesystem-analysis admission bounds omit files, the report includes a
 high-severity `scanner:coverage-incomplete`
 operational-risk finding with scanned and skipped counters.
+
+Haskell support is bounded dependency inventory, not Cabal semantic validation
+or dependency solving. It reads space-indented layout, multiline dependency
+fields, and the union of conditional branches and common stanzas without
+evaluating flags, conditions, or common-stanza imports. Sublibrary selectors
+retain the owning Hackage package identity. Test/benchmark dependencies have
+test scope; freeze setup-qualified constraints have build scope and do not
+resolve ordinary `build-depends`. A nearest ancestor `cabal.project.freeze`
+inside the scanned tree supplies matching exact pins; unmatched declarations
+remain in the inventory. Pins are not checked for solver compatibility with
+manifest ranges. `cabal.project`, `stack.yaml`, and `stack.yaml.lock` are not
+parsed.
+
+Malformed dependency syntax and conflicting exact freeze pins fail closed.
+Valid Cabal tab indentation and explicit-brace stanza layout are also
+unsupported and produce input errors, rather than silently partial inventory.
+Consequently, scanning the entire upstream Cabal test corpus is not supported:
+it includes intentionally invalid parser fixtures as well as valid layouts
+outside these bounds. Support for a production package directory is not a
+claim of full-corpus acceptance.
 
 ## Quality and security verification
 

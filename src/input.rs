@@ -32,6 +32,7 @@ use self::parsers::{
     dart::parse_pubspec_lock,
     go::parse_go_mod,
     gradle::parse_gradle_lockfile,
+    haskell::{parse_cabal, parse_cabal_freeze},
     helm::{parse_chart_lock, parse_chart_yaml},
     image::{scan_oci_layout, scan_oci_tar},
     maven::parse_pom_xml,
@@ -298,6 +299,10 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
     ("pnpm-lock.yaml", LockfileRoute::Lock(parse_pnpm_lock)),
     ("bun.lock", LockfileRoute::Lock(parse_bun_lock)),
     ("poetry.lock", LockfileRoute::Lock(parse_poetry_lock)),
+    (
+        "cabal.project.freeze",
+        LockfileRoute::Lock(parse_cabal_freeze),
+    ),
     ("Pipfile.lock", LockfileRoute::Lock(parse_pipfile_lock)),
     ("Gemfile.lock", LockfileRoute::Lock(parse_gemfile_lock)),
     (
@@ -356,6 +361,9 @@ fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
     if name.ends_with(".csproj") {
         return Some(&CS_PROJ_ROUTE);
     }
+    if name.ends_with(".cabal") {
+        return Some(&CABAL_ROUTE);
+    }
     name.ends_with(".lockfile")
         .then_some(&GRADLE_LOCKFILE_ROUTE)
 }
@@ -364,6 +372,7 @@ fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
 /// `lockfile_route` can return shared references.
 static CS_PROJ_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_csproj);
 static GRADLE_LOCKFILE_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_gradle_lockfile);
+static CABAL_ROUTE: LockfileRoute = LockfileRoute::LockTree(parse_cabal);
 
 fn scan_virtual_files(
     locator: &Path,
