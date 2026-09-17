@@ -5,8 +5,12 @@ use serde_yaml::Value as Yaml;
 use super::split_descriptor;
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::{ComponentId, Scope};
-type YarnEntries = BTreeMap<String, (String, Vec<(String, bool)>)>;
-type YarnCurrent = (String, String, Vec<(String, bool)>);
+struct YarnEntry {
+    descriptors: Vec<String>,
+    name: String,
+    version: String,
+    deps: Vec<(String, bool)>,
+}
 
 pub(crate) fn parse_yarn_lock(
     path: &str,
@@ -33,8 +37,8 @@ fn parse_yarn_classic(
     text: &str,
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let mut entries: YarnEntries = BTreeMap::new();
-    let mut current: Option<YarnCurrent> = None;
+    let mut entries = Vec::new();
+    let mut current: Option<YarnEntry> = None;
     let mut mode = YarnSection::Header;
     for raw in text.lines() {
         let trimmed = raw.trim_end().trim();
@@ -49,27 +53,21 @@ fn parse_yarn_classic(
                     format!("invalid entry header {trimmed:?}"),
                 )
             })?;
-            if let Some((name, version, deps)) = current.take() {
-                insert_yarn_entry(&mut entries, path, name, version, deps)?;
+            if let Some(entry) = current.take() {
+                insert_yarn_entry(&mut entries, path, entry)?;
             }
-            let descriptor = header
-                .split(',')
-                .next()
-                .unwrap_or(header)
-                .trim()
-                .trim_matches('"');
-            let Some((name, _)) = split_descriptor(descriptor) else {
-                return Err(malformed_msg(
-                    path,
-                    "yarn.lock",
-                    format!("invalid descriptor {descriptor:?}"),
-                ));
-            };
-            current = Some((name.to_owned(), String::new(), Vec::new()));
+            let descriptors = yarn_descriptors(path, header, false)?;
+            let name = yarn_name(path, &descriptors[0])?.to_owned();
+            current = Some(YarnEntry {
+                descriptors,
+                name,
+                version: String::new(),
+                deps: Vec::new(),
+            });
             mode = YarnSection::Header;
             continue;
         }
-        let Some((_, version, deps)) = current.as_mut() else {
+        let Some(entry) = current.as_mut() else {
             return Err(malformed_msg(
                 path,
                 "yarn.lock",
@@ -89,19 +87,36 @@ fn parse_yarn_classic(
             match mode {
                 YarnSection::Header => {
                     if let Some(value) = trimmed.strip_prefix("version ") {
-                        *version = value.trim().trim_matches('"').to_owned();
+                        entry.version = value.trim().trim_matches('"').to_owned();
                     }
                 }
                 active => {
-                    if let Some(dep) = trimmed.split_whitespace().next() {
-                        deps.push((dep.to_owned(), active == YarnSection::OptionalDependencies));
+                    let Some((dep, requested)) = trimmed.split_once(char::is_whitespace) else {
+                        return Err(malformed_msg(
+                            path,
+                            "yarn.lock",
+                            "dependency has no selector",
+                        ));
+                    };
+                    let dep = dep.trim_matches('"');
+                    let requested = requested.trim().trim_matches('"');
+                    if dep.is_empty() || requested.is_empty() {
+                        return Err(malformed_msg(
+                            path,
+                            "yarn.lock",
+                            "dependency has no selector",
+                        ));
                     }
+                    entry.deps.push((
+                        format!("{dep}@{requested}"),
+                        active == YarnSection::OptionalDependencies,
+                    ));
                 }
             }
         }
     }
-    if let Some((name, version, deps)) = current.take() {
-        insert_yarn_entry(&mut entries, path, name, version, deps)?;
+    if let Some(entry) = current.take() {
+        insert_yarn_entry(&mut entries, path, entry)?;
     }
     add_yarn_entries(path, entries, out)
 }
@@ -115,7 +130,7 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
             "expected a mapping of lockfile entries",
         ));
     };
-    let mut entries: YarnEntries = BTreeMap::new();
+    let mut entries = Vec::new();
     for (key, value) in root {
         let Some(key) = key.as_str() else { continue };
         if key == "__metadata" {
@@ -135,7 +150,7 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
             .get("resolution")
             .and_then(Yaml::as_str)
             .unwrap_or(key);
-        let Some((name, locator)) = split_descriptor(descriptor) else {
+        let Some((_, locator)) = split_descriptor(descriptor) else {
             return Err(malformed_msg(
                 path,
                 "yarn.lock",
@@ -149,61 +164,150 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
         {
             continue;
         }
+        let name = yarn_name(path, descriptor)?.to_owned();
+        let descriptors = yarn_descriptors(path, key, true)?;
         let mut deps: Vec<(String, bool)> = Vec::new();
         for (field, optional) in [("dependencies", false), ("optionalDependencies", true)] {
             if let Some(map) = value.get(field).and_then(Yaml::as_mapping) {
-                for (dep, _) in map {
-                    if let Some(dep) = dep.as_str() {
-                        deps.push((dep.to_owned(), optional));
-                    }
+                for (dep, requested) in map {
+                    let (Some(dep), Some(requested)) = (dep.as_str(), requested.as_str()) else {
+                        return Err(malformed_msg(
+                            path,
+                            "yarn.lock",
+                            "invalid dependency selector",
+                        ));
+                    };
+                    deps.push((
+                        yarn_berry_descriptor(&format!("{dep}@{requested}")),
+                        optional,
+                    ));
                 }
             }
         }
-        deps.sort();
-        deps.dedup();
-        entry_bound(entries.len() + 1, path, "yarn.lock")?;
-        entries
-            .entry(name.to_owned())
-            .or_insert((version.to_owned(), deps));
+        insert_yarn_entry(
+            &mut entries,
+            path,
+            YarnEntry {
+                descriptors,
+                name,
+                version: version.to_owned(),
+                deps,
+            },
+        )?;
     }
     add_yarn_entries(path, entries, out)
 }
 
+/// Resolve npm aliases using the same scoped descriptor split as the other npm parsers.
+fn yarn_name<'a>(path: &str, descriptor: &'a str) -> Result<&'a str, InputError> {
+    let (name, locator) = split_descriptor(descriptor)
+        .filter(|(name, locator)| !name.is_empty() && !locator.is_empty())
+        .ok_or_else(|| {
+            malformed_msg(
+                path,
+                "yarn.lock",
+                format!("invalid descriptor {descriptor:?}"),
+            )
+        })?;
+    Ok(locator
+        .strip_prefix("npm:")
+        .and_then(split_descriptor)
+        .map_or(name, |(target, _)| target))
+}
+
+fn yarn_berry_descriptor(descriptor: &str) -> String {
+    if let Some((name, locator)) = split_descriptor(descriptor) {
+        if let Some(locator) = locator.strip_prefix("npm:") {
+            return format!("{name}@{locator}");
+        }
+    }
+    descriptor.to_owned()
+}
+
+fn yarn_descriptors(path: &str, header: &str, berry: bool) -> Result<Vec<String>, InputError> {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut descriptors = Vec::new();
+    for descriptor in header.split(|ch| {
+        if escaped {
+            escaped = false;
+        } else if quoted && ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        }
+        ch == ',' && !quoted
+    }) {
+        let descriptor = descriptor.trim();
+        let descriptor = if descriptor.starts_with('"') {
+            serde_json::from_str::<String>(descriptor)
+                .map_err(|e| malformed(path, "yarn.lock", e))?
+        } else {
+            descriptor.to_owned()
+        };
+        yarn_name(path, &descriptor)?;
+        descriptors.push(if berry {
+            yarn_berry_descriptor(&descriptor)
+        } else {
+            descriptor
+        });
+    }
+    Ok(descriptors)
+}
+
 fn insert_yarn_entry(
-    entries: &mut YarnEntries,
+    entries: &mut Vec<YarnEntry>,
     path: &str,
-    name: String,
-    version: String,
-    mut deps: Vec<(String, bool)>,
+    mut entry: YarnEntry,
 ) -> Result<(), InputError> {
     entry_bound(entries.len() + 1, path, "yarn.lock")?;
-    if version.is_empty() {
+    if entry.version.is_empty() {
         return Err(malformed_msg(
             path,
             "yarn.lock",
-            format!("entry {name} has no version"),
+            format!("entry {} has no version", entry.name),
         ));
     }
-    deps.sort();
-    deps.dedup();
-    entries.entry(name).or_insert((version, deps));
+    entry.deps.sort();
+    entry.deps.dedup();
+    entries.push(entry);
     Ok(())
 }
 
 fn add_yarn_entries(
     path: &str,
-    entries: YarnEntries,
+    entries: Vec<YarnEntry>,
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let mut ids: BTreeMap<String, ComponentId> = BTreeMap::new();
-    for (name, (version, _)) in &entries {
-        let id = out.add("npm", name, version, Scope::Runtime, path, BTreeSet::new())?;
-        ids.insert(name.clone(), id);
+    // The builder deduplicates resolved identities, not package names. Keep every
+    // descriptor and dependency list even when several entries share an identity.
+    let mut ids: BTreeMap<&str, ComponentId> = BTreeMap::new();
+    let mut resolved = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let id = out.add(
+            "npm",
+            &entry.name,
+            &entry.version,
+            Scope::Runtime,
+            path,
+            BTreeSet::new(),
+        )?;
+        for descriptor in &entry.descriptors {
+            if let Some(previous) = ids.insert(descriptor, id.clone()) {
+                if previous != id {
+                    return Err(malformed_msg(
+                        path,
+                        "yarn.lock",
+                        format!("conflicting descriptor {descriptor:?}"),
+                    ));
+                }
+            }
+        }
+        resolved.push(id);
     }
-    for (name, (_, deps)) in &entries {
-        let Some(from) = ids.get(name) else { continue };
-        for (dep, optional) in deps {
-            if let Some(to) = ids.get(dep) {
+    for (entry, from) in entries.iter().zip(&resolved) {
+        for (dep, optional) in &entry.deps {
+            if let Some(to) = ids.get(dep.as_str()) {
                 out.edge(from, to, Scope::Runtime, *optional);
             }
         }
@@ -217,6 +321,198 @@ mod tests {
     use crate::input::{config, scan_path};
     use std::fs;
     use tempfile::tempdir;
+    #[test]
+    fn yarn_multiversion_descriptors_select_exact_resolved_identities() {
+        let classic = r#"acorn@^8.7.1, acorn@~8.8.0:
+  version "8.8.1"
+acorn@^8.8.2:
+  version "8.10.0"
+acorn@8.10.0:
+  version "8.10.0"
+old@1:
+  version "1.0.0"
+  dependencies:
+    acorn "^8.7.1"
+grouped@1:
+  version "1.0.0"
+  dependencies:
+    acorn "~8.8.0"
+new@1:
+  version "1.0.0"
+  optionalDependencies:
+    acorn "^8.8.2"
+exact@1:
+  version "1.0.0"
+  dependencies:
+    acorn "8.10.0"
+unmatched@1:
+  version "1.0.0"
+  dependencies:
+    acorn "^9.0.0"
+"#;
+        let berry = r#"__metadata:
+  version: 8
+"acorn@npm:^8.7.1, acorn@npm:~8.8.0":
+  version: 8.8.1
+  resolution: "acorn@npm:8.8.1"
+"acorn@npm:^8.8.2":
+  version: 8.10.0
+  resolution: "acorn@npm:8.10.0"
+"acorn@npm:8.10.0":
+  version: 8.10.0
+  resolution: "acorn@npm:8.10.0"
+"old@npm:1":
+  version: 1.0.0
+  dependencies:
+    acorn: "^8.7.1"
+"grouped@npm:1":
+  version: 1.0.0
+  dependencies:
+    acorn: "npm:~8.8.0"
+"new@npm:1":
+  version: 1.0.0
+  optionalDependencies:
+    acorn: "^8.8.2"
+"exact@npm:1":
+  version: 1.0.0
+  dependencies:
+    acorn: "8.10.0"
+"unmatched@npm:1":
+  version: 1.0.0
+  dependencies:
+    acorn: "^9.0.0"
+"#;
+        for text in [classic, berry] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("yarn.lock"), text).unwrap();
+            let inventory = scan_path(dir.path(), &config()).unwrap();
+            let identities: BTreeSet<_> = inventory
+                .components
+                .values()
+                .map(|c| (c.name.as_str(), c.version.as_str()))
+                .collect();
+            assert_eq!(
+                identities,
+                BTreeSet::from([
+                    ("acorn", "8.8.1"),
+                    ("acorn", "8.10.0"),
+                    ("old", "1.0.0"),
+                    ("grouped", "1.0.0"),
+                    ("new", "1.0.0"),
+                    ("exact", "1.0.0"),
+                    ("unmatched", "1.0.0"),
+                ])
+            );
+            assert_eq!(inventory.components.len(), identities.len());
+            let edges: BTreeSet<_> = inventory
+                .dependencies
+                .iter()
+                .map(|edge| {
+                    let from = &inventory.components[&edge.from];
+                    let to = &inventory.components[&edge.to];
+                    (
+                        from.name.as_str(),
+                        to.name.as_str(),
+                        to.version.as_str(),
+                        edge.optional,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                edges,
+                BTreeSet::from([
+                    ("old", "acorn", "8.8.1", false),
+                    ("grouped", "acorn", "8.8.1", false),
+                    ("new", "acorn", "8.10.0", true),
+                    ("exact", "acorn", "8.10.0", false),
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn yarn_scoped_aliases_and_quoted_grouped_descriptors_keep_edges() {
+        for text in [
+            r#""alias@npm:@scope/pkg@^1", "alias@npm:@scope/pkg@~1.2":
+  version "1.2.0"
+"@scope/pkg@^2":
+  version "2.1.0"
+consumer@1:
+  version "1.0.0"
+  dependencies:
+    alias "npm:@scope/pkg@~1.2"
+  optionalDependencies:
+    "@scope/pkg" "^2"
+"#,
+            r#"__metadata:
+  version: 8
+"alias@npm:@scope/pkg@^1, alias@npm:@scope/pkg@~1.2":
+  version: 1.2.0
+  resolution: "@scope/pkg@npm:1.2.0"
+"@scope/pkg@npm:^2":
+  version: 2.1.0
+  resolution: "@scope/pkg@npm:2.1.0"
+"consumer@npm:1":
+  version: 1.0.0
+  dependencies:
+    alias: "npm:@scope/pkg@~1.2"
+  optionalDependencies:
+    "@scope/pkg": "^2"
+"#,
+        ] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("yarn.lock"), text).unwrap();
+            let inventory = scan_path(dir.path(), &config()).unwrap();
+            assert_eq!(inventory.components.len(), 3);
+            assert!(!inventory.components.values().any(|c| c.name == "alias"));
+            let edges: BTreeSet<_> = inventory
+                .dependencies
+                .iter()
+                .map(|edge| {
+                    let from = &inventory.components[&edge.from];
+                    let to = &inventory.components[&edge.to];
+                    (
+                        from.name.as_str(),
+                        to.name.as_str(),
+                        to.version.as_str(),
+                        edge.optional,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                edges,
+                BTreeSet::from([
+                    ("consumer", "@scope/pkg", "1.2.0", false),
+                    ("consumer", "@scope/pkg", "2.1.0", true),
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn yarn_classic_malformed_entries_and_conflicting_descriptors_fail_closed() {
+        for text in [
+            "a@1:\n  resolved \"url\"\n",
+            "a@1, broken:\n  version \"1.0.0\"\n",
+            "a@1:\n  version \"1.0.0\"\n  dependencies:\n    b\n",
+            "a@1:\n  version \"1.0.0\"\na@1:\n  version \"2.0.0\"\n",
+            "__metadata:\n  version: 8\n\"a@npm:1, a@npm:2\":\n  version: 1.0.0\n\"a@npm:2\":\n  version: 2.0.0\n",
+        ] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("yarn.lock"), text).unwrap();
+            assert!(
+                matches!(
+                    scan_path(dir.path(), &config()),
+                    Err(InputError::Malformed {
+                        format: "yarn.lock",
+                        ..
+                    })
+                ),
+                "expected malformed yarn.lock for {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn scans_yarn_lock_classic_and_berry_formats() {
         let dir = tempdir().unwrap();
