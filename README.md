@@ -578,14 +578,14 @@ legacy severity-only `--fail-on` interface.
 | Yarn | `yarn.lock` classic or Berry | Locked packages with dependency edges, npm purls |
 | pnpm | `pnpm-lock.yaml` | Locked packages with dev/optional scope, npm purls |
 | Bun | `bun.lock` (text format) | Locked packages with dependency edges, npm purls |
-| Python pip | `requirements.txt` | Pinned `name==version` requirements, PyPI purls |
+| Python pip | `requirements.txt` | `name==version` pins plus unpinned/constrained requirements (versionless purls), PyPI purls |
 | Python Poetry | `poetry.lock` | Locked PyPI packages, PyPI purls |
 | Python Pipenv | `Pipfile.lock` | Pinned default/develop packages, PyPI purls |
-| Ruby | `Gemfile.lock` | `GEM`-section specs, gem purls |
+| Ruby | `Gemfile.lock` | `GEM`/`GIT`/`PATH`-section specs with nested dependency edges, gem purls |
 | Go | `go.mod` requirements | Module/version entries, Go purls |
 | Swift | `Package.resolved` v1 or v2 | Pinned identities and versions, Swift purls |
 | Dart | `pubspec.lock` | Locked pub packages, pub purls |
-| CocoaPods | `Podfile.lock` | Pod entries, CocoaPods purls |
+| CocoaPods | `Podfile.lock` | Pod entries with nested dependency edges, CocoaPods purls |
 | PHP | `composer.json` | Declared `require`/`require-dev` packages, composer purls; platform packages skipped |
 | Conda | `environment.yml` | Dependency list entries, conda purls |
 | Helm | `Chart.yaml` | Declared chart dependencies, Helm purls |
@@ -762,10 +762,11 @@ overlap rather than identity:
   `composer.lock` support), so PHP inventory parity is specifier-level
   rather than resolved-version-level.
 - Formats without dependency edges (`requirements.txt`, `go.mod`,
-  `Pipfile.lock`, `Gemfile.lock`, `Package.resolved`, `pubspec.lock`,
-  `Podfile.lock`, `composer.json`, `environment.yml`, `Chart.yaml`) classify
-  all components as disconnected; direct/transitive parity is comparable
-  only for npm, Yarn, pnpm, Poetry, Cargo, and NuGet cases.
+  `Pipfile.lock`, `Package.resolved`, `pubspec.lock`, `composer.json`,
+  `environment.yml`, `Chart.yaml`) classify all components as disconnected;
+  `Gemfile.lock` and `Podfile.lock` emit edges but no declared roots, so
+  direct/transitive parity is comparable only for npm, Yarn, pnpm, Poetry,
+  Cargo, and NuGet cases.
 - Hooray derives severity as bucketed labels from OSV while Xray exposes
   numeric CVSS scores; severity agreement compares label buckets only.
 - Vulnerability sets can never be identical because OSV and Xray curate
