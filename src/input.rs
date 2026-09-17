@@ -32,6 +32,7 @@ use self::parsers::{
     dart::parse_pubspec_lock,
     go::parse_go_mod,
     gradle::parse_gradle_lockfile,
+    gradle_catalog::parse_gradle_catalog,
     helm::{parse_chart_lock, parse_chart_yaml},
     image::{scan_oci_layout, scan_oci_tar},
     maven::parse_pom_xml,
@@ -342,9 +343,10 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
 const MANIFEST_SIDECARS: &[&str] = &["Cargo.toml", "go.sum"];
 
 /// Resolves an inventory file to its route. Most lockfiles match by exact
-/// base name; MSBuild project files and Gradle dependency lockfiles are
-/// recognized by their `.csproj`/`.lockfile` extensions because the project
-/// or configuration name is part of the filename.
+/// base name; MSBuild project files, Gradle dependency lockfiles, and Gradle
+/// version catalogs are recognized by their `.csproj`/`.lockfile`/
+/// `.versions.toml` extensions because the project, configuration, or
+/// catalog name is part of the filename.
 fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
     if let Some(route) = LOCKFILES
         .iter()
@@ -356,6 +358,9 @@ fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
     if name.ends_with(".csproj") {
         return Some(&CS_PROJ_ROUTE);
     }
+    if name.ends_with(".versions.toml") {
+        return Some(&GRADLE_CATALOG_ROUTE);
+    }
     name.ends_with(".lockfile")
         .then_some(&GRADLE_LOCKFILE_ROUTE)
 }
@@ -364,6 +369,7 @@ fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
 /// `lockfile_route` can return shared references.
 static CS_PROJ_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_csproj);
 static GRADLE_LOCKFILE_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_gradle_lockfile);
+static GRADLE_CATALOG_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_gradle_catalog);
 
 fn scan_virtual_files(
     locator: &Path,
