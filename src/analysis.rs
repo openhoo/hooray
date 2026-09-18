@@ -1,8 +1,9 @@
+use chrono::{DateTime, NaiveDate, Utc};
 use std::cmp::Ordering;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::ControlFlow;
-
-use chrono::{DateTime, NaiveDate, Utc};
+use std::rc::Rc;
 
 use crate::model::{
     Applicability, ApplicabilityStatus, Component, ComponentId, Evidence, Inventory,
@@ -39,10 +40,13 @@ pub struct OsvAffectedRange {
     pub events: Vec<OsvEvent>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ApplicabilityInput<'a> {
     pub component: &'a Component,
-    pub inventory: Option<&'a Inventory>,
+    /// Shared dependency-path index over the inventory; `None` when no
+    /// inventory context is available. Built once per scan instead of once
+    /// per finding (see `DependencyPathIndex`).
+    pub paths: Option<&'a DependencyPathIndex<'a>>,
     pub evidence: &'a BTreeSet<Evidence>,
     pub affected_ranges: &'a [OsvAffectedRange],
 }
@@ -62,8 +66,8 @@ impl ApplicabilityAnalyzer {
         // comparator rejects stay on the legacy path everywhere below.
         let scoped = ScopedOrdering::for_component(ecosystem, &input.component.version);
         let (paths, paths_truncated) = input
-            .inventory
-            .map(|inventory| dependency_paths(inventory, &input.component.identity))
+            .paths
+            .map(|index| index.paths(&input.component.identity))
             .unwrap_or_default();
         let reachable = evidence.boolean("dependency.reachable");
         let imported = evidence
@@ -545,10 +549,8 @@ fn apply_event<'a>(
     version: &str,
     scoped: Option<&ScopedOrdering>,
 ) -> Option<RangeOutcome> {
-    match event.introduced.as_deref() {
-        Some("0") => state.activate(),
-        Some(introduced) => state.cross_introduced(scoped, version_parts, introduced),
-        None => {}
+    if let Some(introduced) = event.introduced.as_deref() {
+        state.cross_introduced(scoped, version_parts, introduced);
     }
     if let Some(fixed) = event.fixed.as_deref() {
         state.cross_fixed(scoped, version_parts, fixed);
@@ -647,61 +649,153 @@ fn version_parts(version: &str) -> Option<Vec<String>> {
     (!parts.is_empty()).then_some(parts)
 }
 
-fn dependency_paths(inventory: &Inventory, target: &ComponentId) -> (Vec<String>, bool) {
-    let incoming: BTreeSet<_> = inventory.dependencies.iter().map(|edge| &edge.to).collect();
-    let roots: Vec<_> = inventory
-        .components
-        .keys()
-        .filter(|id| !incoming.contains(id))
-        .cloned()
-        .collect();
-    let mut queue: VecDeque<(ComponentId, Vec<ComponentId>)> = roots
-        .into_iter()
-        .map(|root| (root.clone(), vec![root]))
-        .collect();
-    let mut shortest: BTreeMap<ComponentId, usize> = BTreeMap::new();
-    let mut results = Vec::new();
-    while let Some((current, path)) = queue.pop_front() {
-        if results.len() >= MAX_DEPENDENCY_PATHS {
-            break;
+/// One node's shortest-path summary inside `DependencyPathIndex`.
+#[derive(Debug)]
+struct PathInfo<'a> {
+    /// Node count of the shortest root-to-node path (roots have depth 1).
+    depth: usize,
+    /// Number of shortest paths, saturated at `MAX_DEPENDENCY_PATHS + 1` so
+    /// the truncation flag can distinguish "exactly at the cap" from "more".
+    count: usize,
+    /// The lexicographically smallest shortest path (by component-id
+    /// sequence), shared via `Rc` so relaxations stay O(1).
+    best: Rc<Vec<&'a ComponentId>>,
+    /// Predecessors on shortest paths, sorted for deterministic enumeration.
+    predecessors: Vec<&'a ComponentId>,
+}
+
+/// Shortest-path index over an inventory's dependency graph, built once with
+/// a single multi-source BFS and shared by every finding's applicability
+/// analysis. Replaces the per-finding `O(V + E)` BFS that made scans
+/// quadratic in component count. Mirrors the enumeration bounds of graph
+/// path collection (`engine::MAX_DEPENDENCY_PATHS` / `MAX_DEPENDENCY_DEPTH`)
+/// and the old per-call traversal: roots are components with no incoming
+/// edge (isolated components count as their own path), edges referencing
+/// unknown components stay traversable, and only shortest paths are
+/// reported.
+#[derive(Debug)]
+pub struct DependencyPathIndex<'a> {
+    info: BTreeMap<&'a ComponentId, PathInfo<'a>>,
+}
+
+impl<'a> DependencyPathIndex<'a> {
+    pub fn new(inventory: &'a Inventory) -> Self {
+        let mut outgoing: BTreeMap<&ComponentId, Vec<&ComponentId>> = BTreeMap::new();
+        let mut incoming: BTreeSet<&ComponentId> = BTreeSet::new();
+        for edge in &inventory.dependencies {
+            outgoing.entry(&edge.from).or_default().push(&edge.to);
+            incoming.insert(&edge.to);
         }
-        if shortest
-            .get(&current)
-            .is_some_and(|length| *length < path.len())
-        {
-            continue;
-        }
-        shortest.insert(current.clone(), path.len());
-        if &current == target {
-            results.push(
-                path.iter()
-                    .map(|id| id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" -> "),
-            );
-            continue;
-        }
-        if path.len() >= MAX_DEPENDENCY_DEPTH {
-            continue;
-        }
-        for edge in inventory
-            .dependencies
-            .iter()
-            .filter(|edge| edge.from == current)
-        {
-            if !path.contains(&edge.to) {
-                let mut next = path.clone();
-                next.push(edge.to.clone());
-                queue.push_back((edge.to.clone(), next));
+        let mut info: BTreeMap<&ComponentId, PathInfo> = BTreeMap::new();
+        let mut queue: VecDeque<&ComponentId> = VecDeque::new();
+        for id in inventory.components.keys() {
+            if !incoming.contains(id) {
+                info.insert(
+                    id,
+                    PathInfo {
+                        depth: 1,
+                        count: 1,
+                        best: Rc::new(vec![id]),
+                        predecessors: Vec::new(),
+                    },
+                );
+                queue.push_back(id);
             }
         }
+        while let Some(node) = queue.pop_front() {
+            let Some(PathInfo {
+                depth, count, best, ..
+            }) = info.get(node)
+            else {
+                continue;
+            };
+            if *depth >= MAX_DEPENDENCY_DEPTH {
+                continue;
+            }
+            let (depth, count, best) = (*depth, *count, Rc::clone(best));
+            for &next in outgoing.get(node).into_iter().flatten() {
+                let mut candidate = (*best).clone();
+                candidate.push(next);
+                match info.entry(next) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(PathInfo {
+                            depth: depth + 1,
+                            count,
+                            best: Rc::new(candidate),
+                            predecessors: vec![node],
+                        });
+                        queue.push_back(next);
+                    }
+                    Entry::Occupied(mut slot) => {
+                        let existing = slot.get_mut();
+                        if existing.depth == depth + 1 {
+                            existing.count = (existing.count + count).min(MAX_DEPENDENCY_PATHS + 1);
+                            if candidate < *existing.best {
+                                existing.best = Rc::new(candidate);
+                            }
+                            existing.predecessors.push(node);
+                        }
+                    }
+                }
+            }
+        }
+        for entry in info.values_mut() {
+            entry.predecessors.sort_unstable();
+        }
+        Self { info }
     }
-    // Consumers only use the count and one representative shortest path, so
-    // stopping at the cap keeps chained-diamond graphs linear instead of
-    // exponential; remaining queue entries mean the collection was truncated.
-    let truncated = results.len() >= MAX_DEPENDENCY_PATHS && !queue.is_empty();
-    results.sort_by_key(|path| (path.matches(" -> ").count(), path.clone()));
-    (results, truncated)
+
+    /// Returns up to `MAX_DEPENDENCY_PATHS` shortest root-to-target paths as
+    /// `"a -> b -> c"` strings sorted by length then lexically, plus whether
+    /// more shortest paths exist than the cap allows. The lexicographically
+    /// smallest path is always included so `paths.first()` is the stable
+    /// representative consumers display.
+    pub fn paths(&self, target: &ComponentId) -> (Vec<String>, bool) {
+        let Some(info) = self.info.get(target) else {
+            return (Vec::new(), false);
+        };
+        let mut paths = Vec::new();
+        let mut chain: Vec<&ComponentId> = vec![target];
+        let mut stack: Vec<(&ComponentId, std::slice::Iter<'_, &ComponentId>)> =
+            vec![(target, info.predecessors.iter())];
+        while let Some((node, predecessors)) = stack.last_mut() {
+            if paths.len() >= MAX_DEPENDENCY_PATHS {
+                break;
+            }
+            match predecessors.next() {
+                Some(&predecessor) => {
+                    chain.push(predecessor);
+                    stack.push((predecessor, self.info[predecessor].predecessors.iter()));
+                }
+                None => {
+                    if self.info[*node].predecessors.is_empty() {
+                        paths.push(
+                            chain
+                                .iter()
+                                .rev()
+                                .map(|id| id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" -> "),
+                        );
+                    }
+                    chain.pop();
+                    stack.pop();
+                }
+            }
+        }
+        let best = info
+            .best
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        if !paths.contains(&best) {
+            paths.pop();
+            paths.push(best);
+        }
+        paths.sort_by_key(|path| (path.matches(" -> ").count(), path.clone()));
+        (paths, info.count > MAX_DEPENDENCY_PATHS)
+    }
 }
 
 #[cfg(test)]
@@ -785,11 +879,12 @@ mod tests {
     fn analyze(version: &str, events: Vec<OsvEvent>, properties: &[(&str, &str)]) -> Applicability {
         let component = component(version, Scope::Runtime);
         let inventory = inventory(component.clone(), true);
+        let index = DependencyPathIndex::new(&inventory);
         let evidence = evidence(properties);
         let ranges = range(events);
         ApplicabilityAnalyzer::analyze(ApplicabilityInput {
             component: &component,
-            inventory: Some(&inventory),
+            paths: Some(&index),
             evidence: &evidence,
             affected_ranges: &ranges,
         })
@@ -803,6 +898,7 @@ mod tests {
         let mut component = component(version, Scope::Runtime);
         component.purl = format!("pkg:{purl_type}/lib@{version}");
         let inventory = inventory(component.clone(), true);
+        let index = DependencyPathIndex::new(&inventory);
         let evidence = evidence(&[]);
         let ranges = vec![OsvAffectedRange {
             range_type: OsvRangeType::Semver,
@@ -811,7 +907,7 @@ mod tests {
         }];
         ApplicabilityAnalyzer::analyze(ApplicabilityInput {
             component: &component,
-            inventory: Some(&inventory),
+            paths: Some(&index),
             evidence: &evidence,
             affected_ranges: &ranges,
         })
@@ -907,11 +1003,12 @@ mod tests {
     fn absent_or_unusable_range_is_unknown_not_suppressed() {
         let component = component("1.0", Scope::Unknown);
         let inventory = inventory(component.clone(), false);
+        let index = DependencyPathIndex::new(&inventory);
         let evidence = BTreeSet::new();
         assert_eq!(
             ApplicabilityAnalyzer::analyze(ApplicabilityInput {
                 component: &component,
-                inventory: Some(&inventory),
+                paths: Some(&index),
                 evidence: &evidence,
                 affected_ranges: &[]
             })
@@ -929,7 +1026,7 @@ mod tests {
         assert_eq!(
             ApplicabilityAnalyzer::analyze(ApplicabilityInput {
                 component: &component,
-                inventory: Some(&inventory),
+                paths: Some(&index),
                 evidence: &evidence,
                 affected_ranges: &git
             })
@@ -977,6 +1074,7 @@ mod tests {
     fn unknown_range_alongside_affected_range_is_not_suppressed() {
         let component = component("1.0", Scope::Runtime);
         let inventory = inventory(component.clone(), true);
+        let index = DependencyPathIndex::new(&inventory);
         let evidence = BTreeSet::new();
         let ranges = [
             OsvAffectedRange {
@@ -998,11 +1096,48 @@ mod tests {
         ];
         let result = ApplicabilityAnalyzer::analyze(ApplicabilityInput {
             component: &component,
-            inventory: Some(&inventory),
+            paths: Some(&index),
             evidence: &evidence,
             affected_ranges: &ranges,
         });
         assert_eq!(result.status, ApplicabilityStatus::UnderInvestigation);
+    }
+
+    #[test]
+    fn introduced_zero_still_requires_a_comparable_version() {
+        // `introduced: "0"` means "since the beginning", but a version that
+        // cannot be parsed was never compared: the verdict must be unknown
+        // with an honest rationale, not a fabricated "falls within".
+        let events = vec![OsvEvent {
+            introduced: Some("0".into()),
+            ..OsvEvent::default()
+        }];
+        for version in ["~4.5", "^5.4.47 || ^6.0", "*"] {
+            let result = analyze(version, events.clone(), &[]);
+            assert_eq!(
+                result.status,
+                ApplicabilityStatus::Unknown,
+                "{version} must not be reported affected"
+            );
+            let rationale = result.rationale.unwrap();
+            assert!(
+                rationale.contains("could not be compared"),
+                "{version}: {rationale}"
+            );
+            assert!(
+                !rationale.contains("falls within"),
+                "{version}: {rationale}"
+            );
+        }
+        // Parseable versions still compare against the zero boundary.
+        assert_eq!(
+            analyze("1.0", events.clone(), &[]).status,
+            ApplicabilityStatus::Affected
+        );
+        assert_eq!(
+            analyze("0.0.0-alpha", events, &[]).status,
+            ApplicabilityStatus::NotAffected
+        );
     }
 
     #[test]
@@ -1263,9 +1398,11 @@ mod tests {
                 (bottom, sink),
             ]);
         }
+
         let target = 3 * DIAMONDS;
         let (inventory, ids) = graph_inventory(&edges);
-        let (paths, truncated) = dependency_paths(&inventory, &ids[target]);
+        let index = DependencyPathIndex::new(&inventory);
+        let (paths, truncated) = index.paths(&ids[target]);
         assert!(truncated);
         assert_eq!(paths.len(), MAX_DEPENDENCY_PATHS);
         for path in &paths {
@@ -1274,16 +1411,14 @@ mod tests {
             assert_eq!(path.matches(" -> ").count(), 2 * DIAMONDS);
         }
         // Enumeration order is deterministic across repeated calls.
-        assert_eq!(
-            dependency_paths(&inventory, &ids[target]),
-            (paths.clone(), truncated)
-        );
+        assert_eq!(index.paths(&ids[target]), (paths.clone(), truncated));
     }
 
     #[test]
     fn dependency_paths_preserves_all_shortest_paths_below_cap() {
         let (inventory, ids) = graph_inventory(&[(0, 1), (0, 2), (1, 3), (2, 3)]);
-        let (paths, truncated) = dependency_paths(&inventory, &ids[3]);
+        let index = DependencyPathIndex::new(&inventory);
+        let (paths, truncated) = index.paths(&ids[3]);
         assert!(!truncated);
         assert_eq!(
             paths,
@@ -1294,11 +1429,55 @@ mod tests {
         );
         // Linear chain yields exactly one path.
         let (inventory, ids) = graph_inventory(&[(0, 1), (1, 2)]);
-        let (paths, truncated) = dependency_paths(&inventory, &ids[2]);
+        let index = DependencyPathIndex::new(&inventory);
+        let (paths, truncated) = index.paths(&ids[2]);
         assert!(!truncated);
         assert_eq!(
             paths,
             vec!["component:n0 -> component:n1 -> component:n2".to_owned()]
         );
+    }
+    #[test]
+    fn dependency_path_index_serves_every_target_from_one_traversal() {
+        // The index answers path queries for every component after a single
+        // BFS, including isolated components (their own one-node path) and
+        // components unreachable from any root.
+        let (inventory, ids) = graph_inventory(&[(0, 1), (0, 2), (1, 3), (2, 3)]);
+        let index = DependencyPathIndex::new(&inventory);
+        assert_eq!(
+            index.paths(&ids[0]),
+            (vec!["component:n0".to_owned()], false)
+        );
+        assert_eq!(
+            index.paths(&ids[1]),
+            (vec!["component:n0 -> component:n1".to_owned()], false)
+        );
+        assert_eq!(index.paths(&ids[3]).0.len(), 2);
+
+        // A component with no incoming edge and no edges at all is its own
+        // root and reports exactly one path.
+        let (mut inventory, _) = graph_inventory(&[(0, 1)]);
+        let isolated = ComponentId::new("component:isolated").unwrap();
+        inventory.components.insert(
+            isolated.clone(),
+            Component {
+                identity: isolated.clone(),
+                name: "isolated".into(),
+                version: "1".into(),
+                purl: "pkg:cargo/isolated@1".into(),
+                scope: Scope::Runtime,
+                provenance: BTreeSet::new(),
+                licenses: BTreeSet::new(),
+                locations: BTreeSet::new(),
+            },
+        );
+        let index = DependencyPathIndex::new(&inventory);
+        assert_eq!(
+            index.paths(&isolated),
+            (vec!["component:isolated".to_owned()], false)
+        );
+        // Unknown targets report no paths.
+        let missing = ComponentId::new("component:missing").unwrap();
+        assert_eq!(index.paths(&missing), (Vec::new(), false));
     }
 }

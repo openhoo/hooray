@@ -650,6 +650,18 @@ fn decode_time(field: &'static str, value: &str) -> Result<i64, MonitorError> {
     Ok((encoded ^ (1_u64 << 63)) as i64)
 }
 
+/// Decodes a stored biased-sortable timestamp and renders it as RFC 3339 for
+/// CLI display. Fails closed on malformed or out-of-range encodings instead of
+/// leaking the internal sortable form.
+pub fn display_time(field: &'static str, value: &str) -> Result<String, MonitorError> {
+    let timestamp = decode_time(field, value)?;
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .ok_or_else(|| {
+            MonitorError::Persistence(format!("stored {field} timestamp is out of range"))
+        })
+}
+
 fn store_error(error: crate::store::StoreError) -> MonitorError {
     MonitorError::Store(error)
 }

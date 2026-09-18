@@ -63,13 +63,22 @@ pub(crate) fn repository_walk(
         {
             inspect_ignore_controls(entry.path(), &filter_budget);
         }
-        !has_ignore_violation(&filter_budget)
+        !is_vcs_metadata_directory(entry) && !has_ignore_violation(&filter_budget)
     });
     RepositoryWalk {
         inner: builder.build(),
         budget,
         finished: false,
     }
+}
+
+/// VCS internals (`.git/`, `.hg/`, `.svn/`) are not project input: their object
+/// stores trip byte bounds and distort coverage counters. Only directories are
+/// excluded — a `.git` *file* is a worktree/submodule gitdir pointer and stays.
+fn is_vcs_metadata_directory(entry: &ignore::DirEntry) -> bool {
+    entry.depth() > 0
+        && entry.file_type().is_some_and(|kind| kind.is_dir())
+        && matches!(entry.file_name().to_str(), Some(".git" | ".hg" | ".svn"))
 }
 
 fn inspect_ancestor_ignore_controls(root: &Path, budget: &SharedIgnoreBudget) {
@@ -301,6 +310,62 @@ mod tests {
         assert!(files.contains("main.py"));
         assert!(!files.contains("ignored/secret.py"));
         assert!(!files.contains("fixtures/bad.py"));
+    }
+
+    #[test]
+    fn repository_walk_skips_vcs_metadata_but_keeps_hidden_sources() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join(".git/objects/pack")).unwrap();
+        fs::create_dir_all(directory.path().join(".hg/store")).unwrap();
+        fs::create_dir_all(directory.path().join(".svn")).unwrap();
+        fs::create_dir_all(directory.path().join("vendor/repo/.git")).unwrap();
+        fs::create_dir_all(directory.path().join(".github/workflows")).unwrap();
+        fs::create_dir_all(directory.path().join("linked")).unwrap();
+        fs::write(
+            directory.path().join(".git/objects/pack/pack-1.pack"),
+            "pack",
+        )
+        .unwrap();
+        fs::write(directory.path().join(".git/config"), "config").unwrap();
+        fs::write(directory.path().join(".hg/store/data.i"), "data").unwrap();
+        fs::write(directory.path().join(".svn/entries"), "entries").unwrap();
+        fs::write(directory.path().join("vendor/repo/.git/config"), "config").unwrap();
+        fs::write(directory.path().join("vendor/repo/lib.py"), "visible").unwrap();
+        fs::write(directory.path().join(".github/workflows/ci.yml"), "visible").unwrap();
+        // A `.git` *file* is a worktree/submodule gitdir pointer, not metadata.
+        fs::write(
+            directory.path().join("linked/.git"),
+            "gitdir: ../.git/modules/linked",
+        )
+        .unwrap();
+        fs::write(directory.path().join("main.py"), "visible").unwrap();
+
+        let files: BTreeSet<_> = repository_walk(directory.path(), false, None)
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .map(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(directory.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert!(files.contains("main.py"));
+        assert!(files.contains(".github/workflows/ci.yml"));
+        assert!(files.contains("vendor/repo/lib.py"));
+        assert!(files.contains("linked/.git"));
+        for path in &files {
+            assert!(
+                !path
+                    .split('/')
+                    .any(|segment| matches!(segment, ".git" | ".hg" | ".svn")
+                        && *path != "linked/.git"),
+                "VCS metadata leaked into walk: {path}"
+            );
+        }
     }
 
     #[test]

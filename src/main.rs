@@ -20,7 +20,7 @@ use hooray::{
     model::{RunId, ScanReport},
     monitor::{
         AdvisoryCursor, AdvisoryRefresh, AlertEvent, Evaluation, MonitorConfig, MonitorError,
-        MonitorFuture, MonitorRunner, MonitorService, Notifier, SystemClock,
+        MonitorFuture, MonitorRunner, MonitorService, Notifier, SystemClock, display_time,
     },
     report::{self, ReportFormat},
     store::{MonitorTarget, Store},
@@ -84,6 +84,9 @@ struct ScanTargetArgs {
     baseline: Option<RunId>,
     #[arg(long)]
     new_findings_only: bool,
+    /// Disable OSV access; equivalent to `HOORAY_OFFLINE=true` or `offline: true`.
+    #[arg(long)]
+    offline: bool,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -113,7 +116,7 @@ struct PolicyEvaluateArgs {
     #[arg(long, value_name = "RUN_ID")]
     run_id: RunId,
     #[command(flatten)]
-    output: OutputArgs,
+    output: DataOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -121,7 +124,7 @@ struct InventoryArgs {
     #[arg(long, value_name = "RUN_ID")]
     run_id: Option<RunId>,
     #[command(flatten)]
-    output: OutputArgs,
+    output: DataOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -144,7 +147,7 @@ struct HistoryListArgs {
     #[arg(long, default_value_t = 0)]
     offset: u64,
     #[command(flatten)]
-    output: OutputArgs,
+    output: DataOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -152,7 +155,7 @@ struct HistoryShowArgs {
     #[arg(value_name = "RUN_ID")]
     run_id: RunId,
     #[command(flatten)]
-    output: OutputArgs,
+    output: DataOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -162,7 +165,7 @@ struct HistoryDiffArgs {
     #[arg(value_name = "CURRENT_RUN_ID")]
     current: RunId,
     #[command(flatten)]
-    output: OutputArgs,
+    output: DataOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -236,7 +239,7 @@ struct MonitorTargetsListArgs {
     #[arg(long, default_value_t = 0)]
     offset: u64,
     #[command(flatten)]
-    output: OutputArgs,
+    output: MonitorTargetsOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -296,6 +299,50 @@ enum OutputFormat {
     JsonLines,
     GitlabArtifacts,
     Csv,
+}
+
+// Structured-data output shared by commands whose renderers only serialize
+// values: `policy evaluate`, `inventory`, and every `history` subcommand.
+// Keeping this enum separate from `OutputFormat` means `--help` can never
+// advertise a format the command would reject at runtime.
+#[derive(Debug, Args)]
+struct DataOutputArgs {
+    #[arg(long, value_enum, default_value_t = DataFormat::Json)]
+    format: DataFormat,
+    #[arg(long, default_value = "-", value_name = "FILE")]
+    output: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DataFormat {
+    Json,
+    Yaml,
+}
+
+// `monitor targets list` additionally renders a human-readable table.
+#[derive(Debug, Args)]
+struct MonitorTargetsOutputArgs {
+    #[arg(long, value_enum, default_value_t = MonitorTargetsFormat::Json)]
+    format: MonitorTargetsFormat,
+    #[arg(long, default_value = "-", value_name = "FILE")]
+    output: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum MonitorTargetsFormat {
+    Json,
+    Yaml,
+    Table,
+}
+
+impl MonitorTargetsFormat {
+    fn data_format(self) -> Option<DataFormat> {
+        match self {
+            Self::Json => Some(DataFormat::Json),
+            Self::Yaml => Some(DataFormat::Yaml),
+            Self::Table => None,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -386,10 +433,13 @@ async fn run_scan(config: &Config, args: ScanArgs) -> Result<CommandOutcome> {
     let path = stdin
         .as_ref()
         .map_or(args.input.as_path(), |file| file.path.as_path());
+    let offline = args.offline;
     let input = detect_input(kind, path, config)?;
     let policy_path = args.policy.unwrap_or_else(|| config.policy_path.clone());
     let mut store = open_store(config)?;
-    let mut engine = Engine::new(config, &mut store, None);
+    let mut effective = config.clone();
+    effective.offline = config.offline || offline;
+    let mut engine = Engine::new(&effective, &mut store, None);
     let mut request = ScanRequest::new(input, policy_path);
     request.baseline = args.baseline;
     request.new_findings_only = args.new_findings_only;
@@ -576,6 +626,14 @@ fn run_monitor_targets(config: &Config, args: MonitorTargetsArgs) -> Result<Comm
     let mut store = open_store(config)?;
     match args.command {
         MonitorTargetsCommand::Add(args) => {
+            // The source is walked every monitor cycle; reject a path that
+            // cannot exist at registration instead of deferring the failure.
+            if !Path::new(&args.source)
+                .try_exists()
+                .with_context(|| format!("cannot access monitor source '{}'", args.source))?
+            {
+                bail!("monitor source '{}' does not exist", args.source);
+            }
             let target = MonitorTarget::new(
                 args.target_id,
                 args.source,
@@ -586,14 +644,25 @@ fn run_monitor_targets(config: &Config, args: MonitorTargetsArgs) -> Result<Comm
             println!("added monitor target '{}'", target.target_id);
         }
         MonitorTargetsCommand::List(args) => {
-            let targets = store.list_monitor_targets(args.limit, args.offset)?;
-            if args.output.format == OutputFormat::Table {
-                write_bytes(
+            let mut targets = store.list_monitor_targets(args.limit, args.offset)?;
+            // Stored timestamps use the biased-sortable encode_time form;
+            // decode them to RFC 3339 before any rendering sees them.
+            for target in &mut targets {
+                target.next_due_at = display_time("next_due_at", &target.next_due_at)?;
+                target.updated_at = display_time("updated_at", &target.updated_at)?;
+            }
+            match args.output.format.data_format() {
+                None => write_bytes(
                     render_monitor_targets_table(&targets).as_bytes(),
                     &args.output.output,
-                )?;
-            } else {
-                write_output(&targets, &args.output)?;
+                )?,
+                Some(format) => write_output(
+                    &targets,
+                    &DataOutputArgs {
+                        format,
+                        output: args.output.output.clone(),
+                    },
+                )?,
             }
         }
         MonitorTargetsCommand::Remove(args) => {
@@ -689,12 +758,19 @@ impl MonitorRunner for CliMonitorRunner {
     }
 
     fn policy_digest(&self) -> Result<String, MonitorError> {
-        let bytes = read_bounded(&self.config.policy_path, self.config.max_input_bytes)
-            .map_err(|error| MonitorError::Runner(error.to_string()))?;
+        let bytes = read_bounded(&self.config.policy_path, self.config.max_input_bytes).map_err(
+            |error| {
+                MonitorError::Runner(format!(
+                    "failed to read policy {}: {error}",
+                    self.config.policy_path.display()
+                ))
+            },
+        )?;
         if bytes.len() as u64 > self.config.max_input_bytes {
-            return Err(MonitorError::Runner(
-                "policy exceeds configured input bound".into(),
-            ));
+            return Err(MonitorError::Runner(format!(
+                "policy {} exceeds configured input bound",
+                self.config.policy_path.display()
+            )));
         }
         Ok(sha256_hex(&bytes))
     }
@@ -893,14 +969,10 @@ fn write_report_output(report: &ScanReport, args: &OutputArgs) -> Result<()> {
     Ok(())
 }
 
-fn write_output<T: Serialize>(value: &T, args: &OutputArgs) -> Result<()> {
-    if !matches!(args.format, OutputFormat::Json | OutputFormat::Yaml) {
-        bail!("this command supports only json and yaml output");
-    }
-    let mut bytes = if args.format == OutputFormat::Json {
-        serde_json::to_vec_pretty(value)?
-    } else {
-        serde_yaml::to_string(value)?.into_bytes()
+fn write_output<T: Serialize>(value: &T, args: &DataOutputArgs) -> Result<()> {
+    let mut bytes = match args.format {
+        DataFormat::Json => serde_json::to_vec_pretty(value)?,
+        DataFormat::Yaml => serde_yaml::to_string(value)?.into_bytes(),
     };
     bytes.push(b'\n');
     write_bytes(&bytes, &args.output)
@@ -985,6 +1057,23 @@ mod tests {
 
     fn output(path: PathBuf, format: OutputFormat) -> OutputArgs {
         OutputArgs {
+            format,
+            output: path,
+        }
+    }
+
+    fn data_output(path: PathBuf, format: DataFormat) -> DataOutputArgs {
+        DataOutputArgs {
+            format,
+            output: path,
+        }
+    }
+
+    fn monitor_targets_output(
+        path: PathBuf,
+        format: MonitorTargetsFormat,
+    ) -> MonitorTargetsOutputArgs {
+        MonitorTargetsOutputArgs {
             format,
             output: path,
         }
@@ -1159,7 +1248,7 @@ mod tests {
                 command: PolicyCommand::Evaluate(PolicyEvaluateArgs {
                     policy,
                     run_id: RunId::new("run:evaluate").unwrap(),
-                    output: output(destination.clone(), OutputFormat::Yaml),
+                    output: data_output(destination.clone(), DataFormat::Yaml),
                 }),
             },
         )
@@ -1194,7 +1283,7 @@ mod tests {
                 command: HistoryCommand::List(HistoryListArgs {
                     limit: 1,
                     offset: 0,
-                    output: output(list.clone(), OutputFormat::Json),
+                    output: data_output(list.clone(), DataFormat::Json),
                 }),
             },
         )
@@ -1209,7 +1298,7 @@ mod tests {
             HistoryArgs {
                 command: HistoryCommand::Show(HistoryShowArgs {
                     run_id: RunId::new("run:one").unwrap(),
-                    output: output(show.clone(), OutputFormat::Yaml),
+                    output: data_output(show.clone(), DataFormat::Yaml),
                 }),
             },
         )
@@ -1224,7 +1313,7 @@ mod tests {
                 command: HistoryCommand::Diff(HistoryDiffArgs {
                     previous: RunId::new("run:one").unwrap(),
                     current: RunId::new("run:two").unwrap(),
-                    output: output(diff.clone(), OutputFormat::Json),
+                    output: data_output(diff.clone(), DataFormat::Json),
                 }),
             },
         )
@@ -1239,7 +1328,7 @@ mod tests {
             &config,
             InventoryArgs {
                 run_id: None,
-                output: output(inventory.clone(), OutputFormat::Json),
+                output: data_output(inventory.clone(), DataFormat::Json),
             },
         )
         .unwrap();
@@ -1335,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn input_kind_mismatch_and_unsupported_structured_output_fail_closed() {
+    fn input_kind_mismatch_fails_closed() {
         let temp = TempDir::new().unwrap();
         let config = config(&temp);
         let sbom = temp.path().join("bom.cdx.json");
@@ -1346,17 +1435,55 @@ mod tests {
                 .to_string()
                 .contains("does not match")
         );
-        let destination = temp.path().join("unsupported.out");
-        assert!(
-            write_output(
-                &json!({"safe": true}),
-                &output(destination.clone(), OutputFormat::Html)
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("only json and yaml")
-        );
-        assert!(!destination.exists() || std::fs::read(destination).unwrap().is_empty());
+    }
+
+    #[test]
+    fn data_commands_advertise_only_the_formats_they_render() {
+        // Every format a data command's --help lists must parse, and nothing
+        // else may: clap rejection is the only guard now.
+        for command in [
+            "hooray policy evaluate policy.yaml --run-id run:x --format json",
+            "hooray policy evaluate policy.yaml --run-id run:x --format yaml",
+            "hooray inventory --format json",
+            "hooray inventory --format yaml",
+            "hooray history list --format json",
+            "hooray history list --format yaml",
+            "hooray history show run:x --format json",
+            "hooray history diff run:a run:b --format yaml",
+            "hooray monitor targets list --format json",
+            "hooray monitor targets list --format yaml",
+            "hooray monitor targets list --format table",
+        ] {
+            assert!(
+                Cli::try_parse_from(command.split_whitespace()).is_ok(),
+                "{command}"
+            );
+        }
+        for command in [
+            "hooray policy evaluate policy.yaml --run-id run:x --format table",
+            "hooray inventory --format sarif",
+            "hooray history list --format table",
+            "hooray history show run:x --format html",
+            "hooray history diff run:a run:b --format json-lines",
+            "hooray monitor targets list --format sarif",
+            "hooray monitor targets list --format gitlab-artifacts",
+        ] {
+            let error = Cli::try_parse_from(command.split_whitespace())
+                .expect_err(&format!("{command} must be rejected"));
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        }
+        // Scan and stored-report commands still accept the full format set.
+        for command in [
+            "hooray scan project . --format sarif",
+            "hooray scan project . --format table",
+            "hooray report run:x --format html",
+            "hooray report run:x --format gitlab-artifacts",
+        ] {
+            assert!(
+                Cli::try_parse_from(command.split_whitespace()).is_ok(),
+                "{command}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1374,22 +1501,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("does not support --once"));
-    }
-
-    #[test]
-    fn structured_output_rejects_bundle_before_opening_destination() {
-        let temp = TempDir::new().unwrap();
-        let destination = temp.path().join("unsupported.out");
-        assert!(
-            write_output(
-                &json!({"safe": true}),
-                &output(destination.clone(), OutputFormat::GitlabArtifacts)
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("only json and yaml")
-        );
-        assert!(!destination.exists());
     }
 
     #[test]
@@ -1482,7 +1593,7 @@ mod tests {
         std::fs::write(&destination, [b'x'; 4096]).unwrap();
         write_output(
             &json!({"status": "passed"}),
-            &output(destination.clone(), OutputFormat::Json),
+            &data_output(destination.clone(), DataFormat::Json),
         )
         .unwrap();
         let bytes = std::fs::read(destination).unwrap();
@@ -1545,7 +1656,8 @@ mod tests {
         };
         let policy_error = runner.policy_digest().unwrap_err().to_string();
         assert!(
-            policy_error.contains("policy exceeds configured input bound"),
+            policy_error.contains("policy.yaml")
+                && policy_error.contains("exceeds configured input bound"),
             "{policy_error}"
         );
         let target = hooray::monitor::MonitorTarget {
@@ -2081,7 +2193,7 @@ mod tests {
         let add = |id: &str| MonitorTargetsArgs {
             command: MonitorTargetsCommand::Add(MonitorTargetAddArgs {
                 target_id: id.into(),
-                source: "repo".into(),
+                source: temp.path().display().to_string(),
                 interval_seconds: 60,
             }),
         };
@@ -2095,7 +2207,7 @@ mod tests {
                 command: MonitorTargetsCommand::List(MonitorTargetsListArgs {
                     limit: 10,
                     offset: 0,
-                    output: output(listed.clone(), OutputFormat::Json),
+                    output: monitor_targets_output(listed.clone(), MonitorTargetsFormat::Json),
                 }),
             },
         )
@@ -2104,10 +2216,14 @@ mod tests {
         let rows = values.as_array().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["target_id"], "alpha");
-        assert_eq!(rows[0]["source"], "repo");
+        assert_eq!(rows[0]["source"], json!(temp.path().display().to_string()));
         assert_eq!(rows[0]["interval_seconds"], 60);
         assert_eq!(rows[0]["finding_ids"], json!([]));
-        assert_eq!(rows[0]["next_due_at"].as_str().unwrap().len(), 20);
+        // Timestamps must reach the CLI decoded to RFC 3339, not the internal
+        // biased-sortable encode_time form.
+        let next_due_at = rows[0]["next_due_at"].as_str().unwrap();
+        chrono::DateTime::parse_from_rfc3339(next_due_at).unwrap();
+        chrono::DateTime::parse_from_rfc3339(rows[0]["updated_at"].as_str().unwrap()).unwrap();
 
         let duplicate = run_monitor_targets(&config, add("zeta")).unwrap_err();
         assert!(duplicate.to_string().contains("already exists"));
@@ -2119,7 +2235,7 @@ mod tests {
                 command: MonitorTargetsCommand::List(MonitorTargetsListArgs {
                     limit: 10,
                     offset: 0,
-                    output: output(table.clone(), OutputFormat::Table),
+                    output: monitor_targets_output(table.clone(), MonitorTargetsFormat::Table),
                 }),
             },
         )
@@ -2127,13 +2243,18 @@ mod tests {
         let rendered = std::fs::read_to_string(&table).unwrap();
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(lines.len(), 3);
-        assert_eq!(
-            lines[0],
-            "TARGET_ID  SOURCE  INTERVAL_SECONDS  NEXT_DUE_AT           UPDATED_AT"
-        );
-        // Encoded timestamps are 20 characters wide and widen the column.
+        for header in [
+            "TARGET_ID",
+            "SOURCE",
+            "INTERVAL_SECONDS",
+            "NEXT_DUE_AT",
+            "UPDATED_AT",
+        ] {
+            assert!(lines[0].contains(header), "missing {header}: {}", lines[0]);
+        }
         assert!(lines[1].contains("  60  ") && lines[2].contains("  60  "));
         assert!(lines[1].starts_with("alpha") && lines[2].starts_with("zeta"));
+        assert!(lines[1].contains(next_due_at));
 
         let remove = |id: &str| MonitorTargetsArgs {
             command: MonitorTargetsCommand::Remove(MonitorTargetRemoveArgs {
@@ -2152,7 +2273,7 @@ mod tests {
                 command: MonitorTargetsCommand::List(MonitorTargetsListArgs {
                     limit: 10,
                     offset: 0,
-                    output: output(empty.clone(), OutputFormat::Json),
+                    output: monitor_targets_output(empty.clone(), MonitorTargetsFormat::Json),
                 }),
             },
         )
@@ -2160,6 +2281,54 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<Value>(&std::fs::read(&empty).unwrap()).unwrap(),
             json!([])
+        );
+    }
+
+    #[test]
+    fn monitor_targets_add_rejects_a_source_that_does_not_exist() {
+        let temp = TempDir::new().unwrap();
+        let config = config(&temp);
+        let missing = temp.path().join("no-such-source");
+        let error = run_monitor_targets(
+            &config,
+            MonitorTargetsArgs {
+                command: MonitorTargetsCommand::Add(MonitorTargetAddArgs {
+                    target_id: "ghost".into(),
+                    source: missing.display().to_string(),
+                    interval_seconds: 60,
+                }),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not exist"),
+            "unexpected error: {error:#}"
+        );
+        assert!(error.to_string().contains("no-such-source"));
+        let store = Store::open(&config.database_path).unwrap();
+        assert!(store.list_monitor_targets(10, 0).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monitor_once_names_the_missing_policy_file() {
+        let temp = TempDir::new().unwrap();
+        let config = config(&temp);
+        // config() points policy_path at a file that is never created.
+        let error = run_monitor(
+            &config,
+            MonitorArgs {
+                once: true,
+                webhook_url: None,
+                webhook_secret_env: None,
+                command: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("policy.yaml"),
+            "missing policy must be named: {rendered}"
         );
     }
 

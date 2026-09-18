@@ -54,14 +54,16 @@ pub(crate) fn parse_package_lock(
 ) -> Result<(), InputError> {
     let lock: NpmLock =
         serde_json::from_slice(bytes).map_err(|e| malformed(path, "package-lock.json", e))?;
-    if !lock.packages.is_empty() {
-        parse_npm_packages_v2(&lock, path, out)?;
+    let root_version = if !lock.packages.is_empty() {
+        parse_npm_packages_v2(&lock, path, out)?
     } else {
         parse_npm_dependencies_v1(&lock, path, out)?;
-    }
-    if let Some(name) = lock.name {
-        out.asset.name = name;
-    }
+        None
+    };
+    // Root-anchored identity: the builder applies this claim only when no
+    // shallower lockfile already claimed the field, so nested lockfiles
+    // contribute components and edges but never override root identity.
+    out.claim_asset_identity(path, lock.name, root_version);
     Ok(())
 }
 
@@ -72,12 +74,13 @@ fn parse_npm_packages_v2(
     lock: &NpmLock,
     path: &str,
     out: &mut InventoryBuilder,
-) -> Result<(), InputError> {
+) -> Result<Option<String>, InputError> {
     entry_bound(lock.packages.len(), path, "package-lock.json")?;
     let mut ids = BTreeMap::new();
+    let mut root_version = None;
     for (key, package) in &lock.packages {
         if key.is_empty() {
-            out.asset.version = package.version.clone().or_else(|| lock.version.clone());
+            root_version = package.version.clone().or_else(|| lock.version.clone());
             continue;
         }
         let name = package
@@ -132,7 +135,7 @@ fn parse_npm_packages_v2(
             }
         }
     }
-    Ok(())
+    Ok(root_version)
 }
 
 /// npm v1 nested `dependencies`-tree ingestion.
@@ -297,6 +300,65 @@ mod tests {
                 .any(|e| e.from == a && e.to == b && e.scope == Scope::Runtime && !e.optional),
             "expected hoisted fallback edge a -> b"
         );
+    }
+
+    #[test]
+    fn npm_lockfile_identity_stays_anchored_to_root() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{"name":"root-app","version":"1.20.0","packages":{"":{"name":"root-app","version":"1.20.0"},"node_modules/root-dep":{"name":"root-dep","version":"1.0.0"}}}"#,
+        )
+        .unwrap();
+        // Nested lockfiles on both sides of the root in lexical order:
+        // "a/..." parses before "package-lock.json", "tests/..." after.
+        for (nested, name, dep) in [
+            ("a/package-lock.json", "nested-a", "dep-a"),
+            ("tests/smoke/package-lock.json", "nested-b", "dep-b"),
+        ] {
+            let nested_path = dir.path().join(nested);
+            fs::create_dir_all(nested_path.parent().unwrap()).unwrap();
+            fs::write(
+                nested_path,
+                format!(
+                    r#"{{"name":"{name}","version":"9.9.9","packages":{{"":{{"name":"{name}","version":"9.9.9"}},"node_modules/{dep}":{{"name":"{dep}","version":"2.0.0"}}}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.name, "root-app");
+        assert_eq!(inventory.asset.version.as_deref(), Some("1.20.0"));
+        for dep in ["root-dep", "dep-a", "dep-b"] {
+            assert!(
+                inventory.components.values().any(|c| c.name == dep),
+                "missing nested component {dep}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_nested_lockfiles_prefer_shallowest_identity() {
+        let dir = tempdir().unwrap();
+        // No root lockfile: the shallowest nested declarer wins even though
+        // the deeper "a/b/..." path parses first in lexical order.
+        for (nested, name) in [
+            ("a/b/package-lock.json", "deep"),
+            ("a/package-lock.json", "shallow"),
+        ] {
+            let nested_path = dir.path().join(nested);
+            fs::create_dir_all(nested_path.parent().unwrap()).unwrap();
+            fs::write(
+                nested_path,
+                format!(
+                    r#"{{"name":"{name}","version":"1.0.0","packages":{{"":{{"name":"{name}","version":"1.0.0"}}}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.name, "shallow");
+        assert_eq!(inventory.asset.version.as_deref(), Some("1.0.0"));
     }
 
     #[test]

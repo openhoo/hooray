@@ -9,7 +9,8 @@ use chrono::{TimeZone, Utc};
 
 use hooray::{
     analysis::{
-        ApplicabilityAnalyzer, ApplicabilityInput, OsvAffectedRange, OsvEvent, OsvRangeType,
+        ApplicabilityAnalyzer, ApplicabilityInput, DependencyPathIndex, OsvAffectedRange, OsvEvent,
+        OsvRangeType,
     },
     graph::DependencyGraph,
     model::{
@@ -242,6 +243,41 @@ fn report_fixture(component_count: usize, findings_per_component: usize) -> Scan
     }
 }
 
+/// Flat lockfile-shaped inventory: `count` components, no dependency edges.
+/// This is the shape that made per-finding path traversal quadratic.
+fn flat_inventory_fixture(count: usize) -> Inventory {
+    let components = (0..count)
+        .map(|index| {
+            let identity = component_id(format!("component:flat-{index:05}"));
+            (
+                identity.clone(),
+                Component {
+                    identity,
+                    name: format!("flat-{index:05}"),
+                    version: "1.0.0".into(),
+                    purl: format!("pkg:cargo/flat-{index:05}@1.0.0"),
+                    scope: Scope::Runtime,
+                    provenance: BTreeSet::new(),
+                    licenses: BTreeSet::new(),
+                    locations: BTreeSet::new(),
+                },
+            )
+        })
+        .collect();
+    Inventory {
+        asset: Asset {
+            id: AssetId::new("asset:flat").expect("asset id"),
+            name: "flat".into(),
+            kind: AssetKind::Repository,
+            version: None,
+            metadata: BTreeMap::new(),
+        },
+        components,
+        locations: BTreeSet::new(),
+        dependencies: BTreeSet::new(),
+    }
+}
+
 fn affected_ranges_fixture() -> Vec<OsvAffectedRange> {
     (0..200)
         .map(|range| OsvAffectedRange {
@@ -391,12 +427,29 @@ fn main() {
     let (iterations, elapsed) = measure(|| {
         black_box(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
             component: black_box(&analysis_component),
-            inventory: None,
+            paths: None,
             evidence: &evidence,
             affected_ranges: black_box(&ranges),
         }));
     });
     report("applicability_4000_events", iterations, elapsed);
+
+    // Regression guard for the quadratic per-finding path BFS: one shared
+    // index must serve every component's applicability analysis.
+    let flat = flat_inventory_fixture(2_000);
+    let flat_components: Vec<_> = flat.components.values().collect();
+    let (iterations, elapsed) = measure(|| {
+        let index = DependencyPathIndex::new(black_box(&flat));
+        for component in &flat_components {
+            black_box(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
+                component,
+                paths: Some(black_box(&index)),
+                evidence: &evidence,
+                affected_ranges: black_box(&ranges),
+            }));
+        }
+    });
+    report("applicability_flat_2000_shared_index", iterations, elapsed);
 
     let large_report = report_fixture(250, 2);
     let (iterations, elapsed) = measure(|| {

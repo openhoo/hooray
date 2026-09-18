@@ -23,16 +23,26 @@ use crate::{
 mod parsers;
 
 use self::parsers::{
-    archive::{read_entry_bounded, read_tar_file, read_zip_file},
+    archive::{
+        decompress_archive, read_entry_bounded, read_tar_file, read_zip_file, tar_entry_path,
+    },
+    bun::parse_bun_lock,
     cargo::parse_cargo_lock,
     conda::parse_conda_environment,
     dart::parse_pubspec_lock,
+    elixir::parse_mix_lock,
     go::parse_go_mod,
-    helm::parse_chart_yaml,
+    gradle::parse_gradle_lockfile,
+    gradle_catalog::parse_gradle_catalog,
+    haskell::{parse_cabal, parse_cabal_freeze},
+    helm::{parse_chart_lock, parse_chart_yaml},
     image::{scan_oci_layout, scan_oci_tar},
+    maven::parse_pom_xml,
     npm::parse_package_lock,
-    nuget::parse_nuget_lock,
-    php::parse_composer_json,
+    nuget::{
+        parse_csproj, parse_directory_packages_props, parse_nuget_lock, parse_packages_config,
+    },
+    php::{parse_composer_json, parse_composer_lock},
     pnpm::parse_pnpm_lock,
     python::{parse_pipfile_lock, parse_poetry_lock, parse_requirements},
     ruby::{parse_gemfile_lock, parse_podfile_lock},
@@ -95,6 +105,8 @@ pub enum InputError {
     DigestMismatch(String),
     #[error("OCI image has no manifest")]
     MissingManifest,
+    #[error("OCI image layer uses unsupported media type {0}")]
+    UnsupportedLayerMediaType(String),
     #[error("I/O error for {path}: {source}")]
     Io {
         path: PathBuf,
@@ -164,8 +176,15 @@ impl ScanInput {
                 format: ArchiveFormat::Zip,
             });
         }
-        if lower.ends_with(".tar") {
-            if tar_is_image(open_regular_nofollow(&canonical)?, config)? {
+        if lower.ends_with(".tar")
+            || lower.ends_with(".tar.gz")
+            || lower.ends_with(".tgz")
+            || lower.ends_with(".tar.zst")
+        {
+            if tar_is_image(
+                decompress_archive(open_regular_nofollow(&canonical)?)?,
+                config,
+            )? {
                 return Ok(Self::OciImageTar(canonical));
             }
             return Ok(Self::Archive {
@@ -244,41 +263,124 @@ fn scan_directory(root: &Path, config: &Config) -> Result<Inventory, InputError>
 }
 
 type LockfileParser = fn(&str, &[u8], &mut InventoryBuilder) -> Result<(), InputError>;
+type ManifestParser =
+    fn(&str, &[u8], Option<&Vec<u8>>, &mut InventoryBuilder) -> Result<(), InputError>;
+
+/// Lockfile parser that additionally sees the whole scanned file set (for
+/// in-tree parent/manifest resolution, e.g. Maven `<parent>` POMs).
+type TreeLockfileParser =
+    fn(&str, &[u8], &BTreeMap<String, Vec<u8>>, &mut InventoryBuilder) -> Result<(), InputError>;
+
+/// How a recognized inventory file is dispatched.
+enum LockfileRoute {
+    /// Plain lockfile parser.
+    Lock(LockfileParser),
+    /// Lockfile parser that receives the full scanned file set.
+    LockTree(TreeLockfileParser),
+    /// `Cargo.lock`, which additionally consumes the sibling `Cargo.toml`
+    /// manifest for license inheritance.
+    CargoLock,
+    /// Manifest whose dependency declarations are superseded by a sibling
+    /// lockfile (`composer.json`/`composer.lock`, `Chart.yaml`/`Chart.lock`).
+    Manifest {
+        parse: ManifestParser,
+        lock_name: &'static str,
+    },
+}
 
 /// Single registry of recognized ecosystem lockfiles. Virtual-file dispatch,
 /// directory inventory detection, and project-manifest detection all derive
 /// from this table so the filename set cannot drift between them.
-/// `Cargo.lock` carries `None` because it additionally consumes the sibling
-/// `Cargo.toml` manifest for license inheritance.
-const LOCKFILES: &[(&str, Option<LockfileParser>)] = &[
-    ("Cargo.lock", None),
-    ("package-lock.json", Some(parse_package_lock)),
-    ("requirements.txt", Some(parse_requirements)),
-    ("go.mod", Some(parse_go_mod)),
-    ("packages.lock.json", Some(parse_nuget_lock)),
-    ("yarn.lock", Some(parse_yarn_lock)),
-    ("pnpm-lock.yaml", Some(parse_pnpm_lock)),
-    ("poetry.lock", Some(parse_poetry_lock)),
-    ("Pipfile.lock", Some(parse_pipfile_lock)),
-    ("Gemfile.lock", Some(parse_gemfile_lock)),
-    ("Package.resolved", Some(parse_package_resolved)),
-    ("pubspec.lock", Some(parse_pubspec_lock)),
-    ("Podfile.lock", Some(parse_podfile_lock)),
-    ("composer.json", Some(parse_composer_json)),
-    ("environment.yml", Some(parse_conda_environment)),
-    ("Chart.yaml", Some(parse_chart_yaml)),
+const LOCKFILES: &[(&str, LockfileRoute)] = &[
+    ("Cargo.lock", LockfileRoute::CargoLock),
+    ("package-lock.json", LockfileRoute::Lock(parse_package_lock)),
+    ("requirements.txt", LockfileRoute::Lock(parse_requirements)),
+    ("go.mod", LockfileRoute::Lock(parse_go_mod)),
+    ("packages.lock.json", LockfileRoute::Lock(parse_nuget_lock)),
+    ("yarn.lock", LockfileRoute::Lock(parse_yarn_lock)),
+    ("pnpm-lock.yaml", LockfileRoute::Lock(parse_pnpm_lock)),
+    ("bun.lock", LockfileRoute::Lock(parse_bun_lock)),
+    ("poetry.lock", LockfileRoute::Lock(parse_poetry_lock)),
+    (
+        "cabal.project.freeze",
+        LockfileRoute::Lock(parse_cabal_freeze),
+    ),
+    ("Pipfile.lock", LockfileRoute::Lock(parse_pipfile_lock)),
+    ("Gemfile.lock", LockfileRoute::Lock(parse_gemfile_lock)),
+    ("mix.lock", LockfileRoute::Lock(parse_mix_lock)),
+    (
+        "Package.resolved",
+        LockfileRoute::Lock(parse_package_resolved),
+    ),
+    ("pubspec.lock", LockfileRoute::Lock(parse_pubspec_lock)),
+    ("Podfile.lock", LockfileRoute::Lock(parse_podfile_lock)),
+    (
+        "composer.json",
+        LockfileRoute::Manifest {
+            parse: parse_composer_json,
+            lock_name: "composer.lock",
+        },
+    ),
+    ("composer.lock", LockfileRoute::Lock(parse_composer_lock)),
+    (
+        "environment.yml",
+        LockfileRoute::Lock(parse_conda_environment),
+    ),
+    (
+        "Chart.yaml",
+        LockfileRoute::Manifest {
+            parse: parse_chart_yaml,
+            lock_name: "Chart.lock",
+        },
+    ),
+    ("Chart.lock", LockfileRoute::Lock(parse_chart_lock)),
+    (
+        "Directory.Packages.props",
+        LockfileRoute::Lock(parse_directory_packages_props),
+    ),
+    (
+        "packages.config",
+        LockfileRoute::Lock(parse_packages_config),
+    ),
+    ("pom.xml", LockfileRoute::LockTree(parse_pom_xml)),
 ];
 
 /// Repository files collected as inventory inputs that have no dedicated
 /// parser of their own.
 const MANIFEST_SIDECARS: &[&str] = &["Cargo.toml", "go.sum"];
 
-fn lockfile_parser(name: &str) -> Option<Option<LockfileParser>> {
-    LOCKFILES
+/// Resolves an inventory file to its route. Most lockfiles match by exact
+/// base name; MSBuild project files, Gradle dependency lockfiles, and Gradle
+/// version catalogs are recognized by their `.csproj`/`.lockfile`/
+/// `.versions.toml` extensions because the project, configuration, or
+/// catalog name is part of the filename.
+fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
+    if let Some(route) = LOCKFILES
         .iter()
         .find(|(candidate, _)| *candidate == name)
-        .map(|(_, parser)| *parser)
+        .map(|(_, route)| route)
+    {
+        return Some(route);
+    }
+    if name.ends_with(".csproj") {
+        return Some(&CS_PROJ_ROUTE);
+    }
+    if name.ends_with(".versions.toml") {
+        return Some(&GRADLE_CATALOG_ROUTE);
+    }
+    if name.ends_with(".cabal") {
+        return Some(&CABAL_ROUTE);
+    }
+    name.ends_with(".lockfile")
+        .then_some(&GRADLE_LOCKFILE_ROUTE)
 }
+
+/// Routes for extension-matched files, stored as statics so
+/// `lockfile_route` can return shared references.
+static CS_PROJ_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_csproj);
+static GRADLE_LOCKFILE_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_gradle_lockfile);
+static GRADLE_CATALOG_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_gradle_catalog);
+static CABAL_ROUTE: LockfileRoute = LockfileRoute::LockTree(parse_cabal);
 
 fn scan_virtual_files(
     locator: &Path,
@@ -289,18 +391,26 @@ fn scan_virtual_files(
     let mut builder = InventoryBuilder::new(asset_id, locator, kind);
     let mut recognized = false;
     for (path, bytes) in &files {
-        if let Some(parser) = lockfile_parser(base_name(path)) {
-            match parser {
-                Some(parse) => parse(path, bytes, &mut builder)?,
-                None => parse_cargo_lock(
-                    path,
-                    bytes,
-                    files.get(&sibling(path, "Cargo.toml")),
-                    &mut builder,
-                )?,
-            }
-            recognized = true;
+        let Some(route) = lockfile_route(base_name(path)) else {
+            continue;
+        };
+        match route {
+            LockfileRoute::Lock(parse) => parse(path, bytes, &mut builder)?,
+            LockfileRoute::LockTree(parse) => parse(path, bytes, &files, &mut builder)?,
+            LockfileRoute::CargoLock => parse_cargo_lock(
+                path,
+                bytes,
+                files.get(&sibling(path, "Cargo.toml")),
+                &mut builder,
+            )?,
+            LockfileRoute::Manifest { parse, lock_name } => parse(
+                path,
+                bytes,
+                files.get(&sibling(path, lock_name)),
+                &mut builder,
+            )?,
         }
+        recognized = true;
     }
     if !recognized && kind != AssetKind::Repository {
         return Err(InputError::UnsupportedFormat(locator.to_owned()));
@@ -312,6 +422,10 @@ struct InventoryBuilder {
     asset: Asset,
     components: BTreeMap<ComponentId, Component>,
     dependencies: BTreeSet<DependencyEdge>,
+    /// Depth (path-separator count) of the lockfile that last claimed each
+    /// asset identity field; `None` while the field is unclaimed.
+    asset_name_depth: Option<usize>,
+    asset_version_depth: Option<usize>,
 }
 
 impl InventoryBuilder {
@@ -333,6 +447,34 @@ impl InventoryBuilder {
             },
             components: BTreeMap::new(),
             dependencies: BTreeSet::new(),
+            asset_name_depth: None,
+            asset_version_depth: None,
+        }
+    }
+
+    /// Applies a lockfile's asset identity claim. Asset identity is anchored
+    /// to the lockfile closest to the scan root: a field claim applies only
+    /// when no shallower lockfile already claimed that field, so nested
+    /// lockfiles contribute components and edges but never override identity
+    /// set closer to the root. Claims at equal depth keep the first-parsed
+    /// value (lexically smallest path, since files are parsed in `BTreeMap`
+    /// order). When no root-level lockfile declares identity, the shallowest
+    /// nested declarer wins each field.
+    fn claim_asset_identity(&mut self, path: &str, name: Option<String>, version: Option<String>) {
+        let depth = path.matches('/').count();
+        if let Some(name) = name
+            && self.asset_name_depth.is_none_or(|claimed| depth < claimed)
+        {
+            self.asset.name = name;
+            self.asset_name_depth = Some(depth);
+        }
+        if version.is_some()
+            && self
+                .asset_version_depth
+                .is_none_or(|claimed| depth < claimed)
+        {
+            self.asset.version = version;
+            self.asset_version_depth = Some(depth);
         }
     }
 
@@ -370,7 +512,12 @@ impl InventoryBuilder {
             .and_modify(|component| {
                 component.provenance.insert(source.clone());
                 component.licenses.extend(licenses.clone());
-                if component.scope == Scope::Unknown {
+                // Cross-file scope merge: when the same component is declared
+                // under different scopes by different lockfiles, keep the
+                // most-exposed scope rather than whichever file parsed first
+                // — a `default`/`runtime` declaration must never be downgraded
+                // by a `develop`/`test` one that sorted earlier.
+                if scope_exposure(scope) > scope_exposure(component.scope) {
                     component.scope = scope;
                 }
             })
@@ -410,6 +557,22 @@ impl InventoryBuilder {
     }
 }
 
+/// Exposure rank for cross-file scope merges in
+/// `InventoryBuilder::add_with_purl`: mirrors the risk model's ordering
+/// (runtime > build > optional > development > test) with `Unknown` ranked
+/// lowest — it carries no information and is always overwritten by a
+/// declared scope.
+fn scope_exposure(scope: Scope) -> u8 {
+    match scope {
+        Scope::Runtime => 5,
+        Scope::Build => 4,
+        Scope::Optional => 3,
+        Scope::Development => 2,
+        Scope::Test => 1,
+        Scope::Unknown => 0,
+    }
+}
+
 const MAX_LOCKFILE_ENTRIES: usize = 100_000;
 
 fn entry_bound(count: usize, path: &str, format: &'static str) -> Result<(), InputError> {
@@ -424,11 +587,12 @@ fn entry_bound(count: usize, path: &str, format: &'static str) -> Result<(), Inp
     }
 }
 
-/// Streams entry names of a plain `.tar` once to decide whether it is an
-/// OCI/docker-save image archive, without buffering entry contents. Enforces
-/// the same entry-count, link, and path rules as `read_tar_with_expanded`;
-/// only `manifest.json` is materialized because its array shape decides
-/// docker-save classification (see `is_oci_markers`).
+/// Streams entry names of a (possibly gzip- or zstd-compressed) `.tar` once
+/// to decide whether it is an OCI/docker-save image archive, without
+/// buffering entry contents. Enforces the same entry-count, link, and path
+/// rules as `read_tar_with_expanded`; only `manifest.json` is materialized
+/// because its array shape decides docker-save classification (see
+/// `is_oci_markers`).
 fn tar_is_image<R: Read>(reader: R, config: &Config) -> Result<bool, InputError> {
     let mut archive = tar::Archive::new(reader);
     let mut count = 0_usize;
@@ -451,10 +615,9 @@ fn tar_is_image<R: Read>(reader: R, config: &Config) -> Result<bool, InputError>
             path: PathBuf::from("<tar>"),
             source,
         })?;
-        let path = normalize_relative(&entry.path().map_err(|source| InputError::Io {
-            path: PathBuf::from("<tar>"),
-            source,
-        })?)?;
+        let Some(path) = tar_entry_path(&entry)? else {
+            continue;
+        };
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(InputError::ArchiveLink(path));
@@ -483,9 +646,9 @@ fn tar_is_image<R: Read>(reader: R, config: &Config) -> Result<bool, InputError>
 }
 
 fn is_inventory_file(path: &Path) -> bool {
-    path.file_name().and_then(|v| v.to_str()).is_some_and(|v| {
-        MANIFEST_SIDECARS.contains(&v) || LOCKFILES.iter().any(|(name, _)| *name == v)
-    })
+    path.file_name()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| lockfile_route(v).is_some() || MANIFEST_SIDECARS.contains(&v))
 }
 /// Decides image classification from archive markers. Only an array-shaped
 /// `manifest.json` marks a docker-save archive; object-shaped manifests are
@@ -734,7 +897,11 @@ fn stable_asset(locator: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<Ass
 fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{}", crate::util::sha256_hex(bytes))
 }
+/// Decodes bytes as UTF-8, tolerating a leading byte-order mark (real-world
+/// YAML/XML/JSON files — including Helm's own `frobnitz_with_bom` testdata —
+/// are BOM-prefixed) and failing closed on any other invalid sequence.
 fn utf8<'a>(bytes: &'a [u8], path: &str, format: &'static str) -> Result<&'a str, InputError> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     std::str::from_utf8(bytes).map_err(|e| malformed(path, format, e))
 }
 fn malformed(
@@ -960,7 +1127,7 @@ mod tests {
         let cases = [
             ("Cargo.lock", "not = [toml", "Cargo.lock"),
             ("package-lock.json", "{", "package-lock.json"),
-            ("requirements.txt", "unpinned>=1\n", "requirements.txt"),
+            ("requirements.txt", "==1.0\n", "requirements.txt"),
             ("go.mod", "require (\nmodule version\n", "go.mod"),
             ("packages.lock.json", "{}", "packages.lock.json"),
         ];
@@ -1043,6 +1210,7 @@ mod tests {
             "pnpm-lock.yaml" => {
                 "lockfileVersion: '9.0'\npackages:\n  a@1:\n    resolution: {integrity: sha512-x}\n"
             }
+            "bun.lock" => r#"{"lockfileVersion":1,"packages":{"a":["a@1","",{},"sha512-x"]}}"#,
             "poetry.lock" => "[[package]]\nname = 'a'\nversion = '1'\n",
             "Pipfile.lock" => "{}",
             "Gemfile.lock" => "GEM\n  specs:\n    a (1)\n",
@@ -1050,6 +1218,11 @@ mod tests {
             "pubspec.lock" => "packages: {}\n",
             "Podfile.lock" => "PODS:\n  - A (1)\n",
             "composer.json" => "{}",
+            "composer.lock" => r#"{"packages":[]}"#,
+            "Directory.Packages.props" => "<Project/>",
+            "packages.config" => "<packages/>",
+            "App.csproj" => "<Project/>",
+            "Chart.lock" => "dependencies: []\n",
             "environment.yml" => "dependencies: []\n",
             _ => "apiVersion: v2\n",
         }
@@ -1060,6 +1233,7 @@ mod tests {
         for name in [
             "yarn.lock",
             "pnpm-lock.yaml",
+            "bun.lock",
             "poetry.lock",
             "Pipfile.lock",
             "Gemfile.lock",
@@ -1069,6 +1243,11 @@ mod tests {
             "composer.json",
             "environment.yml",
             "Chart.yaml",
+            "composer.lock",
+            "Chart.lock",
+            "Directory.Packages.props",
+            "packages.config",
+            "App.csproj",
         ] {
             let dir = tempdir().unwrap();
             fs::write(dir.path().join(name), new_ecosystem_fixture(name)).unwrap();
@@ -1216,6 +1395,155 @@ mod tests {
     }
 
     #[test]
+    fn gemfile_lock_nested_dependencies_become_edges_not_components() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Gemfile.lock"),
+            concat!(
+                "GEM\n",
+                "  remote: https://rubygems.org/\n",
+                "  specs:\n",
+                "    aws-sdk-core (3.241.4)\n",
+                "      base64\n",
+                "      jmespath (~> 1, >= 1.6.1)\n",
+                "    base64 (0.3.0)\n",
+                "    jmespath (1.6.2)\n",
+                "\n",
+                "PATH\n",
+                "  remote: .\n",
+                "  specs:\n",
+                "    fastlane (2.228.0)\n",
+                "\n",
+                "PLATFORMS\n",
+                "  ruby\n",
+                "\n",
+                "DEPENDENCIES\n",
+                "  aws-sdk-core\n",
+                "  fastlane!\n",
+                "\n",
+                "BUNDLED WITH\n",
+                "   2.6.9\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let version_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.version.clone())
+        };
+        assert_eq!(version_of("aws-sdk-core").as_deref(), Some("3.241.4"));
+        assert_eq!(version_of("base64").as_deref(), Some("0.3.0"));
+        assert_eq!(version_of("jmespath").as_deref(), Some("1.6.2"));
+        // PATH-sourced gems are real components.
+        assert_eq!(version_of("fastlane").as_deref(), Some("2.228.0"));
+        // Nested dep lines never become components or phantom versions.
+        assert_eq!(inventory.components.len(), 4);
+        assert!(
+            inventory
+                .components
+                .values()
+                .all(|c| !c.version.contains('~') && !c.version.contains('>'))
+        );
+        // Nested deps resolve to edges against the locked specs.
+        let name_of = |id: &ComponentId| inventory.components[id].name.as_str();
+        assert!(
+            inventory
+                .dependencies
+                .iter()
+                .any(|e| { name_of(&e.from) == "aws-sdk-core" && name_of(&e.to) == "base64" })
+        );
+        assert!(
+            inventory
+                .dependencies
+                .iter()
+                .any(|e| { name_of(&e.from) == "aws-sdk-core" && name_of(&e.to) == "jmespath" })
+        );
+        assert_eq!(inventory.dependencies.len(), 2);
+    }
+
+    #[test]
+    fn podfile_lock_nested_dependencies_become_edges_not_components() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Podfile.lock"),
+            concat!(
+                "PODS:\n",
+                "  - libwebp (1.5.0):\n",
+                "    - libwebp/webp (= 1.5.0)\n",
+                "  - libwebp/demux (1.5.0):\n",
+                "    - libwebp/webp\n",
+                "  - libwebp/webp (1.5.0)\n",
+                "  - SDWebImageWebPCoder (0.14.6):\n",
+                "    - libwebp (~> 1.0)\n",
+                "\n",
+                "DEPENDENCIES:\n",
+                "  - libwebp\n",
+                "  - SDWebImageWebPCoder\n",
+                "\n",
+                "COCOAPODS: 1.15.2\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        // Subspecs collapse to the parent pod; nested deps add no components.
+        assert_eq!(inventory.components.len(), 2);
+        let version_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.version.clone())
+        };
+        // Parent specs with children keep a clean version (no trailing `):`).
+        assert_eq!(version_of("libwebp").as_deref(), Some("1.5.0"));
+        assert_eq!(version_of("SDWebImageWebPCoder").as_deref(), Some("0.14.6"));
+        let name_of = |id: &ComponentId| inventory.components[id].name.as_str();
+        assert!(
+            inventory.dependencies.iter().any(|e| {
+                name_of(&e.from) == "SDWebImageWebPCoder" && name_of(&e.to) == "libwebp"
+            })
+        );
+        // `libwebp` -> `libwebp` self-edges collapse; only the cross-pod
+        // edge remains.
+        assert_eq!(inventory.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn cross_file_scope_merge_prefers_runtime_over_development() {
+        // The same purl declared `develop` in the root lockfile and
+        // `default` in a nested one must resolve to runtime regardless of
+        // lexical walk order.
+        for nested_dir in ["aaa", "zzz"] {
+            let dir = tempdir().unwrap();
+            fs::write(
+                dir.path().join("Pipfile.lock"),
+                r#"{"_meta":{"requires":{}},"default":{},"develop":{"idna":{"version":"==3.15","hashes":["sha256:aaa"]}}}"#,
+            )
+            .unwrap();
+            let sub = dir.path().join(nested_dir);
+            fs::create_dir(&sub).unwrap();
+            fs::write(
+                sub.join("Pipfile.lock"),
+                r#"{"_meta":{"requires":{}},"default":{"idna":{"version":"==3.15","hashes":["sha256:bbb"]}},"develop":{}}"#,
+            )
+            .unwrap();
+            let inventory = scan_path(dir.path(), &config()).unwrap();
+            assert_eq!(inventory.components.len(), 1);
+            let component = inventory.components.values().next().unwrap();
+            assert_eq!(component.purl, "pkg:pypi/idna@3.15");
+            assert_eq!(
+                component.scope,
+                Scope::Runtime,
+                "nested dir {nested_dir}: runtime declaration must win over develop"
+            );
+            assert_eq!(component.provenance.len(), 2);
+        }
+    }
+
+    #[test]
     fn scans_composer_conda_and_chart_inputs() {
         let dir = tempdir().unwrap();
         fs::write(
@@ -1268,9 +1596,21 @@ mod tests {
         };
         assert_eq!(version_of("python").as_deref(), Some("3.11"));
         assert_eq!(version_of("numpy").as_deref(), Some("1.24.*"));
-        assert_eq!(version_of("pytorch").as_deref(), Some("2.0"));
+        assert_eq!(version_of("pytorch").as_deref(), Some(">=2.0,<3"));
+        assert_eq!(version_of("pip").as_deref(), Some("*"));
         assert_eq!(version_of("requests").as_deref(), Some("2.31.0"));
-        assert_eq!(inventory.components.len(), 4);
+        assert_eq!(inventory.components.len(), 5);
+        let purl_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.purl.clone())
+        };
+        assert_eq!(purl_of("python").as_deref(), Some("pkg:conda/python@3.11"));
+        assert_eq!(purl_of("numpy").as_deref(), Some("pkg:conda/numpy"));
+        assert_eq!(purl_of("pytorch").as_deref(), Some("pkg:conda/pytorch"));
+        assert_eq!(purl_of("pip").as_deref(), Some("pkg:conda/pip"));
 
         let chart = tempdir().unwrap();
         fs::write(
@@ -1324,6 +1664,15 @@ mod tests {
             ("composer.json", "[1]", "composer.json"),
             ("environment.yml", "dependencies: 42\n", "environment.yml"),
             ("Chart.yaml", "dependencies: [unclosed\n", "Chart.yaml"),
+            ("composer.lock", "{}", "composer.lock"),
+            ("Chart.lock", "digest: sha256:abc\n", "Chart.lock"),
+            (
+                "Directory.Packages.props",
+                "<Project>",
+                "Directory.Packages.props",
+            ),
+            ("packages.config", "<packages>", "packages.config"),
+            ("App.csproj", "<Project", "csproj"),
         ];
         for (name, contents, expected_format) in cases {
             let dir = tempdir().unwrap();
