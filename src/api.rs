@@ -1189,7 +1189,7 @@ mod tests {
     }
 
     fn token_config(token: &str) -> Config {
-        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let hash = crate::util::hex_lower(&Sha256::digest(token.as_bytes()));
         Config {
             auth_bearer_sha256: Some(serde_json::from_value(Value::String(hash)).unwrap()),
             ..Config::default()
