@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.8.0 (2026-09-18)
+
+### Features
+
+- **cli:** add --offline flag matching documented behavior (#34) (4097058)
+- **parsers:** support Bun text lockfiles (#38) (945dda9)
+- **parsers:** add Chart.lock, composer.lock, and NuGet CPM/csproj/packages.config parsers (#52) (3b51a20)
+- **parsers:** add Gradle lockfile, Maven pom.xml, and Go stdlib toolchain coverage (#84) (62f91f6)
+- **parsers:** inventory Cabal dependencies and freeze pins (#103) (bc68185)
+- **parsers:** add Mix lockfile parser for Hex dependencies (#101) (e8ec136)
+- **parsers:** inventory Gradle version catalog declarations (#104) (190b85f)
+
+### Bug Fixes
+
+- **scanner:** exclude VCS metadata directories from repository walk (#35) (4a55ccd)
+- **scanner:** honor usedforsecurity=False in Python weak-hash rules (#36) (92f1172)
+- **parsers:** anchor asset identity to root lockfile (#37) (200232a)
+- **scanners:** tolerate JSONC/BOM IaC JSON, detect encrypted PEMs, skip regex literals (#51) (5e275b1)
+- **parsers:** pnpm v9 edges/scopes, specifier phantoms, bun asset identity (#53) (191e043)
+- **core:** OCI layer decompression, shared dependency-path index, honest introduced:0 (#54) (b5c2ca7)
+- **cli:** scope --format enums per subcommand; fix monitor target display and errors (#80) (b5a389c)
+- **parsers:** tolerate versionless SBOM entries, ./ tar roots, compressed tarballs (#82) (d3e7f2e)
+- **parsers:** indent-aware bundler/pod specs, poetry groups, honest unpinned versions (#81) (3961a76)
+- **scanners:** IaC anchoring/coverage, secret placeholder filtering, polyglot and SAST FPs (#83) (e5bb809)
+- **parsers:** preserve Composer lockfile licenses (#97) (228d4a8)
+- **parsers:** retain versioned yarn descriptor identities (#98) (57ea15f)
+- **scanners:** structure-aware PE recognition, escaped PEM detection, credential-shape suppression (#100) (82303be)
+- **parsers:** support legacy per-configuration Gradle lockfiles (#99) (f086600)
+- **parsers:** preserve Composer lockfile dependency edges (#102) (0c9de34)
+- **parsers:** exclude Maven template placeholders and record unresolved declarations (#105) (8d1085a)
+
+### Other Changes
+
+- **issues:** port issue governance and exploratory-smoke campaign skills (#28) (e6533f9)
+- **ci:** adopt Hoolicy v0.3.2 action check (#107) (6ed727c)
+- **ci:** adopt Hoonarqube v0.8.2 analyze action (#108) (878d667)
+- **deps:** bump tower-http from 0.6.11 to 0.7.1 (#109) (25a8cf2)
+- **deps:** bump sha2 from 0.10.9 to 0.11.0 (#110) (e3bc6df)
+- **deps:** bump spdx from 0.10.9 to 0.13.5 (#111) (cbfe559)
+- **deps:** bump jsonschema from 0.47.0 to 0.56.0 (#112) (0575b91)
+- **deps:** bump zip from 4.6.1 to 8.6.0 (#113) (cac74fa)
+- **release:** adopt Hooversion v1.1.2 for squash-suffix release resume (#114) (91b32d6)
+
 ## 0.7.0 (2026-09-18)
 
 ### Features
