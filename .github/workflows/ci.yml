@@ -30,7 +30,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Lint commit messages
-        uses: openhoo/hooversion/actions/lint@ac503b23b9b36ebbf39ee6103713c81f1f18b64d # v1.1.1
+        uses: openhoo/hooversion/actions/lint@f0a37cca22997993ca6416010b81ca197a3ac580 # v1.1.2
         with:
           version: 1.1.1
 
