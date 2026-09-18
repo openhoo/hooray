@@ -5,29 +5,7 @@ use serde_json::Value;
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::Scope;
 
-use super::{LockComponents, resolve_lock_component};
-
-/// Parses an MSBuild/NuGet XML document, tolerating a UTF-8 byte-order mark
-/// (Visual Studio writes BOM-prefixed project files) and failing closed on
-/// any malformed XML.
-fn xml_doc<'a>(
-    text: &'a str,
-    path: &str,
-    format: &'static str,
-) -> Result<roxmltree::Document<'a>, InputError> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    roxmltree::Document::parse(text).map_err(|e| malformed(path, format, e))
-}
-
-/// Text of the first direct child element named `name`, trimmed; `None`
-/// when absent, empty, or mixed-content.
-fn child_text<'a>(node: &roxmltree::Node<'a, 'a>, name: &str) -> Option<&'a str> {
-    node.children()
-        .find(|child| child.is_element() && child.tag_name().name() == name)
-        .and_then(|child| child.text())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-}
+use super::{LockComponents, child_text, resolve_lock_component, xml_doc};
 
 /// Normalizes a NuGet version attribute: `[x]`/`[x]`-style exact-version
 /// range notation collapses to the bare `x` so the purl carries a concrete

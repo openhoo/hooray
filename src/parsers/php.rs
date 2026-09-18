@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -66,6 +66,8 @@ pub(crate) fn parse_composer_lock(
     let root = value
         .as_object()
         .ok_or_else(|| malformed_msg(path, "composer.lock", "expected a JSON object"))?;
+    let mut ids = BTreeMap::new();
+    let mut requirements = Vec::new();
     for (section, scope) in [
         ("packages", Scope::Runtime),
         ("packages-dev", Scope::Development),
@@ -107,7 +109,30 @@ pub(crate) fn parse_composer_lock(
                     "package entry has an empty name or version",
                 ));
             }
-            out.add("composer", name, version, scope, path, BTreeSet::new())?;
+            let licenses = package
+                .get("license")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|expression| crate::model::License {
+                    expression: Some(expression.to_owned()),
+                    name: None,
+                    url: None,
+                })
+                .collect();
+            let id = out.add("composer", name, version, scope, path, licenses)?;
+            ids.insert(name, id.clone());
+            if let Some(require) = package.get("require").and_then(Value::as_object) {
+                requirements.push((id, scope, require));
+            }
+        }
+    }
+    for (from, scope, require) in requirements {
+        for name in require.keys().filter(|name| name.contains('/')) {
+            if let Some(to) = ids.get(name.as_str()) {
+                out.edge(&from, to, scope, false);
+            }
         }
     }
     Ok(())
@@ -119,6 +144,60 @@ mod tests {
     use crate::model::Scope;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn composer_lock_edges_resolve_only_local_locked_requirements() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("composer.lock"), r#"{"packages":[
+            {"name":"acme/app","version":"1.0","require":{"acme/lib":"^2","php":">=8","ext-json":"*","missing/package":"*"},"require-dev":{"acme/tool":"*"}},
+            {"name":"acme/lib","version":"2.0"}
+        ],"packages-dev":[
+            {"name":"acme/tool","version":"3.0","require":{"acme/app":"*"}}
+        ]}"#).unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(
+            nested.join("composer.lock"),
+            r#"{"packages":[
+            {"name":"acme/app","version":"4.0","require":{"acme/lib":"^5"}},
+            {"name":"acme/lib","version":"5.0"},
+            {"name":"missing/package","version":"1.0"}
+        ]}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let actual = inventory
+            .dependencies
+            .iter()
+            .map(|edge| {
+                let from = &inventory.components[&edge.from];
+                let to = &inventory.components[&edge.to];
+                (
+                    from.name.as_str(),
+                    from.version.as_str(),
+                    to.name.as_str(),
+                    to.version.as_str(),
+                    edge.scope,
+                    edge.optional,
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual,
+            std::collections::BTreeSet::from([
+                ("acme/app", "1.0", "acme/lib", "2.0", Scope::Runtime, false),
+                ("acme/app", "4.0", "acme/lib", "5.0", Scope::Runtime, false),
+                (
+                    "acme/tool",
+                    "3.0",
+                    "acme/app",
+                    "1.0",
+                    Scope::Development,
+                    false
+                ),
+            ])
+        );
+    }
 
     #[test]
     fn composer_lock_resolves_pinned_versions_and_dev_scope() {
@@ -145,6 +224,60 @@ mod tests {
         assert_eq!(component("phpunit/phpunit").version, "10.3.5");
         assert_eq!(component("phpunit/phpunit").scope, Scope::Development);
         assert_eq!(inventory.components.len(), 3);
+    }
+
+    #[test]
+    fn composer_lock_preserves_declared_licenses_and_honest_unknowns() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("composer.lock"),
+            r#"{"packages":[
+                {"name":"acme/runtime","version":"1.0.0","license":["MIT","Apache-2.0","MIT"]},
+                {"name":"acme/absent","version":"1.0.0"}
+            ],"packages-dev":[
+                {"name":"acme/dev","version":"1.0.0","license":["BSD-3-Clause"]},
+                {"name":"acme/empty","version":"1.0.0","license":[]}
+            ]}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let analysis = crate::license::analyze_with_files(&inventory, Vec::new()).unwrap();
+        for (name, expected) in [
+            ("acme/runtime", vec!["Apache-2.0", "MIT"]),
+            ("acme/dev", vec!["BSD-3-Clause"]),
+            ("acme/absent", vec![]),
+            ("acme/empty", vec![]),
+        ] {
+            let component = inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .unwrap();
+            assert_eq!(
+                component
+                    .licenses
+                    .iter()
+                    .filter_map(|l| l.expression.as_deref())
+                    .collect::<Vec<_>>(),
+                expected,
+                "declared licenses for {name}"
+            );
+            let rules = analysis
+                .findings
+                .iter()
+                .filter(|f| f.component_id.as_ref() == Some(&component.identity))
+                .map(|f| f.rule_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rules,
+                if expected.is_empty() {
+                    vec!["license:unknown"]
+                } else {
+                    vec!["license:detected"; expected.len()]
+                },
+                "license findings for {name}"
+            );
+        }
     }
 
     #[test]
