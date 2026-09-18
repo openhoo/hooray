@@ -891,8 +891,11 @@ fn stable_asset(locator: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<Ass
         hash.update((bytes.len() as u64).to_be_bytes());
         hash.update(bytes);
     }
-    AssetId::new(format!("asset:sha256:{:x}", hash.finalize()))
-        .map_err(|_| InputError::InvalidIdentifier)
+    AssetId::new(format!(
+        "asset:sha256:{}",
+        crate::util::hex_lower(&hash.finalize())
+    ))
+    .map_err(|_| InputError::InvalidIdentifier)
 }
 fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{}", crate::util::sha256_hex(bytes))
