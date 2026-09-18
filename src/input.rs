@@ -30,9 +30,14 @@ use self::parsers::{
     cargo::parse_cargo_lock,
     conda::parse_conda_environment,
     dart::parse_pubspec_lock,
+    elixir::parse_mix_lock,
     go::parse_go_mod,
+    gradle::parse_gradle_lockfile,
+    gradle_catalog::parse_gradle_catalog,
+    haskell::{parse_cabal, parse_cabal_freeze},
     helm::{parse_chart_lock, parse_chart_yaml},
     image::{scan_oci_layout, scan_oci_tar},
+    maven::parse_pom_xml,
     npm::parse_package_lock,
     nuget::{
         parse_csproj, parse_directory_packages_props, parse_nuget_lock, parse_packages_config,
@@ -258,14 +263,20 @@ fn scan_directory(root: &Path, config: &Config) -> Result<Inventory, InputError>
 }
 
 type LockfileParser = fn(&str, &[u8], &mut InventoryBuilder) -> Result<(), InputError>;
-
 type ManifestParser =
     fn(&str, &[u8], Option<&Vec<u8>>, &mut InventoryBuilder) -> Result<(), InputError>;
+
+/// Lockfile parser that additionally sees the whole scanned file set (for
+/// in-tree parent/manifest resolution, e.g. Maven `<parent>` POMs).
+type TreeLockfileParser =
+    fn(&str, &[u8], &BTreeMap<String, Vec<u8>>, &mut InventoryBuilder) -> Result<(), InputError>;
 
 /// How a recognized inventory file is dispatched.
 enum LockfileRoute {
     /// Plain lockfile parser.
     Lock(LockfileParser),
+    /// Lockfile parser that receives the full scanned file set.
+    LockTree(TreeLockfileParser),
     /// `Cargo.lock`, which additionally consumes the sibling `Cargo.toml`
     /// manifest for license inheritance.
     CargoLock,
@@ -290,8 +301,13 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
     ("pnpm-lock.yaml", LockfileRoute::Lock(parse_pnpm_lock)),
     ("bun.lock", LockfileRoute::Lock(parse_bun_lock)),
     ("poetry.lock", LockfileRoute::Lock(parse_poetry_lock)),
+    (
+        "cabal.project.freeze",
+        LockfileRoute::Lock(parse_cabal_freeze),
+    ),
     ("Pipfile.lock", LockfileRoute::Lock(parse_pipfile_lock)),
     ("Gemfile.lock", LockfileRoute::Lock(parse_gemfile_lock)),
+    ("mix.lock", LockfileRoute::Lock(parse_mix_lock)),
     (
         "Package.resolved",
         LockfileRoute::Lock(parse_package_resolved),
@@ -326,6 +342,7 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
         "packages.config",
         LockfileRoute::Lock(parse_packages_config),
     ),
+    ("pom.xml", LockfileRoute::LockTree(parse_pom_xml)),
 ];
 
 /// Repository files collected as inventory inputs that have no dedicated
@@ -333,8 +350,10 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
 const MANIFEST_SIDECARS: &[&str] = &["Cargo.toml", "go.sum"];
 
 /// Resolves an inventory file to its route. Most lockfiles match by exact
-/// base name; MSBuild project files are recognized by their `.csproj`
-/// extension because the project name is part of the filename.
+/// base name; MSBuild project files, Gradle dependency lockfiles, and Gradle
+/// version catalogs are recognized by their `.csproj`/`.lockfile`/
+/// `.versions.toml` extensions because the project, configuration, or
+/// catalog name is part of the filename.
 fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
     if let Some(route) = LOCKFILES
         .iter()
@@ -343,12 +362,25 @@ fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
     {
         return Some(route);
     }
-    name.ends_with(".csproj").then_some(&CS_PROJ_ROUTE)
+    if name.ends_with(".csproj") {
+        return Some(&CS_PROJ_ROUTE);
+    }
+    if name.ends_with(".versions.toml") {
+        return Some(&GRADLE_CATALOG_ROUTE);
+    }
+    if name.ends_with(".cabal") {
+        return Some(&CABAL_ROUTE);
+    }
+    name.ends_with(".lockfile")
+        .then_some(&GRADLE_LOCKFILE_ROUTE)
 }
 
-/// Route for `*.csproj` files, stored as a static so `lockfile_route` can
-/// return a shared reference.
+/// Routes for extension-matched files, stored as statics so
+/// `lockfile_route` can return shared references.
 static CS_PROJ_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_csproj);
+static GRADLE_LOCKFILE_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_gradle_lockfile);
+static GRADLE_CATALOG_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_gradle_catalog);
+static CABAL_ROUTE: LockfileRoute = LockfileRoute::LockTree(parse_cabal);
 
 fn scan_virtual_files(
     locator: &Path,
@@ -364,6 +396,7 @@ fn scan_virtual_files(
         };
         match route {
             LockfileRoute::Lock(parse) => parse(path, bytes, &mut builder)?,
+            LockfileRoute::LockTree(parse) => parse(path, bytes, &files, &mut builder)?,
             LockfileRoute::CargoLock => parse_cargo_lock(
                 path,
                 bytes,

@@ -641,6 +641,8 @@ fn affected_ecosystem(package: &AffectedPackage) -> Option<String> {
                     "go" => "golang",
                     "maven" => "maven",
                     "nuget" => "nuget",
+                    "hex" => "hex",
+                    "hackage" => "hackage",
                     _ => return None,
                 };
                 Some(normalized.to_owned())
