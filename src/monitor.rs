@@ -422,7 +422,7 @@ pub fn source_fingerprint(
         digest.update((bytes.len() as u64).to_be_bytes());
         digest.update(bytes);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(crate::util::hex_lower(&digest.finalize()))
 }
 
 fn read_fingerprint_bounded(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
