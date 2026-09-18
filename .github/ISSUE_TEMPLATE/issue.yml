@@ -1,0 +1,76 @@
+name: Issue report
+description: Report a reproducible scanner, parser, report, policy, documentation, or coverage problem in English.
+labels: [needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve Hooray. Please keep this report focused on one observable request or problem and write it in English.
+
+        Do not disclose suspected security vulnerabilities in a public issue. Use [GitHub private vulnerability reporting](https://github.com/openhoo/hooray/security/advisories/new) instead.
+
+        A reference finding is a lead, not proof that the native implementation is wrong. An incomplete run is not a clean run. Preserve immutable provenance and exact outcomes so another person can reproduce the claim.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: State the one observable problem or requested change, including the affected rule, command, export, metric, or documentation when applicable.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: classification
+    attributes:
+      label: Classification
+      description: Choose the single best starting category. Maintainers may refine labels during triage.
+      options:
+        - Bug
+        - Coverage request
+        - Enhancement
+        - Documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: version-and-provenance
+    attributes:
+      label: Version and provenance
+      description: |-
+        Record immutable identifiers, not only branch names: project/source commit or digest; native implementation version and binary digest; reference implementation version/image/digest when used; and relevant OS, toolchain, and fixture provenance. For a non-executable request, give a reasoned `N/A — <specific reason>` for fields that do not apply.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: |-
+        Give the exact command, input/scope, configuration, and exit status or outcome. Include clean controls where they are relevant, and distinguish an incomplete or resource-limited run from a clean result. For a non-executable request, use a reasoned `N/A — <specific reason>` rather than leaving this section empty.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-and-actual-behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Describe the observable expected result and the actual result, including diagnostics, finding identifiers, output differences, or refusal behavior. Use a reasoned `N/A — <specific reason>` only when the request is genuinely non-executable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence-and-scope
+    attributes:
+      label: Evidence and scope
+      description: |-
+        Link or name durable artifacts and their digests, state the tested scope and its completeness, and include relevant native/reference counts or byte-level comparisons. Reference findings are evidence to investigate, not proof by themselves; an incomplete run is not a clean run. Use a reasoned `N/A — <specific reason>` for a genuinely non-executable request.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: List specific, observable, bounded conditions that will show the request is resolved. Include behavior, compatibility, and proof requirements where relevant; do not ask maintainers to infer success from an implementation detail.
+    validations:
+      required: true

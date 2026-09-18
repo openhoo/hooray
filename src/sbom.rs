@@ -9,7 +9,7 @@ use crate::model::{
     Location, ModelInvariantError, Scope, Source, SourceKind, stable_component_id,
     stable_location_id,
 };
-use crate::util::{parse_purl_body, sha256_hex};
+use crate::util::{is_purl_byte, parse_purl_body, percent_encode, sha256_hex};
 
 const MAX_SBOM_BYTES: usize = 100 * 1024 * 1024;
 const MAX_COMPONENTS: usize = 1_000_000;
@@ -76,7 +76,7 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
 
     let digest = sha256_hex(input);
     let asset_id = stable_asset_id(&sbom, &digest)?;
-    let asset = Asset {
+    let mut asset = Asset {
         id: asset_id.clone(),
         name: asset_name(&sbom),
         kind: AssetKind::Sbom,
@@ -104,6 +104,7 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
     collect_declared_dependencies(
         &sbom.dependencies,
         &state.refs,
+        &state.skipped_refs,
         sbom.metadata
             .as_ref()
             .and_then(|metadata| metadata.component.as_ref())
@@ -112,6 +113,18 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
             .filter(|reference| !reference.is_empty()),
         &mut state.dependencies,
     )?;
+    if !state.skipped.is_empty() {
+        asset.metadata.insert(
+            "cyclonedx.skippedComponents".to_owned(),
+            Value::Array(
+                state
+                    .skipped
+                    .iter()
+                    .map(|entry| Value::String(entry.clone()))
+                    .collect(),
+            ),
+        );
+    }
 
     let inventory = Inventory {
         asset,
@@ -129,6 +142,11 @@ struct ParseState<'a> {
     components: BTreeMap<ComponentId, Component>,
     dependencies: BTreeSet<DependencyEdge>,
     refs: BTreeMap<String, ComponentId>,
+    /// bom-refs/SPDXIDs of entries skipped for carrying no usable identity;
+    /// dependency edges pointing at them are tolerated instead of failing.
+    skipped_refs: BTreeSet<String>,
+    /// Human-readable diagnostics for skipped entries, recorded on the asset.
+    skipped: Vec<String>,
     count: usize,
 }
 
@@ -164,6 +182,8 @@ fn sbom_state<'a>(asset_id: &'a AssetId, source: &'a Source) -> ParseState<'a> {
         components: BTreeMap::new(),
         dependencies: BTreeSet::new(),
         refs: BTreeMap::new(),
+        skipped_refs: BTreeSet::new(),
+        skipped: Vec::new(),
         count: 0,
     }
 }
@@ -185,21 +205,42 @@ fn collect_components(
         }
         let component_path = format!("{path}[{index}]");
         let name = required(&wire.name, "name", &component_path)?;
-        let version = required(&wire.version, "version", &component_path)?;
-        let purl = required(&wire.purl, "purl", &component_path)?;
-        if !is_versioned_purl(purl) {
-            return Err(SbomError::InvalidComponent {
-                path: component_path,
-                field: "purl",
-            });
-        }
-        let identity = stable_component_id(purl).map_err(|_| SbomError::InvalidComponent {
+        let bom_ref = wire
+            .bom_ref
+            .as_deref()
+            .map(|value| required_value(value, "bom-ref", &component_path))
+            .transpose()?;
+        let Some((purl, version)) = component_identity(
+            name,
+            trimmed(wire.version.as_deref()),
+            trimmed(wire.purl.as_deref()),
+            &component_path,
+        )?
+        else {
+            // CycloneDX marks version and purl optional; a component carrying
+            // neither cannot be identified. Skip it with a diagnostic and
+            // tolerate dependency edges that reference its bom-ref.
+            state.skipped.push(format!("{component_path} ({name})"));
+            if let Some(reference) = bom_ref
+                && (state.refs.contains_key(reference)
+                    || !state.skipped_refs.insert(reference.to_owned()))
+            {
+                return Err(SbomError::DuplicateBomRef(reference.to_owned()));
+            }
+            collect_components(
+                &wire.components,
+                parent,
+                depth + 1,
+                &format!("{component_path}.components"),
+                state,
+            )?;
+            continue;
+        };
+        let identity = stable_component_id(&purl).map_err(|_| SbomError::InvalidComponent {
             path: component_path.clone(),
             field: "purl",
         })?;
-        let location_path = wire
-            .bom_ref
-            .as_deref()
+        let location_path = bom_ref
             .map(|value| format!("bom-ref:{value}"))
             .unwrap_or_else(|| format!("purl:{purl}"));
         let location_id =
@@ -213,8 +254,8 @@ fn collect_components(
         let component = Component {
             identity: identity.clone(),
             name: name.to_owned(),
-            version: version.to_owned(),
-            purl: purl.to_owned(),
+            version,
+            purl: purl.clone(),
             scope,
             provenance: BTreeSet::from([state.source.clone()]),
             licenses: parse_licenses(&wire.licenses),
@@ -226,16 +267,15 @@ fn collect_components(
                 end: None,
             }]),
         };
-        state.upsert_component(&identity, component, purl.to_owned())?;
-        if let Some(reference) = wire.bom_ref.as_deref() {
-            let reference = required_value(reference, "bom-ref", &component_path)?;
-            if state
-                .refs
-                .insert(reference.to_owned(), identity.clone())
-                .is_some()
-            {
-                return Err(SbomError::DuplicateBomRef(reference.to_owned()));
-            }
+        state.upsert_component(&identity, component, purl)?;
+        if let Some(reference) = bom_ref
+            && (state.skipped_refs.contains(reference)
+                || state
+                    .refs
+                    .insert(reference.to_owned(), identity.clone())
+                    .is_some())
+        {
+            return Err(SbomError::DuplicateBomRef(reference.to_owned()));
         }
         if let Some(parent) = parent
             && parent != &identity
@@ -261,6 +301,7 @@ fn collect_components(
 fn collect_declared_dependencies(
     dependencies: &[CycloneDxDependency],
     refs: &BTreeMap<String, ComponentId>,
+    skipped: &BTreeSet<String>,
     root_ref: Option<&str>,
     output: &mut BTreeSet<DependencyEdge>,
 ) -> Result<(), SbomError> {
@@ -270,6 +311,9 @@ fn collect_declared_dependencies(
             .then(|| refs.get(&dependency.reference))
             .flatten();
         if from.is_none() && !from_is_root {
+            if skipped.contains(&dependency.reference) {
+                continue;
+            }
             return Err(SbomError::UnknownDependency {
                 from: dependency.reference.clone(),
                 to: dependency.reference.clone(),
@@ -279,6 +323,9 @@ fn collect_declared_dependencies(
             let to_is_root = root_ref == Some(target.as_str());
             let to = (!to_is_root).then(|| refs.get(target)).flatten();
             if to.is_none() && !to_is_root {
+                if skipped.contains(target) {
+                    continue;
+                }
                 return Err(SbomError::UnknownDependency {
                     from: dependency.reference.clone(),
                     to: target.clone(),
@@ -341,6 +388,63 @@ fn required<'a>(
         })
 }
 
+/// Resolves a component's `(purl, version)` from the optional SBOM identity
+/// fields. A versioned purl wins and supplies a missing version; an
+/// unversioned purl gains the declared version; without a purl the SPDX
+/// `name@version` fallback applies. `Ok(None)` means the entry carries no
+/// usable identity at all and must be skipped by the caller; malformed purls
+/// still fail closed.
+fn component_identity(
+    name: &str,
+    version: Option<&str>,
+    purl: Option<&str>,
+    path: &str,
+) -> Result<Option<(String, String)>, SbomError> {
+    match purl {
+        Some(purl) => {
+            if parse_purl_body(purl).is_none() {
+                return Err(SbomError::InvalidComponent {
+                    path: path.to_owned(),
+                    field: "purl",
+                });
+            }
+            match purl_version(purl) {
+                Some(purl_version) => Ok(Some((
+                    purl.to_owned(),
+                    version.unwrap_or(purl_version).to_owned(),
+                ))),
+                None => version
+                    .map(|version| {
+                        append_purl_version(purl, version, path)
+                            .map(|purl| (purl, version.to_owned()))
+                    })
+                    .transpose(),
+            }
+        }
+        None => Ok(version.map(|version| (format!("{name}@{version}"), version.to_owned()))),
+    }
+}
+
+/// Appends a declared version to an unversioned purl, inserting it before any
+/// `?`/`#` suffix and percent-encoding version bytes the purl grammar
+/// reserves. A final segment already containing `@` (e.g. a trailing
+/// separator) cannot be versioned cleanly and fails closed as malformed.
+fn append_purl_version(purl: &str, version: &str, path: &str) -> Result<String, SbomError> {
+    let split = purl.find(['?', '#']).unwrap_or(purl.len());
+    let (body, suffix) = purl.split_at(split);
+    let final_segment = body.rsplit('/').next().unwrap_or(body);
+    if final_segment.contains('@') {
+        return Err(SbomError::InvalidComponent {
+            path: path.to_owned(),
+            field: "purl",
+        });
+    }
+    Ok(format!(
+        "{body}@{}{suffix}",
+        percent_encode(version, is_purl_byte)
+    ))
+}
+
 fn required_value<'a>(
     value: &'a str,
     field: &'static str,
@@ -359,7 +463,7 @@ fn required_value<'a>(
 fn purl_version(purl: &str) -> Option<&str> {
     parse_purl_body(purl)?.version()
 }
-
+#[cfg(test)]
 fn is_versioned_purl(purl: &str) -> bool {
     purl_version(purl).is_some()
 }
@@ -440,7 +544,6 @@ struct CycloneDxSbom {
 struct CycloneDxMetadata {
     component: Option<CycloneDxComponent>,
 }
-
 #[derive(Debug, Deserialize)]
 struct CycloneDxComponent {
     #[serde(rename = "bom-ref")]
@@ -490,7 +593,7 @@ fn parse_spdx(input: &[u8]) -> Result<Inventory, SbomError> {
     let digest = sha256_hex(input);
     let asset_id =
         AssetId::new(format!("sbom:sha256:{digest}")).map_err(|_| SbomError::InvalidFormat)?;
-    let asset = Asset {
+    let mut asset = Asset {
         id: asset_id.clone(),
         name: trimmed(document.name.as_deref())
             .map(str::to_owned)
@@ -509,8 +612,21 @@ fn parse_spdx(input: &[u8]) -> Result<Inventory, SbomError> {
     collect_spdx_relationships(
         &document.relationships,
         &state.refs,
+        &state.skipped_refs,
         &mut state.dependencies,
     )?;
+    if !state.skipped.is_empty() {
+        asset.metadata.insert(
+            "spdx.skippedPackages".to_owned(),
+            Value::Array(
+                state
+                    .skipped
+                    .iter()
+                    .map(|entry| Value::String(entry.clone()))
+                    .collect(),
+            ),
+        );
+    }
     let inventory = Inventory {
         asset,
         components: state.components,
@@ -533,29 +649,22 @@ fn collect_spdx_packages(
         let package_path = format!("packages[{index}]");
         let spdx_id = required(&package.spdx_id, "SPDXID", &package_path)?;
         let name = required(&package.name, "name", &package_path)?;
-        let referenced_purl = spdx_package_purl(package);
-        // SPDX 2.x marks versionInfo optional (0:1). Recover the version from
-        // a versioned externalRefs purl before failing closed; the tradeoff is
-        // that the raw (possibly percent-encoded) purl version is accepted
-        // where a literal versionInfo field is absent.
-        let version = match required(&package.version_info, "versionInfo", &package_path) {
-            Ok(version) => version,
-            Err(error) => referenced_purl
-                .as_deref()
-                .and_then(purl_version)
-                .ok_or(error)?,
-        };
-        let purl = match referenced_purl.as_deref() {
-            Some(purl) => {
-                if !is_versioned_purl(purl) {
-                    return Err(SbomError::InvalidComponent {
-                        path: package_path.clone(),
-                        field: "purl",
-                    });
-                }
-                purl.to_owned()
+        // SPDX 2.x marks versionInfo optional (0:1). A versioned externalRefs
+        // purl supplies the version when the field is absent; a package with
+        // neither carries no usable identity and is skipped with a diagnostic
+        // (trivy emits such APPLICATION/SOURCE nodes for every scanned tree).
+        let Some((purl, version)) = component_identity(
+            name,
+            trimmed(package.version_info.as_deref()),
+            spdx_package_purl(package).as_deref(),
+            &package_path,
+        )?
+        else {
+            state.skipped.push(format!("{package_path} ({name})"));
+            if state.refs.contains_key(spdx_id) || !state.skipped_refs.insert(spdx_id.to_owned()) {
+                return Err(SbomError::DuplicateSpdxId(spdx_id.to_owned()));
             }
-            None => format!("{name}@{version}"),
+            continue;
         };
         let identity = stable_component_id(&purl).map_err(|_| SbomError::InvalidComponent {
             path: package_path.clone(),
@@ -572,7 +681,7 @@ fn collect_spdx_packages(
         let component = Component {
             identity: identity.clone(),
             name: name.to_owned(),
-            version: version.to_owned(),
+            version,
             purl: purl.clone(),
             scope: Scope::Unknown,
             provenance: BTreeSet::from([state.source.clone()]),
@@ -586,7 +695,9 @@ fn collect_spdx_packages(
             }]),
         };
         state.upsert_component(&identity, component, purl)?;
-        if state.refs.insert(spdx_id.to_owned(), identity).is_some() {
+        if state.skipped_refs.contains(spdx_id)
+            || state.refs.insert(spdx_id.to_owned(), identity).is_some()
+        {
             return Err(SbomError::DuplicateSpdxId(spdx_id.to_owned()));
         }
     }
@@ -605,6 +716,7 @@ fn spdx_package_purl(package: &SpdxPackage) -> Option<String> {
 fn collect_spdx_relationships(
     relationships: &[SpdxRelationship],
     refs: &BTreeMap<String, ComponentId>,
+    skipped: &BTreeSet<String>,
     output: &mut BTreeSet<DependencyEdge>,
 ) -> Result<(), SbomError> {
     for relationship in relationships {
@@ -636,12 +748,18 @@ fn collect_spdx_relationships(
             _ => continue,
         };
         let Some(from) = refs.get(source) else {
+            if skipped.contains(source) {
+                continue;
+            }
             return Err(SbomError::UnknownDependency {
                 from: source.to_owned(),
                 to: target.to_owned(),
             });
         };
         let Some(to) = refs.get(target) else {
+            if skipped.contains(target) {
+                continue;
+            }
             return Err(SbomError::UnknownDependency {
                 from: source.to_owned(),
                 to: target.to_owned(),
@@ -830,12 +948,15 @@ mod tests {
             parse_cyclonedx(br#"{}"#),
             Err(SbomError::InvalidFormat)
         ));
-        assert!(matches!(
-            parse_cyclonedx(
-                br#"{"bomFormat":"CycloneDX","components":[{"name":"a","version":"1"}]}"#
-            ),
-            Err(SbomError::InvalidComponent { field: "purl", .. })
-        ));
+        // A missing purl is spec-optional: the component falls back to the
+        // SPDX-style `name@version` identity instead of failing.
+        let recovered = parse_cyclonedx(
+            br#"{"bomFormat":"CycloneDX","components":[{"name":"a","version":"1"}]}"#,
+        )
+        .unwrap();
+        let component = recovered.components.values().next().unwrap();
+        assert_eq!(component.purl, "a@1");
+        assert_eq!(component.version, "1");
         assert!(matches!(
             parse_cyclonedx(br#"{"bomFormat":"CycloneDX","components":[{"bom-ref":"a","name":"a","version":"1","purl":"pkg:npm/a@1"}],"dependencies":[{"ref":"a","dependsOn":["missing"]}]}"#),
             Err(SbomError::UnknownDependency { .. })
@@ -994,18 +1115,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_blank_and_malformed_component_identity_fields() {
-        for (field, component) in [
-            ("name", r#"{"version":"1","purl":"pkg:cargo/a@1"}"#),
-            ("version", r#"{"name":"a","purl":"pkg:cargo/a@1"}"#),
-            ("purl", r#"{"name":"a","version":"1","purl":"   "}"#),
+    fn rejects_missing_name_and_malformed_component_purls() {
+        // name is the only required identity field; version and purl are
+        // spec-optional and recover or skip instead of failing.
+        assert!(matches!(
+            parse_cyclonedx(
+                br#"{"bomFormat":"CycloneDX","components":[{"version":"1","purl":"pkg:cargo/a@1"}]}"#
+            ),
+            Err(SbomError::InvalidComponent { field: "name", .. })
+        ));
+        // A present-but-blank purl is treated as absent and falls back to
+        // `name@version`; a missing version recovers from the purl.
+        for (component, expected) in [
+            (r#"{"name":"a","version":"1","purl":"   "}"#, "a@1"),
+            (r#"{"name":"a","purl":"pkg:cargo/a@1"}"#, "pkg:cargo/a@1"),
+            (
+                r#"{"name":"a","version":"1","purl":"pkg:cargo/a"}"#,
+                "pkg:cargo/a@1",
+            ),
         ] {
             let input = format!(r#"{{"bomFormat":"CycloneDX","components":[{component}]}}"#);
-            assert!(
-                matches!(parse_cyclonedx(input.as_bytes()), Err(SbomError::InvalidComponent { field: actual, .. }) if actual == field)
-            );
+            let inventory = parse_cyclonedx(input.as_bytes()).unwrap();
+            assert_eq!(inventory.components.values().next().unwrap().purl, expected);
         }
-        for purl in ["cargo/a@1", "pkg:cargo/a", "pkg:@1", "pkg:cargo/a@"] {
+        for purl in ["cargo/a@1", "pkg:@1", "pkg:cargo/a@"] {
             let input = format!(
                 r#"{{"bomFormat":"CycloneDX","components":[{{"name":"a","version":"1","purl":"{purl}"}}]}}"#
             );
@@ -1166,24 +1299,112 @@ mod tests {
     }
 
     #[test]
-    fn unversioned_scoped_purls_fail_closed_at_both_gates() {
-        // CycloneDX gate: only fully versioned purls may enter.
+    fn unversioned_scoped_purls_are_never_misread_as_versioned() {
+        // CycloneDX: an unversioned scoped purl gains the declared version
+        // instead of being misparsed or rejected.
+        let inventory = parse_cyclonedx(
+            br#"{"bomFormat":"CycloneDX","components":[{"name":"s","version":"1","purl":"pkg:npm/@scope/pkg"}]}"#,
+        )
+        .unwrap();
+        let component = inventory.components.values().next().unwrap();
+        assert_eq!(component.purl, "pkg:npm/@scope/pkg@1");
+        assert_eq!(component.version, "1");
+        // SPDX: a scoped unversioned purl must not be misread as a version
+        // substitute for a missing versionInfo; the package is skipped.
+        let inventory = parse_cyclonedx(
+            br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-s","name":"s","externalRefs":[{"referenceType":"purl","referenceLocator":"pkg:npm/@scope/pkg"}]}]}"#,
+        )
+        .unwrap();
+        assert!(inventory.components.is_empty());
+        assert_eq!(
+            inventory.asset.metadata["spdx.skippedPackages"],
+            Value::Array(vec![Value::String("packages[0] (s)".into())])
+        );
+    }
+
+    #[test]
+    fn skips_versionless_components_and_tolerates_their_dependency_refs() {
+        // pip's vendored bom.cdx.json shape: a versionless, purl-less root
+        // component whose bom-ref anchors the dependency graph (#61), plus a
+        // second unidentifiable component referenced as a non-root edge end.
+        let inventory = parse_cyclonedx(
+            br#"{"bomFormat":"CycloneDX","specVersion":"1.4",
+            "metadata":{"component":{"bom-ref":"bom-ref:pip","name":"pip"}},
+            "components":[
+              {"bom-ref":"bom-ref:pip","name":"pip","type":"library"},
+              {"bom-ref":"bom-ref:other","name":"other","type":"library"},
+              {"bom-ref":"pkg:pypi/msgpack@1.1.2","name":"msgpack","purl":"pkg:pypi/msgpack@1.1.2"},
+              {"bom-ref":"pkg:pypi/setuptools@70.3.0","name":"setuptools","purl":"pkg:pypi/setuptools@70.3.0"}
+            ],
+            "dependencies":[
+              {"ref":"bom-ref:pip","dependsOn":["pkg:pypi/msgpack@1.1.2","pkg:pypi/setuptools@70.3.0"]},
+              {"ref":"bom-ref:other","dependsOn":["pkg:pypi/msgpack@1.1.2"]},
+              {"ref":"pkg:pypi/msgpack@1.1.2","dependsOn":["bom-ref:other","pkg:pypi/setuptools@70.3.0"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(inventory.components.len(), 2);
+        assert!(
+            inventory
+                .components
+                .values()
+                .all(|component| component.purl.starts_with("pkg:pypi/"))
+        );
+        assert_eq!(
+            inventory.asset.metadata["cyclonedx.skippedComponents"],
+            Value::Array(vec![
+                Value::String("components[0] (pip)".into()),
+                Value::String("components[1] (other)".into()),
+            ])
+        );
+        // Edges touching skipped refs are dropped; the edge between the two
+        // inventoried components still resolves.
+        assert_eq!(inventory.dependencies.len(), 1);
+        inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn skips_spdx_packages_without_identity_and_tolerates_relationships() {
+        // trivy fs --format spdx-json shape: APPLICATION/SOURCE packages
+        // carry neither versionInfo nor a purl (#79).
+        let inventory = parse_cyclonedx(
+            br#"{"spdxVersion":"SPDX-2.3","name":"repro","packages":[
+              {"SPDXID":"SPDXRef-Application-1","name":"myapp","downloadLocation":"NOASSERTION"},
+              {"SPDXID":"SPDXRef-Package-1","name":"requests","versionInfo":"2.25.1","externalRefs":[{"referenceType":"purl","referenceLocator":"pkg:pypi/requests@2.25.1"}]}
+            ],"relationships":[
+              {"spdxElementId":"SPDXRef-Application-1","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-1"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(inventory.components.len(), 1);
+        let component = inventory.components.values().next().unwrap();
+        assert_eq!(component.purl, "pkg:pypi/requests@2.25.1");
+        assert_eq!(component.version, "2.25.1");
+        assert_eq!(
+            inventory.asset.metadata["spdx.skippedPackages"],
+            Value::Array(vec![Value::String("packages[0] (myapp)".into())])
+        );
+        // The skipped package's DEPENDS_ON edge is dropped rather than
+        // aborting the document as an unknown dependency.
+        assert!(inventory.dependencies.is_empty());
+        inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn still_fails_closed_on_dangling_refs_to_unknown_entries() {
+        // Tolerance applies only to refs of entries that were skipped for
+        // missing identity; refs that never existed still fail closed.
         assert!(matches!(
             parse_cyclonedx(
-                br#"{"bomFormat":"CycloneDX","components":[{"name":"s","version":"1","purl":"pkg:npm/@scope/pkg"}]}"#
+                br#"{"bomFormat":"CycloneDX","components":[{"name":"a","version":"1","purl":"pkg:cargo/a@1"}],"dependencies":[{"ref":"ghost","dependsOn":[]}]}"#
             ),
-            Err(SbomError::InvalidComponent { field: "purl", .. })
+            Err(SbomError::UnknownDependency { .. })
         ));
-        // SPDX recovery: a scoped unversioned purl must not be misread as a
-        // version substitute for a missing versionInfo.
         assert!(matches!(
             parse_cyclonedx(
-                br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-s","name":"s","externalRefs":[{"referenceType":"purl","referenceLocator":"pkg:npm/@scope/pkg"}]}]}"#
+                br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"}],"relationships":[{"spdxElementId":"SPDXRef-ghost","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-a"}]}"#
             ),
-            Err(SbomError::InvalidComponent {
-                field: "versionInfo",
-                ..
-            })
+            Err(SbomError::UnknownDependency { .. })
         ));
     }
 
@@ -1225,10 +1446,17 @@ mod tests {
             parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","versionInfo":"1"}]}"#),
             Err(SbomError::InvalidComponent { field: "name", .. })
         ));
-        assert!(matches!(
-            parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a"}]}"#),
-            Err(SbomError::InvalidComponent { field: "versionInfo", .. })
-        ));
+        // versionInfo is optional (0:1): a package with neither versionInfo
+        // nor a versioned purl is skipped with a diagnostic, not an error.
+        let inventory = parse_cyclonedx(
+            br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a"}]}"#,
+        )
+        .unwrap();
+        assert!(inventory.components.is_empty());
+        assert_eq!(
+            inventory.asset.metadata["spdx.skippedPackages"],
+            Value::Array(vec![Value::String("packages[0] (a)".into())])
+        );
         assert!(matches!(
             parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"},{"SPDXID":"SPDXRef-a","name":"b","versionInfo":"2"}]}"#),
             Err(SbomError::DuplicateSpdxId(id)) if id == "SPDXRef-a"
@@ -1237,10 +1465,16 @@ mod tests {
             parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1"}],"relationships":[{"spdxElementId":"SPDXRef-a","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-missing"}]}"#),
             Err(SbomError::UnknownDependency { from, to }) if from == "SPDXRef-a" && to == "SPDXRef-missing"
         ));
-        assert!(matches!(
-            parse_cyclonedx(br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1","externalRefs":[{"referenceType":"purl","referenceLocator":"pkg:cargo/a"}]}]}"#),
-            Err(SbomError::InvalidComponent { field: "purl", .. })
-        ));
+        // An unversioned purl gains the declared versionInfo instead of
+        // failing; the package is inventoried under the completed purl.
+        let inventory = parse_cyclonedx(
+            br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"a","versionInfo":"1","externalRefs":[{"referenceType":"purl","referenceLocator":"pkg:cargo/a"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            inventory.components.values().next().unwrap().purl,
+            "pkg:cargo/a@1"
+        );
     }
 
     #[test]
@@ -1352,6 +1586,8 @@ mod tests {
             components: BTreeMap::new(),
             dependencies: BTreeSet::new(),
             refs: BTreeMap::new(),
+            skipped_refs: BTreeSet::new(),
+            skipped: Vec::new(),
             count: 0,
         }
     }

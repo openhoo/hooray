@@ -22,7 +22,7 @@ Hooray accepts explicit input types or auto-detects them:
 - project directories; recognized lockfiles and manifests contribute dependency inventory;
 - CycloneDX JSON SBOMs with nested components and dependency relationships;
 - SPDX 2.x JSON SBOMs, detected by their `spdxVersion` key;
-- ZIP and TAR artifacts containing supported dependency files;
+- ZIP and TAR artifacts (including gzip- and zstd-compressed tarballs) containing supported dependency files;
 - OCI image-layout directories;
 - OCI or Docker image TAR files; and
 - CycloneDX or SPDX 2.x JSON from standard input for `scan sbom` and `scan auto`.
@@ -50,9 +50,10 @@ and run identifiers make reports and history diffs reproducible.
   and emits ecosystem-specific upgrade guidance for Cargo, npm/pnpm/Yarn,
   pip/Poetry, Go, Maven/Gradle, and NuGet when the required data is available.
 
-`--offline` disables OSV access. Local inventory, license, filesystem, policy,
-history, and report operations remain available; vulnerability findings are not
-invented or served from an implicit cache.
+`--offline` (or `HOORAY_OFFLINE=true`, or `offline: true` in the config file)
+disables OSV access. Local inventory, license, filesystem, policy, history, and
+report operations remain available; vulnerability findings are not invented or
+served from an implicit cache.
 
 ### Policy and exceptions
 
@@ -160,7 +161,7 @@ files, aggregate bytes, file count, traversal depth, archive metadata, and
 expanded archive inventory are subject to configured or built-in limits.
 
 Secret detection covers AWS access-key IDs, GitHub and GitLab tokens, Slack
-tokens, private-key headers, JWT-shaped values, and high-entropy credential
+tokens, private keys, JWT-shaped values, and high-entropy credential
 assignments. Placeholder-like values are ignored. Inline allowlist markers are
 `hooray:allow-secret`, `pragma: allowlist secret`, `gitleaks:allow`, and
 `nosec`. Secret values are never retained: evidence contains only redacted
@@ -172,7 +173,8 @@ IaC checks include:
 - Terraform unrestricted ingress and explicitly disabled storage encryption;
 - Dockerfile remote `ADD`, secret-like `ARG`/`ENV`, and absence of an explicit
   non-root `USER`;
-- Kubernetes host networking, privileged containers, and privilege escalation;
+- Kubernetes host networking, host ports, privileged containers, and privilege
+  escalation;
 - CloudFormation S3 buckets without public-access blocking and RDS instances
   without storage encryption;
 - nginx and Apache weak TLS protocol lists plus server-version disclosure;
@@ -576,22 +578,28 @@ legacy severity-only `--fail-on` interface.
 | npm | `package-lock.json` | Package graph, dev/optional scope, npm purls |
 | Yarn | `yarn.lock` classic or Berry | Locked packages with dependency edges, npm purls |
 | pnpm | `pnpm-lock.yaml` | Locked packages with dev/optional scope, npm purls |
-| Python pip | `requirements.txt` | Pinned `name==version` requirements, PyPI purls |
+| Bun | `bun.lock` (text format) | Locked packages with dependency edges, npm purls |
+| Python pip | `requirements.txt` | `name==version` pins plus unpinned/constrained requirements (versionless purls), PyPI purls |
 | Python Poetry | `poetry.lock` | Locked PyPI packages, PyPI purls |
 | Python Pipenv | `Pipfile.lock` | Pinned default/develop packages, PyPI purls |
-| Ruby | `Gemfile.lock` | `GEM`-section specs, gem purls |
-| Go | `go.mod` requirements | Module/version entries, Go purls |
+| Ruby | `Gemfile.lock` | `GEM`/`GIT`/`PATH`-section specs with nested dependency edges, gem purls |
+| Go | `go.mod` requirements | Module/version entries plus a `pkg:golang/stdlib` toolchain component from the `go`/`toolchain` directive, Go purls |
+| Maven | `pom.xml` | Direct dependencies; versions resolve via `<properties>`, `<dependencyManagement>`, and in-tree `<parent>` POMs; unresolvable/template versions excluded from components and asset version claims, with per-POM counts, skipped dependency identities, and unfollowed BOM sources recorded in `asset.metadata["maven.poms"]` (counts describe effective parent/child-merged declarations; no external parent/BOM fetch) |
+| Gradle | `*.lockfile` (Gradle 7+ lock format) | Locked `group:artifact:version` entries with configuration-derived scope, Maven purls |
+| Gradle catalogs | `*.versions.toml` | Declared `[libraries]` coordinates with inline/ref/rich versions (`strictly` > `require` > `prefer`), Maven purls; constraints, dynamic selectors, and versionless declarations stay versionless — not resolved lockfile pins. Scope is unknown; raw declarations and explicitly skipped plugins are recorded in `asset.metadata["gradle.catalogs"]`. Bundles add no components; no Gradle script/accessor, transitive graph, or BOM version resolution |
 | Swift | `Package.resolved` v1 or v2 | Pinned identities and versions, Swift purls |
 | Dart | `pubspec.lock` | Locked pub packages, pub purls |
-| CocoaPods | `Podfile.lock` | Pod entries, CocoaPods purls |
+| CocoaPods | `Podfile.lock` | Pod entries with nested dependency edges, CocoaPods purls |
 | PHP | `composer.json` | Declared `require`/`require-dev` packages, composer purls; platform packages skipped |
+| PHP | `composer.lock` | Pinned packages and declared licenses; lock-local `require` dependency edges with requiring-package scope |
 | Conda | `environment.yml` | Dependency list entries, conda purls |
 | Helm | `Chart.yaml` | Declared chart dependencies, Helm purls |
+| Haskell (partial) | `*.cabal`, `cabal.project.freeze` | Union of `build-depends`, Hackage purls; ranges remain versionless, exact equality and matching nearest in-tree freeze pins produce versioned purls |
 | NuGet | `packages.lock.json` | Framework dependency graph, direct/transitive hints, NuGet purls |
 | CycloneDX | JSON SBOM with versioned purls | Nested and declared dependency edges, scope, provenance |
 | SPDX | 2.x JSON detected by `spdxVersion` | Packages, checksums, declared `DEPENDS_ON` relationships |
 | OCI/Docker | OCI layout or OCI/Docker TAR | Layer application with whiteouts, digest validation, supported lockfiles from final filesystem |
-| Generic artifact | `.zip` or `.tar` | Supported lockfiles discovered in the bounded archive |
+| Generic artifact | `.zip`, `.tar`, `.tar.gz`, `.tgz`, or `.tar.zst` | Supported lockfiles discovered in the bounded archive |
 
 Any existing non-symlink directory is treated as a project unless both OCI
 layout markers (`oci-layout` and `index.json`) are present. Recognized lockfiles
@@ -603,6 +611,29 @@ malformed recognized inventory files fail rather than being silently skipped. If
 filesystem-analysis admission bounds omit files, the report includes a
 high-severity `scanner:coverage-incomplete`
 operational-risk finding with scanned and skipped counters.
+
+Haskell support is bounded dependency inventory, not Cabal semantic validation
+or dependency solving. It reads space/tab-indented and explicit-brace layout,
+multiline dependency fields, and the union of conditional branches and common stanzas without
+evaluating flags, conditions, or common-stanza imports. Sublibrary selectors
+retain the owning Hackage package identity. Test/benchmark dependencies have
+test scope; freeze setup-qualified constraints have build scope and do not
+resolve ordinary `build-depends`. A nearest ancestor `cabal.project.freeze`
+inside the scanned tree supplies matching exact pins; unmatched declarations
+remain in the inventory. A dependency without a range uses the existing `*`
+unconstrained specifier and a versionless purl, never the manifest's own package
+version. Pins are not checked for solver compatibility with
+manifest ranges. `cabal.project`, `stack.yaml`, and `stack.yaml.lock` are not
+parsed.
+
+Malformed dependency syntax and conflicting exact freeze pins fail closed.
+Explicit field braces delimit the field value; dependency version-set and
+sublibrary braces remain part of ordinary layout field values. Other Cabal
+syntax is still bounded: nonbreaking-space indentation, legacy compound
+`cabal-version` ranges, and `foreign-library` stanzas are not supported.
+Verification covers a valid production subtree and refusal of the unchanged
+full corpus, which includes intentionally invalid parser fixtures. A successful
+production-directory scan is not a claim of full-corpus grammar parity.
 
 ## Quality and security verification
 
@@ -756,13 +787,14 @@ version is kept verbatim.
 Parity is bounded by what each side can know, and the scorecard measures
 overlap rather than identity:
 
-- `composer.json` yields constraint-style versions (there is no
-  `composer.lock` support), so PHP inventory parity is specifier-level
-  rather than resolved-version-level.
+- `composer.json` yields constraint-style versions when no sibling lockfile exists.
+  `composer.lock` supplies pinned versions, declared licenses, and edges to
+  locked sibling packages; platform and unresolved requirements are not edges.
 - Formats without dependency edges (`requirements.txt`, `go.mod`,
-  `Pipfile.lock`, `Gemfile.lock`, `Package.resolved`, `pubspec.lock`,
-  `Podfile.lock`, `composer.json`, `environment.yml`, `Chart.yaml`) classify
-  all components as disconnected; direct/transitive parity is comparable
+  `Pipfile.lock`, `Package.resolved`, `pubspec.lock`, `composer.json`,
+  `environment.yml`, `Chart.yaml`, `pom.xml`, `*.lockfile`) classify
+  all components as disconnected; `Gemfile.lock`, `Podfile.lock`, and `composer.lock` emit
+  edges but no declared roots, so direct/transitive parity is comparable
   only for npm, Yarn, pnpm, Poetry, Cargo, and NuGet cases.
 - Hooray derives severity as bucketed labels from OSV while Xray exposes
   numeric CVSS scores; severity agreement compares label buckets only.

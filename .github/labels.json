@@ -1,0 +1,182 @@
+[
+  {
+    "name": "bug",
+    "color": "b60205",
+    "description": "Reported defect in existing behavior or safety; triage records verification"
+  },
+  {
+    "name": "enhancement",
+    "color": "1f6feb",
+    "description": "Feature, coverage, or capability request"
+  },
+  {
+    "name": "documentation",
+    "color": "0075ca",
+    "description": "Improvements or additions to documentation"
+  },
+  {
+    "name": "duplicate",
+    "color": "cfd3d7",
+    "description": "This issue or pull request already exists"
+  },
+  {
+    "name": "invalid",
+    "color": "e4e669",
+    "description": "This doesn't seem right"
+  },
+  {
+    "name": "question",
+    "color": "d876e3",
+    "description": "Further information is requested"
+  },
+  {
+    "name": "wontfix",
+    "color": "ffffff",
+    "description": "This will not be worked on"
+  },
+  {
+    "name": "needs-triage",
+    "color": "d4a72c",
+    "description": "Evidence and scope still need triage"
+  },
+  {
+    "name": "needs-info",
+    "color": "9a6700",
+    "description": "Specific information is needed before triage can continue"
+  },
+  {
+    "name": "ready-for-agent",
+    "color": "1a7f37",
+    "description": "Evidence, scope, and acceptance criteria are ready for agent implementation"
+  },
+  {
+    "name": "false-positive",
+    "color": "cf222e",
+    "description": "Confirmed finding reported where the input is clean"
+  },
+  {
+    "name": "false-negative",
+    "color": "a40e26",
+    "description": "Confirmed expected finding or behavior is missed"
+  },
+  {
+    "name": "regression",
+    "color": "9c2c2c",
+    "description": "Previously working behavior regressed"
+  },
+  {
+    "name": "crash",
+    "color": "6e1d2a",
+    "description": "Supported input aborts instead of returning a report"
+  },
+  {
+    "name": "coverage",
+    "color": "0969da",
+    "description": "Requested parser, scanner, or format coverage is not currently provided"
+  },
+  {
+    "name": "ecosystem:npm",
+    "color": "6f42c1",
+    "description": "npm/pnpm/Yarn dependency scope"
+  },
+  {
+    "name": "ecosystem:pypi",
+    "color": "8250df",
+    "description": "Python dependency scope"
+  },
+  {
+    "name": "ecosystem:go",
+    "color": "5a32a3",
+    "description": "Go modules dependency scope"
+  },
+  {
+    "name": "ecosystem:cargo",
+    "color": "6639ba",
+    "description": "Rust/Cargo dependency scope"
+  },
+  {
+    "name": "ecosystem:nuget",
+    "color": "7048e8",
+    "description": "NuGet dependency scope"
+  },
+  {
+    "name": "ecosystem:rubygems",
+    "color": "4c2889",
+    "description": "RubyGems dependency scope"
+  },
+  {
+    "name": "ecosystem:php",
+    "color": "7b3f9e",
+    "description": "Composer/PHP dependency scope"
+  },
+  {
+    "name": "ecosystem:other",
+    "color": "8e44ad",
+    "description": "Swift/Dart/Conda/Helm or other dependency scope"
+  },
+  {
+    "name": "area:sca",
+    "color": "0550ae",
+    "description": "Dependency inventory, OSV vulnerabilities, or remediation"
+  },
+  {
+    "name": "area:secrets",
+    "color": "0a5b83",
+    "description": "Secret detection rules"
+  },
+  {
+    "name": "area:sast",
+    "color": "0969da",
+    "description": "SAST rules (rs/js/ts/py/go/java/cs)"
+  },
+  {
+    "name": "area:iac",
+    "color": "1f6feb",
+    "description": "Service and IaC configuration rules"
+  },
+  {
+    "name": "area:license",
+    "color": "8250df",
+    "description": "License detection or license policy"
+  },
+  {
+    "name": "area:reports",
+    "color": "6f42c1",
+    "description": "Report formats, exports, or platform integrations"
+  },
+  {
+    "name": "area:policy",
+    "color": "0550ae",
+    "description": "Policy engine, exceptions, or baselines"
+  },
+  {
+    "name": "area:monitor",
+    "color": "0a5b83",
+    "description": "Monitoring, history, or HTTP API"
+  },
+  {
+    "name": "area:ci",
+    "color": "0969da",
+    "description": "Continuous-integration workflow or action behavior"
+  },
+  {
+    "name": "priority:critical",
+    "color": "b60205",
+    "description": "Highest user or data impact"
+  },
+  {
+    "name": "priority:high",
+    "color": "bc4c00",
+    "description": "High user or data impact"
+  },
+  {
+    "name": "priority:normal",
+    "color": "57606a",
+    "description": "Normal priority"
+  },
+  {
+    "name": "priority:low",
+    "color": "6e7781",
+    "description": "Low priority"
+  }
+]

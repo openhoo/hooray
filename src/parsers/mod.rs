@@ -2,12 +2,18 @@
 //! `input` dispatch layer.
 
 pub(crate) mod archive;
+pub(crate) mod bun;
 pub(crate) mod cargo;
 pub(crate) mod conda;
 pub(crate) mod dart;
+pub(crate) mod elixir;
 pub(crate) mod go;
+pub(crate) mod gradle;
+pub(crate) mod gradle_catalog;
+pub(crate) mod haskell;
 pub(crate) mod helm;
 pub(crate) mod image;
+pub(crate) mod maven;
 pub(crate) mod npm;
 pub(crate) mod nuget;
 pub(crate) mod php;
@@ -48,4 +54,26 @@ pub(crate) fn split_descriptor(descriptor: &str) -> Option<(&str, &str)> {
         let at = rest.find('@')?;
         Some((&rest[..at], &rest[at + 1..]))
     }
+}
+
+/// Parses an XML manifest document, tolerating a UTF-8 byte-order mark
+/// (Visual Studio and Maven tooling write BOM-prefixed project files) and
+/// failing closed on any malformed XML.
+pub(crate) fn xml_doc<'a>(
+    text: &'a str,
+    path: &str,
+    format: &'static str,
+) -> Result<roxmltree::Document<'a>, crate::input::InputError> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    roxmltree::Document::parse(text).map_err(|e| crate::input::malformed(path, format, e))
+}
+
+/// Text of the first direct child element named `name`, trimmed; `None`
+/// when absent, empty, or mixed-content.
+pub(crate) fn child_text<'a>(node: &roxmltree::Node<'a, 'a>, name: &str) -> Option<&'a str> {
+    node.children()
+        .find(|child| child.is_element() && child.tag_name().name() == name)
+        .and_then(|child| child.text())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
 }

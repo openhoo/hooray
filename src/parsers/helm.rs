@@ -7,6 +7,7 @@ use crate::model::Scope;
 pub(crate) fn parse_chart_yaml(
     path: &str,
     bytes: &[u8],
+    lock: Option<&Vec<u8>>,
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
     let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "Chart.yaml")?)
@@ -16,7 +17,7 @@ pub(crate) fn parse_chart_yaml(
         .and_then(Yaml::as_str)
         .filter(|v| !v.is_empty())
     {
-        out.asset.version = Some(version.to_owned());
+        out.claim_asset_identity(path, None, Some(version.to_owned()));
     }
     let Some(dependencies) = doc.get("dependencies").and_then(Yaml::as_sequence) else {
         return Ok(());
@@ -41,6 +42,53 @@ pub(crate) fn parse_chart_yaml(
             return Err(malformed_msg(
                 path,
                 "Chart.yaml",
+                "dependency entry has an empty name or version",
+            ));
+        }
+        // A sibling Chart.lock already resolved these constraints; the
+        // lockfile's pinned versions supersede the declared ranges.
+        if lock.is_none() {
+            out.add("helm", name, version, Scope::Runtime, path, BTreeSet::new())?;
+        }
+    }
+    Ok(())
+}
+
+/// Parses a Helm `Chart.lock`: the resolved-dependency artifact `helm
+/// dependency build`/`update` writes. Entries carry exact resolved versions,
+/// unlike `Chart.yaml` constraints, so they always produce versioned
+/// `pkg:helm/<name>@<version>` components.
+pub(crate) fn parse_chart_lock(
+    path: &str,
+    bytes: &[u8],
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "Chart.lock")?)
+        .map_err(|e| malformed(path, "Chart.lock", e))?;
+    let dependencies = doc
+        .get("dependencies")
+        .and_then(Yaml::as_sequence)
+        .ok_or_else(|| malformed_msg(path, "Chart.lock", "missing dependencies list"))?;
+    entry_bound(dependencies.len(), path, "Chart.lock")?;
+    for dependency in dependencies {
+        let Some(name) = dependency.get("name").and_then(Yaml::as_str) else {
+            return Err(malformed_msg(
+                path,
+                "Chart.lock",
+                "dependency entry has no name",
+            ));
+        };
+        let Some(version) = dependency.get("version").and_then(Yaml::as_str) else {
+            return Err(malformed_msg(
+                path,
+                "Chart.lock",
+                "dependency entry has no version",
+            ));
+        };
+        if name.is_empty() || version.is_empty() {
+            return Err(malformed_msg(
+                path,
+                "Chart.lock",
                 "dependency entry has an empty name or version",
             ));
         }
@@ -91,5 +139,128 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn chart_lock_resolves_pinned_versions() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Chart.lock"),
+            concat!(
+                "dependencies:\n",
+                "  - name: alpine\n",
+                "    version: \"0.1.0\"\n",
+                "    repository: https://example.com/charts\n",
+                "  - name: mariner\n",
+                "    version: \"4.3.2\"\n",
+                "    repository: https://example.com/charts\n",
+                "digest: sha256:abc\n",
+                "generated: \"2020-02-03T10:38:51Z\"\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let version_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.version.clone())
+        };
+        assert_eq!(version_of("alpine").as_deref(), Some("0.1.0"));
+        assert_eq!(version_of("mariner").as_deref(), Some("4.3.2"));
+        assert_eq!(inventory.components.len(), 2);
+        assert!(
+            inventory
+                .components
+                .values()
+                .all(|c| c.purl.starts_with("pkg:helm/") && c.purl.contains('@'))
+        );
+    }
+
+    #[test]
+    fn chart_lock_supersedes_chart_yaml_constraints() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Chart.yaml"),
+            concat!(
+                "apiVersion: v2\n",
+                "name: myapp\n",
+                "version: 1.4.2\n",
+                "dependencies:\n",
+                "  - name: alpine\n",
+                "    version: \">=0.1.0\"\n",
+                "    repository: https://example.com/charts\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Chart.lock"),
+            concat!(
+                "dependencies:\n",
+                "  - name: alpine\n",
+                "    version: \"0.1.0\"\n",
+                "    repository: https://example.com/charts\n",
+                "digest: sha256:abc\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        // The resolved lockfile version wins; the declared constraint is not
+        // inventoried alongside it.
+        assert_eq!(inventory.components.len(), 1);
+        let alpine = inventory
+            .components
+            .values()
+            .find(|c| c.name == "alpine")
+            .unwrap();
+        assert_eq!(alpine.version, "0.1.0");
+        assert_eq!(alpine.purl, "pkg:helm/alpine@0.1.0");
+        // Chart.yaml still contributes asset identity.
+        assert_eq!(inventory.asset.version.as_deref(), Some("1.4.2"));
+    }
+
+    #[test]
+    fn chart_lock_without_dependencies_fails_closed() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Chart.lock"), "digest: sha256:abc\n").unwrap();
+        let error = scan_path(dir.path(), &config()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                InputError::Malformed { format, message, .. }
+                    if *format == "Chart.lock" && *message == "missing dependencies list"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn chart_lock_entry_without_name_or_version_fails_closed() {
+        for contents in [
+            "dependencies:\n  - version: \"1.2.3\"\n",
+            "dependencies:\n  - name: postgresql\n",
+            "dependencies:\n  - name: \"\"\n    version: \"1.2.3\"\n",
+        ] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("Chart.lock"), contents).unwrap();
+            let error = scan_path(dir.path(), &config()).unwrap_err();
+            assert!(
+                matches!(&error, InputError::Malformed { format, .. } if *format == "Chart.lock"),
+                "unexpected error for {contents:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn chart_lock_empty_dependencies_is_valid() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Chart.lock"),
+            "dependencies: []\ndigest: sha256:abc\n",
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 0);
     }
 }

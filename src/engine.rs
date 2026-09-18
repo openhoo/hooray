@@ -14,7 +14,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    analysis::{ApplicabilityAnalyzer, ApplicabilityInput},
+    analysis::{ApplicabilityAnalyzer, ApplicabilityInput, DependencyPathIndex},
     config::Config,
     graph::{DependencyGraph, GraphError},
     input::ScanInput,
@@ -425,6 +425,10 @@ pub(crate) fn contextualize_and_score(
     findings: &mut BTreeMap<FindingId, Finding>,
     as_of: DateTime<Utc>,
 ) -> Result<(), GraphError> {
+    // One shared shortest-path index serves every finding's applicability
+    // rationale; building it lazily keeps finding-free scans free of the
+    // O(V + E) traversal.
+    let path_index = std::cell::OnceCell::new();
     for finding in findings.values_mut() {
         let Some(component_id) = finding.component_id.as_ref() else {
             continue;
@@ -436,7 +440,7 @@ pub(crate) fn contextualize_and_score(
         if finding.applicability.is_none() {
             finding.applicability = Some(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
                 component,
-                inventory: Some(inventory),
+                paths: Some(path_index.get_or_init(|| DependencyPathIndex::new(inventory))),
                 evidence: &evidence,
                 affected_ranges: &[],
             }));

@@ -11,7 +11,8 @@ use thiserror::Error;
 
 use crate::{
     analysis::{
-        ApplicabilityAnalyzer, ApplicabilityInput, OsvAffectedRange, OsvEvent, OsvRangeType,
+        ApplicabilityAnalyzer, ApplicabilityInput, DependencyPathIndex, OsvAffectedRange, OsvEvent,
+        OsvRangeType,
     },
     model::{
         Component, Confidence, Evidence, Finding, FindingId, FindingKind, FindingStatus, Inventory,
@@ -469,6 +470,9 @@ fn map_findings(
     details: &BTreeMap<String, Vulnerability>,
     inventory: Option<&Inventory>,
 ) -> Result<BTreeMap<FindingId, Finding>, OsvError> {
+    // Shared across every (advisory, component) finding so applicability
+    // analysis costs one O(V + E) traversal per scan, not per finding.
+    let path_index = inventory.map(DependencyPathIndex::new);
     let mut findings = BTreeMap::new();
     for (purl, ids) in vulnerability_ids {
         let Some(components) = components_by_purl.get(purl) else {
@@ -494,7 +498,7 @@ fn map_findings(
                     component,
                     &rule_id,
                     &references,
-                    inventory,
+                    path_index.as_ref(),
                 );
                 findings.insert(finding.id.clone(), finding);
             }
@@ -511,7 +515,7 @@ fn vulnerability_finding(
     component: &Component,
     rule_id: &RuleId,
     references: &BTreeSet<String>,
-    inventory: Option<&Inventory>,
+    paths: Option<&DependencyPathIndex<'_>>,
 ) -> Finding {
     let finding_id = stable_finding_id(
         FindingKind::Vulnerability,
@@ -563,7 +567,7 @@ fn vulnerability_finding(
         evidence: BTreeSet::from([evidence.clone()]),
         applicability: Some(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
             component,
-            inventory,
+            paths,
             evidence: &BTreeSet::from([evidence]),
             affected_ranges: &affected_ranges,
         })),
@@ -637,6 +641,8 @@ fn affected_ecosystem(package: &AffectedPackage) -> Option<String> {
                     "go" => "golang",
                     "maven" => "maven",
                     "nuget" => "nuget",
+                    "hex" => "hex",
+                    "hackage" => "hackage",
                     _ => return None,
                 };
                 Some(normalized.to_owned())
