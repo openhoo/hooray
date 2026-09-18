@@ -766,7 +766,7 @@ mod tests {
     #[test]
     fn bearer_hash_matches_tokens_without_exposing_secrets() {
         let token = "correct horse battery staple";
-        let hash = BearerTokenHash(format!("{:x}", Sha256::digest(token.as_bytes())));
+        let hash = BearerTokenHash(crate::util::hex_lower(&Sha256::digest(token.as_bytes())));
         assert!(hash.matches_token(token));
         assert!(!hash.matches_token("incorrect"));
         assert!(!BearerTokenHash("invalid".to_owned()).matches_token(token));
