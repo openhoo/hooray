@@ -23,18 +23,9 @@ pub(crate) fn scan_oci_layout(root: &Path, config: &Config) -> Result<Inventory,
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| malformed("manifest", "OCI manifest", e))?;
     let config_bytes = read_oci_blob(root, &manifest.config.digest, config)?;
-    let mut filesystem = BTreeMap::new();
-    let mut expanded = 0;
-    for layer in &manifest.layers {
-        let bytes = read_oci_blob(root, &layer.digest, config)?;
-        apply_layer(
-            &bytes,
-            layer.media_type.as_deref(),
-            config,
-            &mut expanded,
-            &mut filesystem,
-        )?;
-    }
+    let filesystem = oci_manifest_filesystem(&manifest, config, |digest| {
+        read_oci_blob(root, digest, config)
+    })?;
     let mut inventory = scan_virtual_files(root, AssetKind::ContainerImage, filesystem)?;
     inventory
         .asset
@@ -65,21 +56,13 @@ pub(crate) fn scan_oci_tar(path: &Path, config: &Config) -> Result<Inventory, In
                 })
                 .transpose()?
                 .unwrap_or_default();
-            let mut filesystem = BTreeMap::new();
-            let mut expanded = 0;
-            for layer in &manifest.layers {
+            let filesystem = oci_manifest_filesystem(&manifest, config, |digest| {
                 let bytes = outer
-                    .get(&blob_path(&layer.digest)?)
-                    .ok_or_else(|| InputError::MissingBlob(layer.digest.clone()))?;
-                verify_digest(&layer.digest, bytes)?;
-                apply_layer(
-                    bytes,
-                    layer.media_type.as_deref(),
-                    config,
-                    &mut expanded,
-                    &mut filesystem,
-                )?;
-            }
+                    .get(&blob_path(digest)?)
+                    .ok_or_else(|| InputError::MissingBlob(digest.to_owned()))?;
+                verify_digest(digest, bytes)?;
+                Ok(bytes.clone())
+            })?;
             (
                 scan_virtual_files(path, AssetKind::ContainerImage, filesystem)?,
                 descriptor.digest.clone(),
@@ -122,12 +105,12 @@ struct OciIndex {
     manifests: Vec<OciDescriptor>,
 }
 #[derive(Deserialize)]
-struct OciDescriptor {
-    digest: String,
+pub(crate) struct OciDescriptor {
+    pub(crate) digest: String,
     #[serde(rename = "mediaType", default)]
-    media_type: Option<String>,
+    pub(crate) media_type: Option<String>,
     #[serde(rename = "artifactType", default)]
-    artifact_type: Option<String>,
+    pub(crate) artifact_type: Option<String>,
     #[serde(default)]
     platform: Option<OciPlatform>,
     #[serde(default)]
@@ -141,10 +124,10 @@ struct OciPlatform {
     architecture: Option<String>,
 }
 #[derive(Deserialize)]
-struct OciManifest {
-    config: OciDescriptor,
+pub(crate) struct OciManifest {
+    pub(crate) config: OciDescriptor,
     #[serde(default)]
-    layers: Vec<OciDescriptor>,
+    pub(crate) layers: Vec<OciDescriptor>,
 }
 #[derive(Deserialize)]
 struct DockerManifest {
@@ -283,6 +266,30 @@ fn apply_layer(
     Ok(())
 }
 
+/// Builds the virtual filesystem an OCI image manifest describes: every
+/// layer blob is fetched through `read_blob` and applied in order with
+/// whiteout semantics. Exposed so the engine can feed image layers to the
+/// lockfile scanners without duplicating layer application.
+pub(crate) fn oci_manifest_filesystem(
+    manifest: &OciManifest,
+    config: &Config,
+    mut read_blob: impl FnMut(&str) -> Result<Vec<u8>, InputError>,
+) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
+    let mut filesystem = BTreeMap::new();
+    let mut expanded = 0;
+    for layer in &manifest.layers {
+        let bytes = read_blob(&layer.digest)?;
+        apply_layer(
+            &bytes,
+            layer.media_type.as_deref(),
+            config,
+            &mut expanded,
+            &mut filesystem,
+        )?;
+    }
+    Ok(filesystem)
+}
+
 /// Wraps a layer blob in the decompressor its bytes and media type declare.
 /// Magic bytes decide the codec (gzip `1f 8b`, zstd `28 b5 2f fd`); the
 /// media type only guards fail-closed handling: a declared codec the blob
@@ -364,7 +371,22 @@ fn is_plain_layer_media_type(media_type: &str) -> bool {
 fn read_oci_blob(root: &Path, digest: &str, config: &Config) -> Result<Vec<u8>, InputError> {
     let path = root.join(blob_path(digest)?);
     reject_symlink_ancestors_below(root, &path)?;
-    let bytes = read_limited(&path, config.max_archive_bytes)?;
+    // Canonicalize the blob path (resolving every symlink, including the
+    // final component) and require it to stay under the layout root: a
+    // `blobs/sha256/<hex>` symlink pointing outside the image directory
+    // must not be followed.
+    let canonical_root = std::fs::canonicalize(root).map_err(|source| InputError::Io {
+        path: root.to_owned(),
+        source,
+    })?;
+    let canonical = std::fs::canonicalize(&path).map_err(|source| InputError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(InputError::Symlink(path));
+    }
+    let bytes = read_limited(&canonical, config.max_archive_bytes)?;
     verify_digest(digest, &bytes)?;
     Ok(bytes)
 }
@@ -664,6 +686,31 @@ mod tests {
             Err(InputError::DigestMismatch(value)) if value == claimed
         ));
     }
+    #[cfg(unix)]
+    #[test]
+    fn oci_layout_rejects_blob_symlinks_escaping_the_root() {
+        // A `blobs/sha256/<hex>` symlink pointing outside the layout must
+        // not be followed: the canonical blob path has to stay under the
+        // canonical root.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("oci-layout"), "{}").unwrap();
+        let outside = tempdir().unwrap();
+        let claimed = digest(7);
+        let manifest = br#"{"config":{"digest":"sha256:00"},"layers":[]}"#;
+        fs::write(outside.path().join("manifest.json"), manifest).unwrap();
+        let blob = dir.path().join(blob_name(&claimed));
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("manifest.json"), &blob).unwrap();
+        fs::write(
+            dir.path().join("index.json"),
+            format!(r#"{{"manifests":[{{"digest":"{claimed}"}}]}}"#),
+        )
+        .unwrap();
+        assert!(matches!(
+            scan_path(dir.path(), &config()),
+            Err(InputError::Symlink(_))
+        ));
+    }
     #[test]
     fn oci_tar_index_and_docker_manifest_variants_are_scanned() {
         let dir = tempdir().unwrap();
@@ -794,20 +841,20 @@ mod tests {
         assert!(!filesystem.contains_key("app/.wh..wh..opq"));
     }
     #[test]
-    fn image_archive_limit_is_cumulative_across_layers_and_whiteouts() {
-        let first = tar_bytes(&[("old", b"1234")]);
-        let second = tar_bytes(&[(".wh.old", b""), ("requirements.txt", b"a==1\n")]);
+    fn layer_stream_bytes_count_against_the_archive_bound() {
+        // The decompressed tar stream — headers, padding, and the bytes
+        // tar-rs drains for skipped entries — counts against
+        // `max_archive_bytes`, not just the declared sizes of extracted
+        // files: a 5-byte payload inside a ~2 KiB stream exceeds a 5-byte
+        // bound even though the declared entry size alone would fit.
+        let layer = tar_bytes(&[("requirements.txt", b"a==1\n")]);
         let mut limited = config();
         limited.max_archive_bytes = 5;
         let mut filesystem = BTreeMap::new();
         let mut expanded = 0;
-        apply_layer(&first, None, &limited, &mut expanded, &mut filesystem).unwrap();
         assert!(matches!(
-            apply_layer(&second, None, &limited, &mut expanded, &mut filesystem),
-            Err(InputError::ArchiveTooLarge {
-                actual: 9,
-                maximum: 5
-            })
+            apply_layer(&layer, None, &limited, &mut expanded, &mut filesystem),
+            Err(InputError::ArchiveTooLarge { .. })
         ));
     }
     fn digest(value: u8) -> String {

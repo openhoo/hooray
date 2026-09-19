@@ -1,22 +1,144 @@
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::path::{Component as PathComponent, Path, PathBuf};
 
 use crate::config::Config;
 use crate::input::{InputError, malformed_msg, normalize_relative, read_limited};
 
+/// Opens an archive file for reading without following a final-component
+/// symlink and rejecting non-regular files, mirroring the input layer's
+/// `open_regular_nofollow` (kept local so the parsers surface stays
+/// self-contained).
+fn open_regular_nofollow(path: &Path) -> Result<File, InputError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const O_NOFOLLOW: i32 = 0x20_000;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        const O_NOFOLLOW: i32 = 0x100;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|source| {
+        if is_symlink_open_error(&source) {
+            InputError::Symlink(path.to_owned())
+        } else {
+            InputError::Io {
+                path: path.to_owned(),
+                source,
+            }
+        }
+    })?;
+    let metadata = file.metadata().map_err(|source| InputError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(InputError::UnsupportedPath(path.to_owned()));
+    }
+    Ok(file)
+}
+
+/// `ELOOP` per target: Linux/Android use 40, Darwin and the BSDs use 62.
+/// Raw errno matching is required because `io::ErrorKind::FilesystemLoop`
+/// is not available on the pinned toolchain; a single hardcoded 40 would
+/// misclassify symlink rejections on every non-Linux unix target.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ELOOP: i32 = 40;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const ELOOP: i32 = 62;
+
+#[cfg(unix)]
+fn is_symlink_open_error(source: &io::Error) -> bool {
+    source.raw_os_error() == Some(ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_symlink_open_error(_: &io::Error) -> bool {
+    false
+}
+
+/// Marker error `BoundedReader` raises so archive readers can report an
+/// over-budget stream as `ArchiveTooLarge` rather than a bare I/O error.
+#[derive(Debug)]
+struct ArchiveBoundExceeded;
+
+impl std::fmt::Display for ArchiveBoundExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("archive stream exceeded decompressed byte bound")
+    }
+}
+
+impl std::error::Error for ArchiveBoundExceeded {}
+
+/// Byte-counting `Read` wrapper that errors once the wrapped stream yields
+/// more than `maximum` bytes. Wrap decompressed archive streams so skipped
+/// entries (whose declared sizes tar-rs drains through the reader) count
+/// against the same budget as extracted ones.
+struct BoundedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> BoundedReader<R> {
+    fn new(inner: R, maximum: u64) -> Self {
+        Self {
+            inner,
+            remaining: maximum,
+        }
+    }
+}
+
+impl<R: Read> Read for BoundedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(io::Error::other(ArchiveBoundExceeded));
+        }
+        let limit = (self.remaining.min(buf.len() as u64)) as usize;
+        let read = self.inner.read(&mut buf[..limit])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+/// Maps an archive-stream I/O error: a `BoundedReader` bound violation
+/// becomes `ArchiveTooLarge`, anything else stays an `Io` error.
+fn archive_stream_error(source: io::Error, path: PathBuf, config: &Config) -> InputError {
+    if source
+        .get_ref()
+        .is_some_and(|e| e.is::<ArchiveBoundExceeded>())
+    {
+        InputError::ArchiveTooLarge {
+            actual: config.max_archive_bytes.saturating_add(1),
+            maximum: config.max_archive_bytes,
+        }
+    } else {
+        InputError::Io { path, source }
+    }
+}
+
 pub(crate) fn read_zip_file(
     path: &Path,
     config: &Config,
 ) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
-    read_zip(
-        File::open(path).map_err(|source| InputError::Io {
-            path: path.to_owned(),
-            source,
-        })?,
-        config,
-    )
+    read_zip(open_regular_nofollow(path)?, config)
 }
 
 fn read_zip<R: Read + io::Seek>(
@@ -58,7 +180,7 @@ pub(crate) fn read_tar_file(
     config: &Config,
 ) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
     read_tar(
-        decompress_archive(Cursor::new(read_limited(path, config.max_input_bytes)?))?,
+        decompress_archive(Cursor::new(read_limited(path, config.max_archive_bytes)?))?,
         config,
     )
 }
@@ -131,13 +253,16 @@ pub(crate) fn read_tar_with_expanded<R: Read>(
     config: &Config,
     expanded: &mut u64,
 ) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
-    let mut archive = tar::Archive::new(reader);
+    // Bound the decompressed stream, not just extracted bytes: tar-rs drains
+    // skipped entries through the reader, so a crafted archive whose
+    // directory entries declare huge sizes would otherwise decompress
+    // unboundedly.
+    let mut archive = tar::Archive::new(BoundedReader::new(reader, config.max_archive_bytes));
     let mut files = BTreeMap::new();
     let mut count = 0_usize;
-    let entries = archive.entries().map_err(|source| InputError::Io {
-        path: PathBuf::from("<tar>"),
-        source,
-    })?;
+    let entries = archive
+        .entries()
+        .map_err(|source| archive_stream_error(source, PathBuf::from("<tar>"), config))?;
     for entry in entries {
         count += 1;
         if count > config.max_archive_entries {
@@ -145,10 +270,8 @@ pub(crate) fn read_tar_with_expanded<R: Read>(
                 maximum: config.max_archive_entries,
             });
         }
-        let mut entry = entry.map_err(|source| InputError::Io {
-            path: PathBuf::from("<tar>"),
-            source,
-        })?;
+        let mut entry =
+            entry.map_err(|source| archive_stream_error(source, PathBuf::from("<tar>"), config))?;
         let Some(path) = tar_entry_path(&entry)? else {
             continue;
         };
@@ -200,10 +323,7 @@ pub(crate) fn read_entry_bounded(
         .by_ref()
         .take(expected.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|source| InputError::Io {
-            path: PathBuf::from(path),
-            source,
-        })?;
+        .map_err(|source| archive_stream_error(source, PathBuf::from(path), config))?;
     if bytes.len() as u64 != expected {
         return Err(malformed_msg(path, format, "entry size mismatch"));
     }
@@ -455,5 +575,69 @@ mod tests {
                 config().max_archive_bytes
             )
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_zip_file_rejects_symlinked_archive() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real.zip");
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file("a", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"x").unwrap();
+        fs::write(&real, writer.finish().unwrap().into_inner()).unwrap();
+        let link = dir.path().join("link.zip");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(matches!(
+            read_zip_file(&link, &config()),
+            Err(InputError::Symlink(_))
+        ));
+    }
+
+    #[test]
+    fn tar_stream_bound_counts_skipped_entry_bytes() {
+        // A tar whose only file entry is skipped (a directory entry
+        // carrying a large declared size) still drains those bytes through
+        // the reader: the decompressed stream bound must trip even though
+        // no file content is ever extracted.
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(4096);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "dir/", vec![b'x'; 4096].as_slice())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut small = config();
+        small.max_archive_bytes = 8;
+        assert!(matches!(
+            read_tar(Cursor::new(bytes), &small),
+            Err(InputError::ArchiveTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn read_tar_file_caps_input_at_archive_bound() {
+        // The on-disk tar is capped by `max_archive_bytes`, not the smaller
+        // `max_input_bytes` ceiling used for single lockfiles.
+        let dir = tempdir().unwrap();
+        let tar_path = dir.path().join("big.tar");
+        write_tar(&tar_path, &[("requirements.txt", b"safe==1\n")]);
+        let mut limits = config();
+        limits.max_input_bytes = 1;
+        limits.max_archive_bytes = 1 << 20;
+        assert!(read_tar_file(&tar_path, &limits).is_ok());
+        limits.max_archive_bytes = 1;
+        assert!(matches!(
+            read_tar_file(&tar_path, &limits),
+            Err(InputError::InputTooLarge { maximum: 1, .. })
+        ));
     }
 }
