@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.0 (2026-09-19)
+
+### Features
+
+- **scanners:** IaC checks for docker-compose and GitHub Actions (3a6cbe6)
+
+### Bug Fixes
+
+- **parsers:** resolve lockfile edge, scope, and abort defects from audit (985a893)
+- **reports:** harden SBOM ingestion, renderers, model, monitor, and store (362111e)
+- **parity:** harden corpus loading, comparison keys, gates, and recording validation (7767d39)
+- **parsers:** harden archive readers and expose OCI filesystem builder (99a1f78)
+- **engine:** harden OSV matching, graph classification, and input handling (0a5caaa)
+- **scanners:** close audit findings in secret, IaC, service-config, SAST, and license (9ec9d45)
+- **parsers:** resolve quoted and multi-version Yarn classic dependencies (9a7fa8a)
+- **store:** require FULL synchronous for commit durability (35e3491)
+- **risk:** rank Unknown severity above Low in severity_points (43cee0a)
+- **input:** bound serde_yaml alias expansion on untrusted lockfiles (9a24589)
+
+### Other Changes
+
+- **ci:** align dependabot naming with hoolicy policy (#116) (de8f062)
+- **parity:** harden recording integrity and corpus coverage assertions (54112a3)
+
 ## 0.8.0 (2026-09-18)
 
 ### Features
