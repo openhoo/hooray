@@ -140,9 +140,9 @@
       "kind": "project-directory",
       "description": "go.mod with module/go/toolchain directives and require block pinning golang.org/x/crypto v0.0.0-20190308221718-c2843e01e9fb pseudo-version (CVE-2020-9283/9288 window) and github.com/pkg/errors v0.9.1; go.sum sibling included.",
       "expected_ecosystems": ["golang"],
-      "min_components": 2,
+      "min_components": 3,
       "directness_comparable": false,
-      "notes": "go.sum is hashed as a sidecar but must NOT emit packages; component count equals go.mod require count exactly."
+      "notes": "go.sum is hashed as a sidecar but must NOT emit packages; component count equals go.mod require count plus the pkg:golang/stdlib toolchain component (#78)."
     },
     {
       "case_id": "nuget-packages-lock",
@@ -152,6 +152,24 @@
       "min_components": 5,
       "directness_comparable": true,
       "notes": "type Direct/Transitive plus per-package dependencies maps give real edges."
+    },
+    {
+      "case_id": "gradle-lockfile-basic",
+      "kind": "project-directory",
+      "description": "Gradle *.lockfile with group:artifact:version=conf records: commons-lang3 3.12.0 and guava 31.1-jre on production configurations, junit 4.13.2 test-only, plus an empty= marker line.",
+      "expected_ecosystems": ["maven"],
+      "min_components": 3,
+      "directness_comparable": false,
+      "notes": "#63: *.lockfile extension routing; configuration-derived scope (production -> runtime, test-only -> development); empty= and comment lines skipped."
+    },
+    {
+      "case_id": "maven-pom-basic",
+      "kind": "project-directory",
+      "description": "Maven pom.xml with dependencyManagement-managed commons-lang3 3.12.0, property-interpolated guava ${guava.version} -> 31.1-jre, and test-scoped junit 4.13.2.",
+      "expected_ecosystems": ["maven"],
+      "min_components": 3,
+      "directness_comparable": false,
+      "notes": "#66: LockTree route resolves versions from dependencyManagement and ${property} interpolation; test scope maps to development; the project itself never becomes a component."
     },
     {
       "case_id": "cyclonedx-sbom-nested",

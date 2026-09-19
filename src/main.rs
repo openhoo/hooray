@@ -1185,6 +1185,30 @@ mod tests {
     }
 
     #[test]
+    fn clap_offline_flag_parses_on_every_scan_target() {
+        for command in [
+            vec!["hooray", "scan", "project", ".", "--offline"],
+            vec!["hooray", "scan", "sbom", "bom.json", "--offline"],
+            vec!["hooray", "scan", "artifact", "app.zip", "--offline"],
+            vec!["hooray", "scan", "container", "image.tar", "--offline"],
+            vec!["hooray", "scan", "auto", ".", "--offline"],
+        ] {
+            let cli = Cli::try_parse_from(command).expect("--offline parses");
+            let Command::Scan(args) = cli.command else {
+                panic!("expected scan command");
+            };
+            let offline = match args.command {
+                ScanCommand::Project(target)
+                | ScanCommand::Sbom(target)
+                | ScanCommand::Artifact(target)
+                | ScanCommand::Container(target)
+                | ScanCommand::Auto(target) => target.offline,
+            };
+            assert!(offline, "--offline must reach ScanTargetArgs.offline");
+        }
+    }
+
+    #[test]
     fn clap_rejects_legacy_flat_scan_surface() {
         assert!(Cli::try_parse_from(["hooray", "scan", "--input", "bom.json"]).is_err());
         assert!(Cli::try_parse_from(["hooray", "config", "validate"]).is_err());
