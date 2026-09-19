@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
+use serde_json::Value;
 
-use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg};
+use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::{ComponentId, License, Scope};
 
 #[derive(Deserialize)]
@@ -22,18 +23,34 @@ struct NpmPackage {
     name: Option<String>,
     #[serde(default)]
     version: Option<String>,
+    /// npm accepts the legacy object form `{"type":"MIT","url":"…"}` copied
+    /// verbatim from old package.json files; keep the raw value so both
+    /// shapes deserialize.
     #[serde(default)]
-    license: Option<String>,
+    license: Option<Value>,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
     #[serde(default, rename = "devDependencies")]
     dev_dependencies: BTreeMap<String, String>,
     #[serde(default, rename = "optionalDependencies")]
     optional_dependencies: BTreeMap<String, String>,
+    #[serde(default, rename = "peerDependencies")]
+    peer_dependencies: BTreeMap<String, String>,
     #[serde(default)]
     dev: bool,
     #[serde(default)]
     optional: bool,
+    /// npm's third scope class: installed as a dev or optional dependency,
+    /// never part of a production install.
+    #[serde(default, rename = "devOptional")]
+    dev_optional: bool,
+    /// Workspace symlinks (`"node_modules/<ws>": {"resolved": "packages/<ws>",
+    /// "link": true}`) carry no version; they alias the link target rather
+    /// than describing an installable package.
+    #[serde(default)]
+    link: bool,
+    #[serde(default)]
+    resolved: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct NpmDependency {
@@ -52,13 +69,13 @@ pub(crate) fn parse_package_lock(
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let lock: NpmLock =
-        serde_json::from_slice(bytes).map_err(|e| malformed(path, "package-lock.json", e))?;
+    let lock: NpmLock = serde_json::from_str(utf8(bytes, path, "package-lock.json")?)
+        .map_err(|e| malformed(path, "package-lock.json", e))?;
     let root_version = if !lock.packages.is_empty() {
         parse_npm_packages_v2(&lock, path, out)?
     } else {
         parse_npm_dependencies_v1(&lock, path, out)?;
-        None
+        lock.version.clone()
     };
     // Root-anchored identity: the builder applies this claim only when no
     // shallower lockfile already claimed the field, so nested lockfiles
@@ -67,8 +84,61 @@ pub(crate) fn parse_package_lock(
     Ok(())
 }
 
+/// Parses a `package.json` manifest: claims the package name/version as
+/// asset identity and records declared dependencies as components. A
+/// sibling package-lock.json already resolved these constraints, so only
+/// identity is claimed when one exists.
+// Wired to the `package.json` manifest route in input.rs by the engine
+// package (issue #154); the route table lives outside this module.
+#[allow(dead_code)]
+pub(crate) fn parse_package_json(
+    path: &str,
+    bytes: &[u8],
+    lock: Option<&Vec<u8>>,
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let value: Value = serde_json::from_str(utf8(bytes, path, "package.json")?)
+        .map_err(|e| malformed(path, "package.json", e))?;
+    let root = value
+        .as_object()
+        .ok_or_else(|| malformed_msg(path, "package.json", "expected a JSON object"))?;
+    let name = root
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty());
+    let version = root
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty());
+    out.claim_asset_identity(path, name.map(str::to_owned), version.map(str::to_owned));
+    if lock.is_some() {
+        return Ok(());
+    }
+    for (section, scope) in [
+        ("dependencies", Scope::Runtime),
+        ("devDependencies", Scope::Development),
+        ("optionalDependencies", Scope::Optional),
+        ("peerDependencies", Scope::Runtime),
+    ] {
+        let Some(deps) = root.get(section).and_then(Value::as_object) else {
+            continue;
+        };
+        entry_bound(deps.len(), path, "package.json")?;
+        for (name, constraint) in deps {
+            let Some(constraint) = constraint.as_str() else {
+                continue;
+            };
+            if constraint.is_empty() {
+                continue;
+            }
+            out.add("npm", name, constraint, scope, path, BTreeSet::new())?;
+        }
+    }
+    Ok(())
+}
+
 /// npm v2 `packages`-map ingestion: registers flat components, infers names
-/// from `node_modules` keys, and wires edges across the three chained
+/// from `node_modules` keys, and wires edges across the four chained
 /// dependency maps.
 fn parse_npm_packages_v2(
     lock: &NpmLock,
@@ -76,6 +146,17 @@ fn parse_npm_packages_v2(
     out: &mut InventoryBuilder,
 ) -> Result<Option<String>, InputError> {
     entry_bound(lock.packages.len(), path, "package-lock.json")?;
+    // Workspace link entries (`"link": true`) carry no version: they alias
+    // their `resolved` target directory, so they register no component but
+    // still resolve dependency edges and name workspace packages.
+    let mut links = BTreeMap::new();
+    for (key, package) in &lock.packages {
+        if package.link
+            && let Some(target) = package.resolved.as_deref().filter(|t| !t.is_empty())
+        {
+            links.insert(key.as_str(), target.trim_start_matches("./"));
+        }
+    }
     let mut ids = BTreeMap::new();
     let mut root_version = None;
     for (key, package) in &lock.packages {
@@ -83,24 +164,40 @@ fn parse_npm_packages_v2(
             root_version = package.version.clone().or_else(|| lock.version.clone());
             continue;
         }
+        if package.link {
+            continue;
+        }
         let name = package
             .name
             .clone()
             .unwrap_or_else(|| match key.rsplit_once("node_modules/") {
                 Some((_, tail)) => tail.to_owned(),
-                None => key.to_owned(),
+                // Workspace packages key by directory (`packages/<ws>`) and
+                // omit `name`; the workspace link under node_modules records
+                // the real package name. Fall back to the directory basename,
+                // never the full path.
+                None => links
+                    .iter()
+                    .find(|(_, target)| **target == key.as_str())
+                    .and_then(|(link_key, _)| {
+                        link_key
+                            .rsplit_once("node_modules/")
+                            .map(|(_, tail)| tail.to_owned())
+                    })
+                    .unwrap_or_else(|| key.rsplit('/').next().unwrap_or(key).to_owned()),
             });
         let version = package
             .version
             .as_deref()
             .ok_or_else(|| malformed_msg(path, "package-lock.json", "package has no version"))?;
-        let scope = npm_scope(package.dev, package.optional);
+        let scope = npm_scope(package.dev || package.dev_optional, package.optional);
         let licenses = package
             .license
             .as_ref()
+            .and_then(npm_license)
             .map(|v| {
                 BTreeSet::from([License {
-                    expression: Some(v.clone()),
+                    expression: Some(v),
                     name: None,
                     url: None,
                 }])
@@ -110,6 +207,12 @@ fn parse_npm_packages_v2(
             key.clone(),
             out.add("npm", &name, version, scope, path, licenses)?,
         );
+    }
+    // Link entries alias their target so edges into a workspace resolve.
+    for (key, target) in &links {
+        if let Some(id) = ids.get(*target) {
+            ids.insert((*key).to_owned(), id.clone());
+        }
     }
     for (key, package) in &lock.packages {
         let Some(from) = ids.get(key) else { continue };
@@ -128,6 +231,12 @@ fn parse_npm_packages_v2(
                     .optional_dependencies
                     .keys()
                     .map(|n| (n, true, Scope::Optional)),
+            )
+            .chain(
+                package
+                    .peer_dependencies
+                    .keys()
+                    .map(|n| (n, false, Scope::Runtime)),
             )
         {
             if let Some(to) = resolve_npm_key(key, name, &ids).cloned() {
@@ -154,14 +263,41 @@ fn resolve_npm_key<'a>(
     name: &str,
     ids: &'a BTreeMap<String, ComponentId>,
 ) -> Option<&'a ComponentId> {
-    let nested = if parent.is_empty() {
-        format!("node_modules/{name}")
-    } else {
-        format!("{parent}/node_modules/{name}")
-    };
-    ids.get(&nested)
-        .or_else(|| ids.get(&format!("node_modules/{name}")))
+    // npm hoists dependencies to the nearest node_modules that has no
+    // conflict: a dependency may live at any ancestor level, so walk every
+    // ancestor before the hoisted top-level fallback.
+    let mut ancestor = Some(parent);
+    while let Some(key) = ancestor {
+        if !key.is_empty()
+            && let Some(id) = ids.get(&format!("{key}/node_modules/{name}"))
+        {
+            return Some(id);
+        }
+        ancestor = npm_parent_key(key);
+    }
+    ids.get(&format!("node_modules/{name}"))
 }
+
+/// Drops the last `node_modules/<name>` segment pair of a package key so
+/// dependency resolution walks every ancestor level.
+fn npm_parent_key(key: &str) -> Option<&str> {
+    if let Some(stripped) = key.strip_prefix("node_modules/")
+        && !stripped.contains('/')
+    {
+        return Some("");
+    }
+    key.rsplit_once("/node_modules/").map(|(parent, _)| parent)
+}
+
+/// Reads an npm `license` field: the modern string form or the legacy
+/// object form `{"type":"MIT","url":"…"}` old package.json files carried.
+fn npm_license(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
 pub(crate) fn npm_scope(dev: bool, optional: bool) -> Scope {
     if dev {
         Scope::Development
@@ -276,6 +412,19 @@ mod tests {
     }
 
     #[test]
+    fn npm_v1_lockfile_claims_root_version() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{"name":"legacy","version":"4.5.6","lockfileVersion":1,"dependencies":{"a":{"version":"1.0.0"}}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.name, "legacy");
+        assert_eq!(inventory.asset.version.as_deref(), Some("4.5.6"));
+    }
+
+    #[test]
     fn npm_v3_nested_dependency_resolves_via_hoisted_top_level_fallback() {
         let dir = tempdir().unwrap();
         fs::write(
@@ -300,6 +449,130 @@ mod tests {
                 .any(|e| e.from == a && e.to == b && e.scope == Scope::Runtime && !e.optional),
             "expected hoisted fallback edge a -> b"
         );
+    }
+
+    #[test]
+    fn npm_v3_mid_level_hoisted_dependency_resolves_through_ancestors() {
+        let dir = tempdir().unwrap();
+        // `c` is hoisted to `node_modules/a/node_modules/c` because the root
+        // already carries a conflicting version; `b` nested under `a` must
+        // still resolve its edge to the intermediate level.
+        fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{"name":"app","packages":{"":{"version":"1"},"node_modules/a":{"name":"a","version":"1.0.0"},"node_modules/a/node_modules/b":{"name":"b","version":"2.0.0","dependencies":{"c":"^1"}},"node_modules/a/node_modules/c":{"name":"c","version":"1.0.0"},"node_modules/c":{"name":"c","version":"2.0.0"}}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let component = |name: &str, version: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name && c.version == version)
+                .unwrap_or_else(|| panic!("missing component {name}@{version}"))
+                .identity
+                .clone()
+        };
+        let b = component("b", "2.0.0");
+        let c1 = component("c", "1.0.0");
+        assert!(
+            inventory
+                .dependencies
+                .iter()
+                .any(|e| e.from == b && e.to == c1),
+            "expected edge b -> c@1.0.0 via intermediate node_modules"
+        );
+    }
+
+    #[test]
+    fn npm_workspaces_links_and_names_resolve() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{"name":"app","version":"1.0.0","packages":{"":{"version":"1.0.0","workspaces":["packages/*"]},"node_modules/app-lib":{"resolved":"packages/app-lib","link":true},"packages/app-lib":{"version":"2.0.0","dependencies":{"left-pad":"^1.3.0"}},"node_modules/left-pad":{"name":"left-pad","version":"1.3.0"}}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        // The link entry produces no phantom component; the workspace package
+        // is named from its link target, not the `packages/` path.
+        assert_eq!(inventory.components.len(), 2);
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "app-lib" && c.version == "2.0.0")
+        );
+        assert!(
+            !inventory
+                .components
+                .values()
+                .any(|c| c.name.starts_with("packages/"))
+        );
+        let app_lib = inventory
+            .components
+            .values()
+            .find(|c| c.name == "app-lib")
+            .unwrap()
+            .identity
+            .clone();
+        let left_pad = inventory
+            .components
+            .values()
+            .find(|c| c.name == "left-pad")
+            .unwrap()
+            .identity
+            .clone();
+        assert!(
+            inventory
+                .dependencies
+                .iter()
+                .any(|e| e.from == app_lib && e.to == left_pad)
+        );
+    }
+
+    #[test]
+    fn npm_dev_optional_and_object_license_and_peer_edges() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{"name":"app","packages":{"":{"version":"1"},"node_modules/a":{"name":"a","version":"1.0.0","license":{"type":"MIT","url":"https://example.com/MIT"},"peerDependencies":{"peer":"^1"}},"node_modules/peer":{"name":"peer","version":"1.0.0","devOptional":true}}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let peer = inventory
+            .components
+            .values()
+            .find(|c| c.name == "peer")
+            .unwrap();
+        assert_eq!(peer.scope, Scope::Development);
+        let a = inventory
+            .components
+            .values()
+            .find(|c| c.name == "a")
+            .unwrap();
+        assert!(
+            a.licenses
+                .iter()
+                .any(|l| l.expression.as_deref() == Some("MIT"))
+        );
+        assert!(
+            inventory
+                .dependencies
+                .iter()
+                .any(|e| e.from == a.identity && e.to == peer.identity),
+            "expected peerDependencies edge a -> peer"
+        );
+    }
+
+    #[test]
+    fn npm_bom_prefixed_lockfile_parses() {
+        let dir = tempdir().unwrap();
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend_from_slice(
+            br#"{"name":"app","packages":{"":{"version":"1"},"node_modules/a":{"name":"a","version":"1.0.0"}}}"#,
+        );
+        fs::write(dir.path().join("package-lock.json"), bytes).unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 1);
     }
 
     #[test]

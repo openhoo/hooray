@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_yaml::Value as Yaml;
 
-use super::split_descriptor;
+use super::{split_descriptor, yaml_str};
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::{ComponentId, Scope};
 struct YarnEntry {
@@ -136,7 +136,7 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
         if key == "__metadata" {
             continue;
         }
-        let Some(version) = value.get("version").and_then(Yaml::as_str) else {
+        let Some(version) = value.get("version").and_then(yaml_str) else {
             // README promises malformed lockfiles fail rather than skip
             // entries; this is the same condition the classic parser
             // hard-errors on, so Berry must not silently drop the entry.
@@ -167,7 +167,11 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
         let name = yarn_name(path, descriptor)?.to_owned();
         let descriptors = yarn_descriptors(path, key, true)?;
         let mut deps: Vec<(String, bool)> = Vec::new();
-        for (field, optional) in [("dependencies", false), ("optionalDependencies", true)] {
+        for (field, optional) in [
+            ("dependencies", false),
+            ("optionalDependencies", true),
+            ("peerDependencies", false),
+        ] {
             if let Some(map) = value.get(field).and_then(Yaml::as_mapping) {
                 for (dep, requested) in map {
                     let (Some(dep), Some(requested)) = (dep.as_str(), requested.as_str()) else {
@@ -190,7 +194,7 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
             YarnEntry {
                 descriptors,
                 name,
-                version: version.to_owned(),
+                version,
                 deps,
             },
         )?;
