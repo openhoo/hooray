@@ -59,7 +59,9 @@ fn add_conda_spec(path: &str, spec: &str, out: &mut InventoryBuilder) -> Result<
         .strip_prefix("==")
         .or_else(|| constraint.strip_prefix('='))
     {
-        Some(pinned) => pinned.trim().to_owned(),
+        // `pkg==1.24.2=py310h…` pins version plus build string; the second
+        // `=` separates the build, so keep only the version part.
+        Some(pinned) => pinned.trim().split('=').next().unwrap_or(pinned).to_owned(),
         None if constraint.is_empty() => "*".to_owned(),
         None => constraint.to_owned(),
     };
@@ -92,4 +94,29 @@ pub(crate) fn clean_pip_requirement(line: &str) -> Option<String> {
     // parse_requirements accepts unpinned and constrained lines, so every
     // non-option pip line is forwarded verbatim.
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::input::{config, scan_path};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn conda_version_build_pins_keep_the_version() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("environment.yml"),
+            "dependencies:\n  - numpy==1.24.2=py310h12345\n",
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let numpy = inventory
+            .components
+            .values()
+            .find(|c| c.name == "numpy")
+            .unwrap();
+        assert_eq!(numpy.version, "1.24.2");
+        assert_eq!(numpy.purl, "pkg:conda/numpy@1.24.2");
+    }
 }

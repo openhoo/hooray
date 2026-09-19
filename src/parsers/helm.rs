@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_yaml::Value as Yaml;
 
+use super::yaml_str;
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::Scope;
 pub(crate) fn parse_chart_yaml(
@@ -12,18 +13,27 @@ pub(crate) fn parse_chart_yaml(
 ) -> Result<(), InputError> {
     let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "Chart.yaml")?)
         .map_err(|e| malformed(path, "Chart.yaml", e))?;
-    if let Some(version) = doc
-        .get("version")
+    let name = doc
+        .get("name")
         .and_then(Yaml::as_str)
-        .filter(|v| !v.is_empty())
-    {
-        out.claim_asset_identity(path, None, Some(version.to_owned()));
+        .filter(|v| !v.is_empty());
+    let version = doc
+        .get("version")
+        .and_then(yaml_str)
+        .filter(|v| !v.is_empty());
+    if name.is_some() || version.is_some() {
+        out.claim_asset_identity(path, name.map(str::to_owned), version);
     }
     let Some(dependencies) = doc.get("dependencies").and_then(Yaml::as_sequence) else {
         return Ok(());
     };
     entry_bound(dependencies.len(), path, "Chart.yaml")?;
     for dependency in dependencies {
+        // `file://` repositories and `@local`/`alias:local` references name
+        // local subcharts, not registry components.
+        if helm_local_repository(dependency) {
+            continue;
+        }
         let Some(name) = dependency.get("name").and_then(Yaml::as_str) else {
             return Err(malformed_msg(
                 path,
@@ -31,7 +41,7 @@ pub(crate) fn parse_chart_yaml(
                 "dependency entry has no name",
             ));
         };
-        let Some(version) = dependency.get("version").and_then(Yaml::as_str) else {
+        let Some(version) = dependency.get("version").and_then(yaml_str) else {
             return Err(malformed_msg(
                 path,
                 "Chart.yaml",
@@ -48,10 +58,31 @@ pub(crate) fn parse_chart_yaml(
         // A sibling Chart.lock already resolved these constraints; the
         // lockfile's pinned versions supersede the declared ranges.
         if lock.is_none() {
-            out.add("helm", name, version, Scope::Runtime, path, BTreeSet::new())?;
+            out.add(
+                "helm",
+                name,
+                &version,
+                Scope::Runtime,
+                path,
+                BTreeSet::new(),
+            )?;
         }
     }
     Ok(())
+}
+
+/// Reports whether a Chart dependency references a local subchart rather
+/// than a chart repository: `file://` URLs or the `@local`/`alias:local`
+/// repository aliases.
+fn helm_local_repository(dependency: &Yaml) -> bool {
+    dependency
+        .get("repository")
+        .and_then(Yaml::as_str)
+        .is_some_and(|repository| {
+            repository.starts_with("file://")
+                || repository == "@local"
+                || repository == "alias:local"
+        })
 }
 
 /// Parses a Helm `Chart.lock`: the resolved-dependency artifact `helm
@@ -71,6 +102,9 @@ pub(crate) fn parse_chart_lock(
         .ok_or_else(|| malformed_msg(path, "Chart.lock", "missing dependencies list"))?;
     entry_bound(dependencies.len(), path, "Chart.lock")?;
     for dependency in dependencies {
+        if helm_local_repository(dependency) {
+            continue;
+        }
         let Some(name) = dependency.get("name").and_then(Yaml::as_str) else {
             return Err(malformed_msg(
                 path,
@@ -78,7 +112,7 @@ pub(crate) fn parse_chart_lock(
                 "dependency entry has no name",
             ));
         };
-        let Some(version) = dependency.get("version").and_then(Yaml::as_str) else {
+        let Some(version) = dependency.get("version").and_then(yaml_str) else {
             return Err(malformed_msg(
                 path,
                 "Chart.lock",
@@ -92,7 +126,14 @@ pub(crate) fn parse_chart_lock(
                 "dependency entry has an empty name or version",
             ));
         }
-        out.add("helm", name, version, Scope::Runtime, path, BTreeSet::new())?;
+        out.add(
+            "helm",
+            name,
+            &version,
+            Scope::Runtime,
+            path,
+            BTreeSet::new(),
+        )?;
     }
     Ok(())
 }
@@ -262,5 +303,36 @@ mod tests {
         .unwrap();
         let inventory = scan_path(dir.path(), &config()).unwrap();
         assert_eq!(inventory.components.len(), 0);
+    }
+
+    #[test]
+    fn chart_yaml_claims_name_and_skips_local_deps() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Chart.yaml"),
+            concat!(
+                "apiVersion: v2\n",
+                "name: my-chart\n",
+                "version: 1.0\n",
+                "dependencies:\n",
+                "  - name: sub\n",
+                "    version: 2.0\n",
+                "    repository: file://../sub\n",
+                "  - name: redis\n",
+                "    version: 17.0\n",
+                "    repository: https://charts.bitnami.com/bitnami\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.name, "my-chart");
+        assert_eq!(inventory.asset.version.as_deref(), Some("1.0"));
+        assert_eq!(inventory.components.len(), 1);
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "redis" && c.purl == "pkg:helm/redis@17.0")
+        );
     }
 }
