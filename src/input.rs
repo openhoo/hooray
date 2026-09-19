@@ -153,7 +153,28 @@ impl ScanInput {
         if !metadata.is_file() {
             return Err(InputError::UnsupportedPath(canonical));
         }
-        check_file_size(&canonical, config.max_input_bytes)?;
+        // Archive inputs are container/archive payloads, not single input
+        // files: bound them by the archive budget so a >100 MiB image tar
+        // scans like the equivalent unpacked layout.
+        let is_tar = canonical
+            .file_name()
+            .and_then(|v| v.to_str())
+            .map(|name| {
+                let name = name.to_ascii_lowercase();
+                name.ends_with(".tar")
+                    || name.ends_with(".tar.gz")
+                    || name.ends_with(".tgz")
+                    || name.ends_with(".tar.zst")
+            })
+            .unwrap_or(false);
+        check_file_size(
+            &canonical,
+            if is_tar {
+                config.max_archive_bytes
+            } else {
+                config.max_input_bytes
+            },
+        )?;
         let lower = canonical
             .file_name()
             .and_then(|v| v.to_str())
@@ -220,6 +241,28 @@ impl ScanInput {
             }
         }
     }
+
+    /// Extracted member contents for archive inputs, so filesystem scanners
+    /// and license detection can evaluate what `scan_virtual_files` saw
+    /// beyond lockfiles. `None` for real-directory and SBOM inputs (scanners
+    /// walk those paths directly) and for OCI images, whose layer extraction
+    /// lives in `parsers::image` and is not yet exposed here.
+    pub fn virtual_files(
+        &self,
+        config: &Config,
+    ) -> Result<Option<BTreeMap<String, Vec<u8>>>, InputError> {
+        match self {
+            Self::Archive {
+                path,
+                format: ArchiveFormat::Zip,
+            } => Ok(Some(read_zip_file(path, config)?)),
+            Self::Archive {
+                path,
+                format: ArchiveFormat::Tar,
+            } => Ok(Some(read_tar_file(path, config)?)),
+            _ => Ok(None),
+        }
+    }
 }
 
 fn scan_directory(root: &Path, config: &Config) -> Result<Inventory, InputError> {
@@ -244,7 +287,7 @@ fn scan_directory(root: &Path, config: &Config) -> Result<Inventory, InputError>
         if !entry.file_type().is_some_and(|kind| kind.is_file()) || !is_inventory_file(relative) {
             continue;
         }
-        let bytes = read_limited(entry.path(), config.max_input_bytes)?;
+        let bytes = read_limited_below(root, entry.path(), config.max_input_bytes)?;
         total = total
             .checked_add(bytes.len() as u64)
             .ok_or(InputError::InputTooLarge {
@@ -281,10 +324,11 @@ enum LockfileRoute {
     /// manifest for license inheritance.
     CargoLock,
     /// Manifest whose dependency declarations are superseded by a sibling
-    /// lockfile (`composer.json`/`composer.lock`, `Chart.yaml`/`Chart.lock`).
+    /// lockfile (`composer.json`/`composer.lock`, `Chart.yaml`/`Chart.lock`,
+    /// `package.json` plus any npm-family lockfile).
     Manifest {
         parse: ManifestParser,
-        lock_name: &'static str,
+        lock_names: &'static [&'static str],
     },
 }
 
@@ -294,6 +338,10 @@ enum LockfileRoute {
 const LOCKFILES: &[(&str, LockfileRoute)] = &[
     ("Cargo.lock", LockfileRoute::CargoLock),
     ("package-lock.json", LockfileRoute::Lock(parse_package_lock)),
+    (
+        "npm-shrinkwrap.json",
+        LockfileRoute::Lock(parse_package_lock),
+    ),
     ("requirements.txt", LockfileRoute::Lock(parse_requirements)),
     ("go.mod", LockfileRoute::Lock(parse_go_mod)),
     ("packages.lock.json", LockfileRoute::Lock(parse_nuget_lock)),
@@ -315,10 +363,23 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
     ("pubspec.lock", LockfileRoute::Lock(parse_pubspec_lock)),
     ("Podfile.lock", LockfileRoute::Lock(parse_podfile_lock)),
     (
+        "package.json",
+        LockfileRoute::Manifest {
+            parse: parse_package_json,
+            lock_names: &[
+                "package-lock.json",
+                "npm-shrinkwrap.json",
+                "yarn.lock",
+                "pnpm-lock.yaml",
+                "bun.lock",
+            ],
+        },
+    ),
+    (
         "composer.json",
         LockfileRoute::Manifest {
             parse: parse_composer_json,
-            lock_name: "composer.lock",
+            lock_names: &["composer.lock"],
         },
     ),
     ("composer.lock", LockfileRoute::Lock(parse_composer_lock)),
@@ -330,7 +391,7 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
         "Chart.yaml",
         LockfileRoute::Manifest {
             parse: parse_chart_yaml,
-            lock_name: "Chart.lock",
+            lock_names: &["Chart.lock"],
         },
     ),
     ("Chart.lock", LockfileRoute::Lock(parse_chart_lock)),
@@ -362,8 +423,8 @@ fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
     {
         return Some(route);
     }
-    if name.ends_with(".csproj") {
-        return Some(&CS_PROJ_ROUTE);
+    if name.ends_with(".csproj") || name.ends_with(".fsproj") || name.ends_with(".vbproj") {
+        return Some(&MSBUILD_PROJ_ROUTE);
     }
     if name.ends_with(".versions.toml") {
         return Some(&GRADLE_CATALOG_ROUTE);
@@ -377,7 +438,7 @@ fn lockfile_route(name: &str) -> Option<&'static LockfileRoute> {
 
 /// Routes for extension-matched files, stored as statics so
 /// `lockfile_route` can return shared references.
-static CS_PROJ_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_csproj);
+static MSBUILD_PROJ_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_csproj);
 static GRADLE_LOCKFILE_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_gradle_lockfile);
 static GRADLE_CATALOG_ROUTE: LockfileRoute = LockfileRoute::Lock(parse_gradle_catalog);
 static CABAL_ROUTE: LockfileRoute = LockfileRoute::LockTree(parse_cabal);
@@ -387,9 +448,7 @@ fn scan_virtual_files(
     kind: AssetKind,
     files: BTreeMap<String, Vec<u8>>,
 ) -> Result<Inventory, InputError> {
-    let asset_id = stable_asset(locator, &files)?;
-    let mut builder = InventoryBuilder::new(asset_id, locator, kind);
-    let mut recognized = false;
+    let mut builder = InventoryBuilder::new(locator, kind);
     for (path, bytes) in &files {
         let Some(route) = lockfile_route(base_name(path)) else {
             continue;
@@ -403,19 +462,20 @@ fn scan_virtual_files(
                 files.get(&sibling(path, "Cargo.toml")),
                 &mut builder,
             )?,
-            LockfileRoute::Manifest { parse, lock_name } => parse(
-                path,
-                bytes,
-                files.get(&sibling(path, lock_name)),
-                &mut builder,
-            )?,
+            LockfileRoute::Manifest { parse, lock_names } => {
+                // The manifest's declared constraints are superseded by any
+                // sibling lockfile; the parser still receives the first
+                // present lockfile so it can skip redundant work.
+                let lock = lock_names
+                    .iter()
+                    .find_map(|name| files.get(&sibling(path, name)));
+                parse(path, bytes, lock, &mut builder)?;
+            }
         }
-        recognized = true;
     }
-    if !recognized && kind != AssetKind::Repository {
-        return Err(InputError::UnsupportedFormat(locator.to_owned()));
-    }
-    builder.finish()
+    // A recognized container/archive kind that carries no lockfiles yields an
+    // empty inventory, matching the directory contract.
+    builder.finish(locator, &files)
 }
 
 struct InventoryBuilder {
@@ -429,10 +489,12 @@ struct InventoryBuilder {
 }
 
 impl InventoryBuilder {
-    fn new(id: AssetId, locator: &Path, kind: AssetKind) -> Self {
+    fn new(locator: &Path, kind: AssetKind) -> Self {
         Self {
             asset: Asset {
-                id,
+                // Placeholder: `finish` derives the stable identity from the
+                // locator plus the claimed project name once parsing is done.
+                id: AssetId::new("asset:unresolved").expect("static asset id is valid"),
                 name: locator
                     .file_name()
                     .and_then(|v| v.to_str())
@@ -545,7 +607,29 @@ impl InventoryBuilder {
         }
     }
 
-    fn finish(self) -> Result<Inventory, InputError> {
+    fn finish(
+        mut self,
+        locator: &Path,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Inventory, InputError> {
+        // Asset identity derives from the locator plus the claimed project
+        // name — never file contents — so baselines and history survive
+        // dependency updates. Without a claimed name the scanned file set
+        // (paths only, not bytes) keys the asset.
+        self.asset.id = stable_asset(locator, Some(&self.asset.name), files)?;
+        // A lockfile that claimed the project identity without locking the
+        // project itself as a component (npm-family, bundler, NuGet, …)
+        // leaves dependency roots that are really direct dependencies; the
+        // flag tells the dependency graph to synthesize a virtual root.
+        let project_is_component = self
+            .components
+            .values()
+            .any(|component| component.name == self.asset.name);
+        if self.asset_name_depth.is_some() && !project_is_component {
+            self.asset
+                .metadata
+                .insert(crate::graph::VIRTUAL_ROOT_METADATA.into(), json!(true));
+        }
         let inventory = Inventory {
             asset: self.asset,
             components: self.components,
@@ -594,7 +678,11 @@ fn entry_bound(count: usize, path: &str, format: &'static str) -> Result<(), Inp
 /// because its array shape decides docker-save classification (see
 /// `is_oci_markers`).
 fn tar_is_image<R: Read>(reader: R, config: &Config) -> Result<bool, InputError> {
-    let mut archive = tar::Archive::new(reader);
+    // Bound the decompressed stream, not just extracted bytes: tar-rs drains
+    // skipped entries through the reader, so a crafted archive whose
+    // directory entries declare huge sizes would otherwise decompress
+    // unboundedly during this detection pass.
+    let mut archive = tar::Archive::new(BoundedReader::new(reader, config.max_archive_bytes));
     let mut count = 0_usize;
     let mut expanded = 0_u64;
     let mut has_layout = false;
@@ -693,7 +781,7 @@ fn check_file_size(path: &Path, maximum: u64) -> Result<(), InputError> {
         Ok(())
     }
 }
-fn open_regular_nofollow(path: &Path) -> Result<File, InputError> {
+pub(crate) fn open_regular_nofollow(path: &Path) -> Result<File, InputError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -788,6 +876,100 @@ fn read_limited(path: &Path, maximum: u64) -> Result<Vec<u8>, InputError> {
         Ok(bytes)
     }
 }
+
+/// `read_limited` variant that re-verifies the opened file still resolves
+/// beneath `root`: `O_NOFOLLOW` guards only the final path component, so an
+/// intermediate directory swapped for a symlink between the walk and the
+/// open would redirect the read outside the scanned tree. On Linux the
+/// opened descriptor's `/proc/self/fd` target is canonicalized and must stay
+/// under `root`; elsewhere the parent directory is re-canonicalized before
+/// opening (same check, narrower race window).
+fn read_limited_below(root: &Path, path: &Path, maximum: u64) -> Result<Vec<u8>, InputError> {
+    #[cfg(target_os = "linux")]
+    {
+        let file = open_regular_nofollow(path)?;
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", {
+            use std::os::unix::io::AsRawFd;
+            file.as_raw_fd()
+        }));
+        let resolved = fs::canonicalize(&fd_path).map_err(|source| InputError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        if !resolved.starts_with(root) {
+            return Err(InputError::Symlink(path.to_owned()));
+        }
+        return read_file_bounded(file, path, maximum);
+    }
+    #[allow(unreachable_code)]
+    {
+        reject_symlink_ancestors_below(root, path)?;
+        read_limited(path, maximum)
+    }
+}
+
+fn read_file_bounded(mut file: File, path: &Path, maximum: u64) -> Result<Vec<u8>, InputError> {
+    let file_size = file
+        .metadata()
+        .map_err(|source| InputError::Io {
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if file_size > maximum {
+        return Err(InputError::InputTooLarge {
+            actual: maximum.saturating_add(1).min(file_size),
+            maximum,
+        });
+    }
+    let capacity = usize::try_from(file_size).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.by_ref()
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| InputError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    let actual = bytes.len() as u64;
+    if actual > maximum {
+        Err(InputError::InputTooLarge { actual, maximum })
+    } else {
+        Ok(bytes)
+    }
+}
+
+/// Byte-counting `Read` wrapper that errors once the wrapped stream yields
+/// more than `maximum` bytes. Wrap decompressed archive streams so skipped
+/// entries (whose declared sizes tar-rs drains through the decompressor)
+/// count against the same budget as extracted ones.
+pub(crate) struct BoundedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> BoundedReader<R> {
+    pub(crate) fn new(inner: R, maximum: u64) -> Self {
+        Self {
+            inner,
+            remaining: maximum,
+        }
+    }
+}
+
+impl<R: Read> Read for BoundedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(io::Error::other(
+                "archive stream exceeded decompressed byte bound",
+            ));
+        }
+        let limit = (self.remaining.min(buf.len() as u64)) as usize;
+        let read = self.inner.read(&mut buf[..limit])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
 fn reject_symlink_ancestors(path: &Path) -> Result<(), InputError> {
     let canonical = fs::canonicalize(path).map_err(|source| InputError::Io {
         path: path.to_owned(),
@@ -866,6 +1048,81 @@ fn package_url(ecosystem: &str, name: &str, version: &str) -> String {
     }
 }
 
+/// Asset identity key: locator + claimed project name + the scanned file
+/// *paths* (never contents), so dependency updates keep the same asset id
+/// and baselines/history survive lockfile churn.
+fn stable_asset(
+    locator: &Path,
+    name: Option<&str>,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<AssetId, InputError> {
+    let mut hash = Sha256::new();
+    hash.update(locator.to_string_lossy().as_bytes());
+    if let Some(name) = name {
+        hash.update([0]);
+        hash.update(name.as_bytes());
+    }
+    for path in files.keys() {
+        hash.update(path.as_bytes());
+    }
+    AssetId::new(format!(
+        "asset:sha256:{}",
+        crate::util::hex_lower(&hash.finalize())
+    ))
+    .map_err(|_| InputError::InvalidIdentifier)
+}
+
+/// Parses a `package.json` manifest: claims the project name/version and
+/// registers declared dependencies as versionless constraint components,
+/// matching the `composer.json` standalone-manifest contract. A sibling
+/// npm-family lockfile supersedes these declarations.
+fn parse_package_json(
+    path: &str,
+    bytes: &[u8],
+    lock: Option<&Vec<u8>>,
+    out: &mut InventoryBuilder,
+) -> Result<(), InputError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|e| malformed(path, "package.json", e))?;
+    let root = value
+        .as_object()
+        .ok_or_else(|| malformed_msg(path, "package.json", "expected a JSON object"))?;
+    let name = root
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let version = root
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    out.claim_asset_identity(path, name, version);
+    if lock.is_some() {
+        return Ok(());
+    }
+    for (section, scope) in [
+        ("dependencies", Scope::Runtime),
+        ("devDependencies", Scope::Development),
+        ("optionalDependencies", Scope::Optional),
+    ] {
+        let Some(packages) = root.get(section).and_then(Value::as_object) else {
+            continue;
+        };
+        entry_bound(packages.len(), path, "package.json")?;
+        for (name, constraint) in packages {
+            let Some(constraint) = constraint.as_str() else {
+                continue;
+            };
+            if constraint.is_empty() {
+                continue;
+            }
+            out.add("npm", name, constraint, scope, path, BTreeSet::new())?;
+        }
+    }
+    Ok(())
+}
+
 /// Returns the concrete purl version for a specifier, stripping pnpm-style
 /// `1.2.3(integrity)` annotations, or `None` for empty values and range
 /// constraints (`^1.2`, `~1.2`, `>=1`, `1.*`, `a || b`, `git+https://…`).
@@ -883,20 +1140,6 @@ fn concrete_version_specifier(version: &str) -> Option<String> {
     Some(concrete.to_owned())
 }
 
-fn stable_asset(locator: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<AssetId, InputError> {
-    let mut hash = Sha256::new();
-    hash.update(locator.to_string_lossy().as_bytes());
-    for (path, bytes) in files {
-        hash.update(path.as_bytes());
-        hash.update((bytes.len() as u64).to_be_bytes());
-        hash.update(bytes);
-    }
-    AssetId::new(format!(
-        "asset:sha256:{}",
-        crate::util::hex_lower(&hash.finalize())
-    ))
-    .map_err(|_| InputError::InvalidIdentifier)
-}
 fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{}", crate::util::sha256_hex(bytes))
 }
