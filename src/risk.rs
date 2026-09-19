@@ -71,9 +71,12 @@ impl RiskScorer {
 }
 
 fn severity_points(severity: Severity) -> i32 {
+    // Unknown ranks between Low and Medium, matching the neutral-middle
+    // convention used by confidence, scope, and directness: an unscored
+    // finding must not sort below a confirmed-low one.
     match severity {
-        Severity::Unknown => 1_000,
         Severity::Low => 1_250,
+        Severity::Unknown => 1_750,
         Severity::Medium => 2_250,
         Severity::High => 3_250,
         Severity::Critical => 4_250,
@@ -443,6 +446,7 @@ mod tests {
         let mut previous = 0;
         for severity in [
             Severity::Low,
+            Severity::Unknown,
             Severity::Medium,
             Severity::High,
             Severity::Critical,
