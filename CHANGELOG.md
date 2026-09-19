@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.1 (2026-09-19)
+
+### Bug Fixes
+
+- **parsers:** resolve lockfile edge, scope, and abort defects from audit (985a893)
+
+### Other Changes
+
+- **ci:** align dependabot naming with hoolicy policy (#116) (de8f062)
+
 ## 0.8.0 (2026-09-18)
 
 ### Features
