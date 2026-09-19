@@ -114,6 +114,15 @@ impl Recording {
                 found: self.xray.case_id.clone(),
             });
         }
+        // The case id joins onto the corpus root during `check`; anything
+        // but a plain directory name could escape the corpus or collide
+        // with another case's key.
+        if !crate::parity::corpus::is_valid_case_id(&self.case_id) {
+            return Err(ParityError::InvalidInput(format!(
+                "invalid case_id {:?}: expected a plain directory name",
+                self.case_id
+            )));
+        }
         // Generator identity is part of the contract: a recording whose
         // sides name foreign tools (or swapped sides) must not pass as a
         // hooray-vs-xray comparison.
