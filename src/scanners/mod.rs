@@ -1423,6 +1423,7 @@ fn scan_terraform_json_value(
                     severity: Severity::High,
                     remediation: "Restrict ingress to the smallest required CIDR ranges and ports.",
                     cwe: "CWE-284",
+                    references: &["https://developer.hashicorp.com/terraform/language"],
                 },
             );
         }
@@ -1441,6 +1442,7 @@ fn scan_terraform_json_value(
                     severity: Severity::High,
                     remediation: "Enable provider-managed or customer-managed encryption for data at rest.",
                     cwe: "CWE-311",
+                    references: &["https://developer.hashicorp.com/terraform/language"],
                 },
             );
         }
@@ -1771,8 +1773,10 @@ struct DocumentLocation<'a> {
     line_starts: &'a [usize],
 }
 
-/// Scans one parsed YAML/JSON document for Kubernetes and CloudFormation
-/// findings.
+/// Scans one parsed YAML/JSON document for Kubernetes, CloudFormation,
+/// Docker Compose, and GitHub Actions findings. Each family gates on the
+/// document's shape, not the filename, so manifests under arbitrary names
+/// are still covered.
 fn scan_structured_document(
     document: &serde_json::Value,
     location: &DocumentLocation<'_>,
@@ -1783,6 +1787,16 @@ fn scan_structured_document(
     }
     if document.get("AWSTemplateFormatVersion").is_some() || document.get("Resources").is_some() {
         scan_cloudformation_value(document, "", location, builder);
+    }
+    if is_compose_document(document) {
+        scan_compose_value(document, location, builder);
+    }
+    // `on` is the workflow trigger key; `true` is accepted as well because
+    // YAML 1.1 tooling emits the unquoted `on` key as the boolean `true`.
+    if document.get("jobs").is_some()
+        && (document.get("on").is_some() || document.get("true").is_some())
+    {
+        scan_github_actions_value(document, location, builder);
     }
 }
 
@@ -1993,6 +2007,7 @@ struct StructuredIacRule<'a> {
     severity: Severity,
     remediation: &'a str,
     cwe: &'a str,
+    references: &'a [&'a str],
 }
 
 /// Boolean-field predicates supported by the table-driven Kubernetes checks.
@@ -2024,6 +2039,7 @@ const KUBERNETES_POD_SPEC_CHECKS: &[KubernetesIacCheck] = &[KubernetesIacCheck {
         severity: Severity::High,
         remediation: "Disable hostNetwork unless the workload has a documented, unavoidable requirement.",
         cwe: "CWE-250",
+        references: &["https://kubernetes.io/docs/concepts/security/"],
     },
 }];
 
@@ -2040,6 +2056,7 @@ const KUBERNETES_SECURITY_CONTEXT_CHECKS: &[KubernetesIacCheck] = &[
             severity: Severity::Critical,
             remediation: "Remove privileged mode and grant only narrowly required capabilities.",
             cwe: "CWE-250",
+            references: &["https://kubernetes.io/docs/concepts/security/"],
         },
     },
     KubernetesIacCheck {
@@ -2054,6 +2071,7 @@ const KUBERNETES_SECURITY_CONTEXT_CHECKS: &[KubernetesIacCheck] = &[
             severity: Severity::High,
             remediation: "Set securityContext.allowPrivilegeEscalation to false.",
             cwe: "CWE-269",
+            references: &["https://kubernetes.io/docs/concepts/security/"],
         },
     },
 ];
@@ -2143,6 +2161,7 @@ fn scan_kubernetes_value(
                                     severity: Severity::Medium,
                                     remediation: "Remove hostPort and expose the workload through a Service instead of the node interface.",
                                     cwe: "CWE-668",
+                                    references: &["https://kubernetes.io/docs/concepts/security/"],
                                 },
                             );
                         }
@@ -2251,6 +2270,9 @@ fn scan_cloudformation_value(
                         severity: Severity::High,
                         remediation: "Configure all four PublicAccessBlockConfiguration controls as true.",
                         cwe: "CWE-284",
+                        references: &[
+                            "https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/",
+                        ],
                     },
                 );
             }
@@ -2275,6 +2297,565 @@ fn scan_cloudformation_value(
                         severity: Severity::High,
                         remediation: "Set StorageEncrypted to true and select an approved KMS key where required.",
                         cwe: "CWE-311",
+                        references: &[
+                            "https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/",
+                        ],
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// A document is treated as a Compose file when `services` is a mapping and
+/// at least one service declares `image` or `build` — the fields every
+/// runnable Compose service needs. Compose-like service maps in other
+/// formats (e.g. Helm values) still describe container deployments, so the
+/// checks remain meaningful there.
+fn is_compose_document(document: &serde_json::Value) -> bool {
+    document
+        .get("services")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|services| {
+            services
+                .values()
+                .any(|service| service.get("image").is_some() || service.get("build").is_some())
+        })
+}
+
+/// Scalar-field predicates supported by the table-driven Compose checks.
+enum ComposeIacPredicate {
+    /// Fires only when the field is present and set to true.
+    IsTrue,
+    /// Fires when the field's string value equals one of the listed values.
+    EqualsAny(&'static [&'static str]),
+}
+
+/// One table row: the service field to inspect, when the check fires, and
+/// the finding to emit.
+struct ComposeIacCheck {
+    field: &'static str,
+    predicate: ComposeIacPredicate,
+    rule: StructuredIacRule<'static>,
+}
+
+const COMPOSE_SERVICE_CHECKS: &[ComposeIacCheck] = &[
+    ComposeIacCheck {
+        field: "privileged",
+        predicate: ComposeIacPredicate::IsTrue,
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "privileged",
+            rule: "iac.compose.privileged",
+            summary: "Compose service runs in privileged mode",
+            severity: Severity::Critical,
+            remediation: "Remove privileged mode and grant only narrowly required capabilities.",
+            cwe: "CWE-250",
+            references: &["https://docs.docker.com/reference/compose-file/services/#privileged"],
+        },
+    },
+    ComposeIacCheck {
+        field: "network_mode",
+        predicate: ComposeIacPredicate::EqualsAny(&["host"]),
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "network_mode",
+            rule: "iac.compose.host-network",
+            summary: "Compose service shares the host network namespace",
+            severity: Severity::High,
+            remediation: "Use a Compose network and publish only the required ports.",
+            cwe: "CWE-668",
+            references: &["https://docs.docker.com/reference/compose-file/services/#network_mode"],
+        },
+    },
+    ComposeIacCheck {
+        field: "pid",
+        predicate: ComposeIacPredicate::EqualsAny(&["host"]),
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "pid",
+            rule: "iac.compose.host-pid",
+            summary: "Compose service shares the host PID namespace",
+            severity: Severity::High,
+            remediation: "Remove pid: host; containers should not see or signal host processes.",
+            cwe: "CWE-668",
+            references: &["https://docs.docker.com/reference/compose-file/services/#pid"],
+        },
+    },
+    ComposeIacCheck {
+        field: "ipc",
+        predicate: ComposeIacPredicate::EqualsAny(&["host"]),
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "ipc",
+            rule: "iac.compose.host-ipc",
+            summary: "Compose service shares the host IPC namespace",
+            severity: Severity::Medium,
+            remediation: "Remove ipc: host; sharing host IPC exposes shared memory and semaphores.",
+            cwe: "CWE-668",
+            references: &["https://docs.docker.com/reference/compose-file/services/#ipc"],
+        },
+    },
+    ComposeIacCheck {
+        field: "cgroup",
+        predicate: ComposeIacPredicate::EqualsAny(&["host"]),
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "cgroup",
+            rule: "iac.compose.host-cgroup",
+            summary: "Compose service runs in the host cgroup namespace",
+            severity: Severity::Medium,
+            remediation: "Remove cgroup: host; the host cgroup namespace exposes resource controls.",
+            cwe: "CWE-668",
+            references: &["https://docs.docker.com/reference/compose-file/services/#cgroup"],
+        },
+    },
+];
+
+/// `cap_add` values that hand a container broad kernel authority (trivy
+/// flags the same set). `CAP_`-prefixed spellings are normalized before
+/// comparison.
+const COMPOSE_DANGEROUS_CAPABILITIES: &[&str] = &["ALL", "SYS_ADMIN", "SYS_MODULE"];
+
+/// Container runtime sockets: mounting one hands the service root-equivalent
+/// control of the host's container runtime.
+const COMPOSE_RUNTIME_SOCKETS: &[&str] = &[
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/podman/podman.sock",
+    "/var/run/podman/podman.sock",
+    "/run/containerd/containerd.sock",
+    "/var/run/crio/crio.sock",
+    "/run/crio/crio.sock",
+];
+
+/// Host path prefixes whose writable bind mount lets a container modify the
+/// host system or other tenants' data. `/` matches the filesystem root only.
+const COMPOSE_SENSITIVE_HOST_PATHS: &[&str] = &[
+    "/",
+    "/etc",
+    "/root",
+    "/home",
+    "/boot",
+    "/var/run",
+    "/var/lib/docker",
+    "/var/log",
+    "/proc",
+    "/sys",
+    "/dev",
+];
+
+fn scan_compose_value(
+    document: &serde_json::Value,
+    location: &DocumentLocation<'_>,
+    builder: &mut FindingBuilder<'_>,
+) {
+    let Some(services) = document
+        .get("services")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    for (service_name, service) in services {
+        let service_path = format!("/services/{}", pointer_escape(service_name));
+        for check in COMPOSE_SERVICE_CHECKS {
+            let observed = service.get(check.field);
+            let fires = match &check.predicate {
+                ComposeIacPredicate::IsTrue => {
+                    observed.and_then(serde_json::Value::as_bool) == Some(true)
+                }
+                ComposeIacPredicate::EqualsAny(values) => observed
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| values.contains(&value)),
+            };
+            if fires {
+                add_structured_iac(
+                    builder,
+                    location,
+                    StructuredIacRule {
+                        path: &format!("{service_path}/{}", check.field),
+                        anchor: service_name,
+                        ..check.rule
+                    },
+                );
+            }
+        }
+        if let Some(capabilities) = service.get("cap_add").and_then(serde_json::Value::as_array) {
+            for (index, capability) in capabilities.iter().enumerate() {
+                let normalized = capability
+                    .as_str()
+                    .unwrap_or("")
+                    .trim_start_matches("CAP_")
+                    .to_ascii_uppercase();
+                if COMPOSE_DANGEROUS_CAPABILITIES.contains(&normalized.as_str()) {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &format!("{service_path}/cap_add/{index}"),
+                            anchor: service_name,
+                            needle: capability.as_str().unwrap_or("cap_add"),
+                            rule: "iac.compose.dangerous-capability",
+                            summary: "Compose service adds a broad Linux capability",
+                            severity: Severity::High,
+                            remediation: "Drop cap_add entries such as ALL or SYS_ADMIN; grant only the specific capabilities the service needs.",
+                            cwe: "CWE-250",
+                            references: &[
+                                "https://docs.docker.com/reference/compose-file/services/#cap_add",
+                            ],
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(options) = service
+            .get("security_opt")
+            .and_then(serde_json::Value::as_array)
+        {
+            for (index, option) in options.iter().enumerate() {
+                if option
+                    .as_str()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("unconfined"))
+                {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &format!("{service_path}/security_opt/{index}"),
+                            anchor: service_name,
+                            needle: option.as_str().unwrap_or("security_opt"),
+                            rule: "iac.compose.unconfined-security",
+                            summary: "Compose service disables a security profile",
+                            severity: Severity::Medium,
+                            remediation: "Remove unconfined seccomp/AppArmor options so the default security profiles apply.",
+                            cwe: "CWE-693",
+                            references: &[
+                                "https://docs.docker.com/reference/compose-file/services/#security_opt",
+                            ],
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(volumes) = service.get("volumes").and_then(serde_json::Value::as_array) {
+            for (index, volume) in volumes.iter().enumerate() {
+                let Some((source, read_only)) = compose_volume_source(volume) else {
+                    continue;
+                };
+                let volume_path = format!("{service_path}/volumes/{index}");
+                if COMPOSE_RUNTIME_SOCKETS.contains(&source) {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &volume_path,
+                            anchor: service_name,
+                            needle: source,
+                            rule: "iac.compose.docker-socket",
+                            summary: "Compose service mounts a container runtime socket",
+                            severity: Severity::Critical,
+                            remediation: "Do not mount container runtime sockets; use a rootless or remote API with least privilege instead.",
+                            cwe: "CWE-668",
+                            references: &[
+                                "https://docs.docker.com/reference/compose-file/services/#volumes",
+                            ],
+                        },
+                    );
+                } else if !read_only && is_sensitive_host_path(source) {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &volume_path,
+                            anchor: service_name,
+                            needle: source,
+                            rule: "iac.compose.sensitive-host-mount",
+                            summary: "Compose service mounts a sensitive host path writable",
+                            severity: Severity::High,
+                            remediation: "Mount only the narrowest required host path, and mount it read-only.",
+                            cwe: "CWE-668",
+                            references: &[
+                                "https://docs.docker.com/reference/compose-file/services/#volumes",
+                            ],
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Extracts the host source path and read-only flag from a Compose volume
+/// entry, for both the short `source:target[:mode]` string form and the long
+/// object form. Returns `None` for named volumes, relative paths, container
+/// paths (single-segment entries), and non-bind mounts.
+fn compose_volume_source(volume: &serde_json::Value) -> Option<(&str, bool)> {
+    if let Some(entry) = volume.as_str() {
+        let mut parts = entry.split(':');
+        let source = parts.next()?;
+        // A single segment is a container path or anonymous volume, not a
+        // host bind mount.
+        parts.next()?;
+        let read_only = parts
+            .next()
+            .is_some_and(|mode| mode.split(',').any(|flag| flag == "ro"));
+        return source.starts_with('/').then_some((source, read_only));
+    }
+    let source = volume.get("source").and_then(serde_json::Value::as_str)?;
+    if !source.starts_with('/') {
+        return None;
+    }
+    let read_only = volume.get("read_only").and_then(serde_json::Value::as_bool) == Some(true);
+    Some((source, read_only))
+}
+
+/// Whether `path` is exactly a sensitive host path or sits beneath one.
+fn is_sensitive_host_path(path: &str) -> bool {
+    let normalized = path.trim_end_matches('/');
+    COMPOSE_SENSITIVE_HOST_PATHS.iter().any(|sensitive| {
+        if *sensitive == "/" {
+            normalized.is_empty()
+        } else {
+            normalized == *sensitive
+                || normalized
+                    .strip_prefix(*sensitive)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
+    })
+}
+
+/// Whether the workflow's `on`/`true` trigger value includes `event`, in
+/// scalar, sequence, or mapping form.
+fn workflow_triggers(on: Option<&serde_json::Value>, event: &str) -> bool {
+    match on {
+        Some(serde_json::Value::String(name)) => name == event,
+        Some(serde_json::Value::Array(events)) => {
+            events.iter().any(|entry| entry.as_str() == Some(event))
+        }
+        Some(serde_json::Value::Object(events)) => events.contains_key(event),
+        _ => false,
+    }
+}
+
+/// Whether a `uses` reference is pinned to an immutable revision: a full
+/// commit SHA for action and reusable-workflow refs, or a digest for
+/// `docker://` refs. Local `./` paths are always pinned by definition.
+fn gha_unpinned_uses(uses: &str) -> bool {
+    if uses.starts_with("./") {
+        return false;
+    }
+    if let Some(image) = uses.strip_prefix("docker://") {
+        return !image.contains("@sha256:");
+    }
+    match uses.rsplit_once('@') {
+        Some((_, reference)) => {
+            !(reference.len() == 40 && reference.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        }
+        None => true,
+    }
+}
+
+/// Whether a `run` body interpolates attacker-controlled contexts directly
+/// into shell code (zizmor's template-injection class): `github.event.*`
+/// payloads, `github.head_ref`, and workflow `inputs.*`.
+fn gha_untrusted_interpolation(run: &str) -> bool {
+    run.split("${{").skip(1).any(|expression| {
+        let expression = expression.split("}}").next().unwrap_or("");
+        expression.contains("github.event.")
+            || expression.contains("github.head_ref")
+            || expression.contains("inputs.")
+    })
+}
+
+/// Whether a `runs-on` value selects self-hosted runners, in scalar,
+/// sequence, or `{labels: [...]}` form.
+fn gha_self_hosted(runs_on: Option<&serde_json::Value>) -> bool {
+    match runs_on {
+        Some(serde_json::Value::String(label)) => label == "self-hosted",
+        Some(serde_json::Value::Array(labels)) => labels
+            .iter()
+            .any(|label| label.as_str() == Some("self-hosted")),
+        Some(serde_json::Value::Object(selector)) => selector
+            .get("labels")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|labels| {
+                labels
+                    .iter()
+                    .any(|label| label.as_str() == Some("self-hosted"))
+            }),
+        _ => false,
+    }
+}
+
+fn scan_github_actions_value(
+    document: &serde_json::Value,
+    location: &DocumentLocation<'_>,
+    builder: &mut FindingBuilder<'_>,
+) {
+    const GHA_REFERENCES: &[&str] = &[
+        "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions",
+    ];
+    let on = document.get("on").or_else(|| document.get("true"));
+    let on_key = if document.get("on").is_some() {
+        "on"
+    } else {
+        "true"
+    };
+    let pull_request_target = workflow_triggers(on, "pull_request_target");
+    if pull_request_target {
+        add_structured_iac(
+            builder,
+            location,
+            StructuredIacRule {
+                path: &format!("/{on_key}"),
+                anchor: "",
+                needle: "pull_request_target",
+                rule: "iac.github-actions.pull-request-target",
+                summary: "Workflow runs on pull_request_target with base-repo privileges",
+                severity: Severity::High,
+                remediation: "Prefer pull_request; if pull_request_target is required, never check out or run untrusted PR code under it.",
+                cwe: "CWE-250",
+                references: GHA_REFERENCES,
+            },
+        );
+    }
+    if document
+        .get("permissions")
+        .and_then(serde_json::Value::as_str)
+        == Some("write-all")
+    {
+        add_structured_iac(
+            builder,
+            location,
+            StructuredIacRule {
+                path: "/permissions",
+                anchor: "",
+                needle: "write-all",
+                rule: "iac.github-actions.broad-permissions",
+                summary: "Workflow grants write-all token permissions",
+                severity: Severity::Medium,
+                remediation: "Replace write-all with the minimal per-scope permissions the jobs need.",
+                cwe: "CWE-732",
+                references: GHA_REFERENCES,
+            },
+        );
+    }
+    let Some(jobs) = document.get("jobs").and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    for (job_name, job) in jobs {
+        let job_path = format!("/jobs/{}", pointer_escape(job_name));
+        if gha_self_hosted(job.get("runs-on")) {
+            add_structured_iac(
+                builder,
+                location,
+                StructuredIacRule {
+                    path: &format!("{job_path}/runs-on"),
+                    anchor: job_name,
+                    needle: "self-hosted",
+                    rule: "iac.github-actions.self-hosted",
+                    summary: "Job runs on a self-hosted runner",
+                    severity: Severity::Medium,
+                    remediation: "Confirm the runner is ephemeral and isolated; self-hosted runners persist secrets and build state across jobs.",
+                    cwe: "CWE-668",
+                    references: GHA_REFERENCES,
+                },
+            );
+        }
+        // Job-level `uses` is a reusable-workflow call; it carries no steps.
+        if let Some(uses) = job.get("uses").and_then(serde_json::Value::as_str) {
+            if gha_unpinned_uses(uses) {
+                add_structured_iac(
+                    builder,
+                    location,
+                    StructuredIacRule {
+                        path: &format!("{job_path}/uses"),
+                        anchor: job_name,
+                        needle: uses,
+                        rule: "iac.github-actions.unpinned-action",
+                        summary: "Reusable workflow is not pinned to a commit SHA",
+                        severity: Severity::Medium,
+                        remediation: "Pin reusable workflow refs to a full commit SHA.",
+                        cwe: "CWE-829",
+                        references: GHA_REFERENCES,
+                    },
+                );
+            }
+            continue;
+        }
+        let Some(steps) = job.get("steps").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for (index, step) in steps.iter().enumerate() {
+            let step_path = format!("{job_path}/steps/{index}");
+            if let Some(uses) = step.get("uses").and_then(serde_json::Value::as_str) {
+                if gha_unpinned_uses(uses) {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &format!("{step_path}/uses"),
+                            anchor: job_name,
+                            needle: uses,
+                            rule: "iac.github-actions.unpinned-action",
+                            summary: "Action is not pinned to a commit SHA",
+                            severity: Severity::Medium,
+                            remediation: "Pin action refs to a full commit SHA; tags and branches are mutable.",
+                            cwe: "CWE-829",
+                            references: GHA_REFERENCES,
+                        },
+                    );
+                }
+                // Checking out the PR head under pull_request_target runs
+                // attacker-controlled code with a privileged token.
+                if pull_request_target
+                    && uses.split('@').next() == Some("actions/checkout")
+                    && step
+                        .pointer("/with/ref")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|reference| {
+                            reference.contains("github.event.pull_request.head")
+                                || reference.contains("github.head_ref")
+                        })
+                {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &format!("{step_path}/with/ref"),
+                            anchor: job_name,
+                            needle: "pull_request.head",
+                            rule: "iac.github-actions.pull-request-target-checkout",
+                            summary: "pull_request_target job checks out untrusted PR code",
+                            severity: Severity::Critical,
+                            remediation: "Check out the base ref under pull_request_target, or switch the trigger to pull_request.",
+                            cwe: "CWE-250",
+                            references: GHA_REFERENCES,
+                        },
+                    );
+                }
+            }
+            if let Some(run) = step.get("run").and_then(serde_json::Value::as_str)
+                && gha_untrusted_interpolation(run)
+            {
+                add_structured_iac(
+                    builder,
+                    location,
+                    StructuredIacRule {
+                        path: &format!("{step_path}/run"),
+                        anchor: job_name,
+                        needle: "run",
+                        rule: "iac.github-actions.script-injection",
+                        summary: "run step interpolates untrusted context into shell code",
+                        severity: Severity::High,
+                        remediation: "Bind the value through an env: variable and quote it, instead of interpolating it into the script.",
+                        cwe: "CWE-94",
+                        references: GHA_REFERENCES,
                     },
                 );
             }
@@ -2307,7 +2888,7 @@ fn add_structured_iac(
     if !rule.anchor.is_empty() {
         properties.insert("object".to_owned(), rule.anchor.to_owned());
     }
-    builder.add(FindingSpec { kind: FindingKind::Iac, rule: rule.rule, line, column, summary: rule.summary, details: "A parsed IaC document contains the concrete insecure configuration described by this rule.", severity: rule.severity, confidence: Confidence::High, description: format!("Parsed configuration key: {}", rule.needle), references: &["https://kubernetes.io/docs/concepts/security/", "https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/"], properties, redacted: false, remediation: rule.remediation, cwe: Some(rule.cwe) });
+    builder.add(FindingSpec { kind: FindingKind::Iac, rule: rule.rule, line, column, summary: rule.summary, details: "A parsed IaC document contains the concrete insecure configuration described by this rule.", severity: rule.severity, confidence: Confidence::High, description: format!("Parsed configuration key: {}", rule.needle), references: rule.references, properties, redacted: false, remediation: rule.remediation, cwe: Some(rule.cwe) });
 }
 
 /// Fallback anchor search used only when no parse-time position index is
@@ -2963,6 +3544,82 @@ mod tests {
         let output = analyze("template.json", json);
         assert!(has(&output, "iac.cloudformation.rds-encryption"));
         assert!(has(&output, "iac.cloudformation.s3-public-access-block"));
+    }
+
+    #[test]
+    fn compose_rules_parse_service_fields() {
+        let yaml = "services:\n  web:\n    image: nginx\n    privileged: true\n    network_mode: host\n    pid: host\n    ipc: host\n    cap_add: [SYS_ADMIN]\n    security_opt: [seccomp:unconfined]\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n      - /etc:/host-etc\n      - type: bind\n        source: /var/lib/docker\n        target: /docker\n";
+        let output = analyze("docker-compose.yml", yaml);
+        assert!(has(&output, "iac.compose.privileged"));
+        assert!(has(&output, "iac.compose.host-network"));
+        assert!(has(&output, "iac.compose.host-pid"));
+        assert!(has(&output, "iac.compose.host-ipc"));
+        assert!(has(&output, "iac.compose.dangerous-capability"));
+        assert!(has(&output, "iac.compose.unconfined-security"));
+        assert!(has(&output, "iac.compose.docker-socket"));
+        assert!(has(&output, "iac.compose.sensitive-host-mount"));
+    }
+
+    #[test]
+    fn compose_rules_skip_safe_mounts_and_non_compose_documents() {
+        // Read-only sensitive mounts, named volumes, and container paths are
+        // not host writes.
+        let yaml = "services:\n  web:\n    image: nginx\n    volumes:\n      - /etc:/host-etc:ro\n      - data:/srv\n      - /container-only\nvolumes:\n  data:\n";
+        let output = analyze("compose.yaml", yaml);
+        assert!(!has(&output, "iac.compose.sensitive-host-mount"));
+        assert!(!has(&output, "iac.compose.docker-socket"));
+        // A `services` map without image/build is not a Compose document.
+        let other = "services:\n  web:\n    enabled: true\n    privileged: true\n";
+        assert!(!has(
+            &analyze("values.yaml", other),
+            "iac.compose.privileged"
+        ));
+    }
+
+    #[test]
+    fn compose_findings_anchor_per_service() {
+        let yaml = "services:\n  first:\n    image: a\n    privileged: true\n  second:\n    image: b\n    privileged: true\n";
+        let output = analyze("docker-compose.yml", yaml);
+        let findings = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "iac.compose.privileged")
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 2);
+        assert_ne!(findings[0].location_id, findings[1].location_id);
+    }
+
+    #[test]
+    fn github_actions_rules_parse_workflow() {
+        let yaml = "on: [pull_request_target]\npermissions: write-all\njobs:\n  build:\n    runs-on: [self-hosted, linux]\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f49056e30\n      - run: echo ${{ github.event.issue.title }}\n";
+        let output = analyze(".github/workflows/ci.yml", yaml);
+        assert!(has(&output, "iac.github-actions.pull-request-target"));
+        assert!(has(
+            &output,
+            "iac.github-actions.pull-request-target-checkout"
+        ));
+        assert!(has(&output, "iac.github-actions.broad-permissions"));
+        assert!(has(&output, "iac.github-actions.self-hosted"));
+        assert!(has(&output, "iac.github-actions.unpinned-action"));
+        assert!(has(&output, "iac.github-actions.script-injection"));
+        // The SHA-pinned setup-node step must not be flagged.
+        let unpinned = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "iac.github-actions.unpinned-action")
+            .count();
+        assert_eq!(unpinned, 1);
+    }
+
+    #[test]
+    fn github_actions_rules_skip_pinned_and_safe_workflows() {
+        let yaml = "on: push\npermissions: read-all\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955\n      - uses: docker://alpine@sha256:abc\n      - uses: ./local/action\n      - run: echo ${{ github.sha }}\n";
+        let output = analyze(".github/workflows/ci.yml", yaml);
+        assert!(!has(&output, "iac.github-actions.unpinned-action"));
+        assert!(!has(&output, "iac.github-actions.pull-request-target"));
+        assert!(!has(&output, "iac.github-actions.broad-permissions"));
+        assert!(!has(&output, "iac.github-actions.self-hosted"));
+        assert!(!has(&output, "iac.github-actions.script-injection"));
     }
 
     #[test]
