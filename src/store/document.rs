@@ -19,17 +19,22 @@ enum DocumentKind {
 }
 
 impl DocumentKind {
-    fn table(self) -> &'static str {
+    /// Static per-kind SELECT so no SQL is ever assembled at runtime.
+    fn select_sql(self) -> &'static str {
         match self {
-            Self::Policy => "policy_documents",
-            Self::Exception => "policy_exceptions",
+            Self::Policy => {
+                "SELECT version,document_json,updated_at,updated_by FROM policy_documents WHERE document_id=?1"
+            }
+            Self::Exception => {
+                "SELECT version,document_json,updated_at,updated_by FROM policy_exceptions WHERE exception_id=?1"
+            }
         }
     }
 
-    fn id_column(self) -> &'static str {
+    fn version_sql(self) -> &'static str {
         match self {
-            Self::Policy => "document_id",
-            Self::Exception => "exception_id",
+            Self::Policy => "SELECT version FROM policy_documents WHERE document_id=?1",
+            Self::Exception => "SELECT version FROM policy_exceptions WHERE exception_id=?1",
         }
     }
 
@@ -97,14 +102,9 @@ impl Store {
         kind: DocumentKind,
         id: &str,
     ) -> Result<Option<VersionedDocument>, StoreError> {
-        let sql = format!(
-            "SELECT version,document_json,updated_at,updated_by FROM {} WHERE {}=?1",
-            kind.table(),
-            kind.id_column()
-        );
         let row = self
             .connection
-            .query_row(&sql, [id], |row| {
+            .query_row(kind.select_sql(), [id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -144,15 +144,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current: Option<i64> = transaction
-            .query_row(
-                &format!(
-                    "SELECT version FROM {} WHERE {}=?1",
-                    kind.table(),
-                    kind.id_column()
-                ),
-                [id],
-                |row| row.get(0),
-            )
+            .query_row(kind.version_sql(), [id], |row| row.get(0))
             .optional()?;
         let actual = current
             .map(|v| u64::try_from(v).map_err(|_| StoreError::VersionOverflow))

@@ -125,31 +125,3 @@ exceptions:
     selectors:
       rule_id: secret.high-entropy-assignment
       fingerprint: "ff238f0a7d1eb249f705f0c0ba772abf6ae4251d2e6705b7f6c9735e90e44b83"
-  - id: dogfood-sast-internal-sql
-    owner: hooray-maintainers
-    reason: format! interpolates only DocumentKind::table()/id_column() enum constants, never user input
-    ticket: audit-2026-09
-    expires_at: "2027-03-19T00:00:00Z"
-    compensating_controls:
-      - Table/column names are compile-time enum constants; values use bound parameters
-    selectors:
-      rule_id: sast.rust.sql-format
-      finding_id: "finding:a7257588054f1421"
-  - id: dogfood-sast-internal-sql-2
-    owner: hooray-maintainers
-    reason: format! interpolates only DocumentKind::table()/id_column() enum constants, never user input
-    ticket: audit-2026-09
-    expires_at: "2027-03-19T00:00:00Z"
-    compensating_controls:
-      - Table/column names are compile-time enum constants; values use bound parameters
-    selectors:
-      rule_id: sast.rust.sql-format
-      finding_id: "finding:aa40c54f09bac364"
-  - id: dogfood-sast-test-shell
-    owner: hooray-maintainers
-    reason: Test invokes bash on a fixed fixture script it writes itself; no dynamic command
-    ticket: audit-2026-09
-    expires_at: "2027-03-19T00:00:00Z"
-    selectors:
-      rule_id: sast.rust.command-shell
-      finding_id: "finding:6b88ee9d30555f64"
