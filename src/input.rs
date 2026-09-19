@@ -36,7 +36,7 @@ use self::parsers::{
     gradle_catalog::parse_gradle_catalog,
     haskell::{parse_cabal, parse_cabal_freeze},
     helm::{parse_chart_lock, parse_chart_yaml},
-    image::{scan_oci_layout, scan_oci_tar},
+    image::{oci_layout_filesystem, oci_tar_filesystem, scan_oci_layout, scan_oci_tar},
     maven::parse_pom_xml,
     npm::parse_package_lock,
     nuget::{
@@ -242,11 +242,10 @@ impl ScanInput {
         }
     }
 
-    /// Extracted member contents for archive inputs, so filesystem scanners
-    /// and license detection can evaluate what `scan_virtual_files` saw
-    /// beyond lockfiles. `None` for real-directory and SBOM inputs (scanners
-    /// walk those paths directly) and for OCI images, whose layer extraction
-    /// lives in `parsers::image` and is not yet exposed here.
+    /// Extracted member contents for archive and image inputs, so filesystem
+    /// scanners and license detection can evaluate what `scan_virtual_files`
+    /// saw beyond lockfiles. `None` for real-directory and SBOM inputs
+    /// (scanners walk those paths directly).
     pub fn virtual_files(
         &self,
         config: &Config,
@@ -260,6 +259,8 @@ impl ScanInput {
                 path,
                 format: ArchiveFormat::Tar,
             } => Ok(Some(read_tar_file(path, config)?)),
+            Self::OciImageLayout(root) => Ok(Some(oci_layout_filesystem(root, config)?)),
+            Self::OciImageTar(path) => Ok(Some(oci_tar_filesystem(path, config)?)),
             _ => Ok(None),
         }
     }
