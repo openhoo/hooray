@@ -43,26 +43,46 @@ fn add_service_finding(
 
 pub(super) fn scan_service_config(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-    let nginx_conf =
-        name == "nginx.conf" || (name.starts_with("nginx.") && name.ends_with(".conf"));
+    let directory = path.rsplit('/').nth(1).unwrap_or("").to_ascii_lowercase();
+    // Routing is name- and directory-aware: suffixed names (`my-nginx.conf`,
+    // `postgresql.auto.conf`), drop-in directories (`sshd_config.d/`,
+    // `conf.d/` under nginx), and service-named directories all select the
+    // matching check table; the generic `.conf` fallback stays Apache.
+    let nginx_conf = (name.contains("nginx") && name.ends_with(".conf"))
+        || directory.contains("nginx")
+        || (name.ends_with(".conf") && directory == "conf.d" && path.contains("nginx"));
     if nginx_conf {
         scan_directive_config(text, builder, NGINX_CHECKS);
+        return;
     }
-    if name.ends_with(".conf")
-        && !nginx_conf
-        && !matches!(
-            name.as_str(),
-            "pg_hba.conf" | "postgresql.conf" | "redis.conf"
-        )
+    let sshd_conf = name == "sshd_config"
+        || (name.ends_with(".conf") && directory == "sshd_config.d")
+        || (name.ends_with(".conf") && directory == "sshd");
+    if sshd_conf {
+        scan_directive_config(text, builder, SSHD_CHECKS);
+        return;
+    }
+    if name == "pg_hba.conf" || (name.ends_with(".conf") && directory == "pg_hba.d") {
+        scan_directive_config(text, builder, PG_HBA_CHECKS);
+        return;
+    }
+    if name == "postgresql.conf"
+        || name == "postgresql.auto.conf"
+        || (name.ends_with(".conf") && directory == "postgresql.d")
+        || (name.ends_with(".conf") && directory == "conf.d" && path.contains("postgres"))
     {
-        scan_directive_config(text, builder, APACHE_CHECKS);
+        scan_key_value_config(text, builder, POSTGRESQL_CHECKS);
+        return;
     }
-    match name.as_str() {
-        "pg_hba.conf" => scan_directive_config(text, builder, PG_HBA_CHECKS),
-        "postgresql.conf" => scan_key_value_config(text, builder, POSTGRESQL_CHECKS),
-        "redis.conf" => scan_key_value_config(text, builder, REDIS_CHECKS),
-        "sshd_config" => scan_directive_config(text, builder, SSHD_CHECKS),
-        _ => {}
+    if name == "redis.conf"
+        || (name.ends_with(".conf") && directory == "redis.d")
+        || (name.ends_with(".conf") && directory.contains("redis"))
+    {
+        scan_key_value_config(text, builder, REDIS_CHECKS);
+        return;
+    }
+    if name.ends_with(".conf") {
+        scan_directive_config(text, builder, APACHE_CHECKS);
     }
 }
 
@@ -75,8 +95,30 @@ fn config_lines(text: &str) -> impl Iterator<Item = (u32, usize, &str)> {
     })
 }
 
+/// Strips a trailing `#` comment, but only when the `#` sits outside single
+/// or double quotes — `requirepass "a#b"` keeps its full value.
 fn effective_config_line(line: &str) -> &str {
-    line.split_once('#').map_or(line, |(code, _)| code).trim()
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for (index, byte) in line.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if quote.is_some() => escaped = true,
+            b'"' | b'\'' => {
+                if quote == Some(byte) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(byte);
+                }
+            }
+            b'#' if quote.is_none() => return line[..index].trim(),
+            _ => {}
+        }
+    }
+    line.trim()
 }
 
 fn split_config_directive(line: &str) -> Option<(&str, &str)> {
@@ -184,6 +226,15 @@ const PG_HBA_TRUST_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
     cwe: "CWE-306",
     references: &["https://www.postgresql.org/docs/current/auth-pg-hba-conf.html"],
 };
+const PG_HBA_IDENT_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
+    rule: "iac.pg-hba.ident-authentication",
+    summary: "pg_hba remote record trusts ident/peer authentication",
+    details: "A non-local pg_hba record uses ident or peer, which trusts the remote host's account claims and is effectively trust-equivalent over the network.",
+    remediation: "Use scram-sha-256 or another credential-based method for remote records; restrict ident/peer to local records.",
+    severity: Severity::High,
+    cwe: "CWE-306",
+    references: &["https://www.postgresql.org/docs/current/auth-pg-hba-conf.html"],
+};
 
 const POSTGRES_SSL_OFF_RULE: ServiceConfigRule<'static> = ServiceConfigRule {
     rule: "iac.postgres.ssl-disabled",
@@ -269,24 +320,27 @@ const SSHD_EMPTY_PASSWORDS_RULE: ServiceConfigRule<'static> = ServiceConfigRule 
 
 /// One service-config check: the directive keyword (compared
 /// case-insensitively; empty matches any line, used by record-style formats
-/// like pg_hba.conf), a predicate over the directive value, and the finding
-/// metadata to emit when both match. Table order is significant: the first
-/// matching check wins, mirroring the previous per-format if/else chains.
+/// One service-config check: the directive keyword (compared
+/// case-insensitively; empty matches any line, used by record-style formats
+/// like pg_hba.conf), a predicate over the directive keyword and its value,
+/// and the finding metadata to emit when both match. Table order is
+/// significant: the first matching check wins, mirroring the previous
+/// per-format if/else chains.
 struct ServiceConfigCheck {
     directive: &'static str,
-    matches_value: fn(&str) -> bool,
+    matches_value: fn(&str, &str) -> bool,
     rule: &'static ServiceConfigRule<'static>,
 }
 
 static NGINX_CHECKS: &[ServiceConfigCheck] = &[
     ServiceConfigCheck {
         directive: "ssl_protocols",
-        matches_value: arguments_contain_weak_protocol,
+        matches_value: |_, arguments| arguments_contain_weak_protocol(arguments),
         rule: &NGINX_WEAK_TLS_RULE,
     },
     ServiceConfigCheck {
         directive: "server_tokens",
-        matches_value: first_argument_is_on,
+        matches_value: |_, arguments| first_argument_is_on(arguments),
         rule: &NGINX_SERVER_TOKENS_RULE,
     },
 ];
@@ -294,31 +348,38 @@ static NGINX_CHECKS: &[ServiceConfigCheck] = &[
 static APACHE_CHECKS: &[ServiceConfigCheck] = &[
     ServiceConfigCheck {
         directive: "SSLProtocol",
-        matches_value: arguments_enable_weak_protocol,
+        matches_value: |_, arguments| arguments_enable_weak_protocol(arguments),
         rule: &APACHE_WEAK_TLS_RULE,
     },
     ServiceConfigCheck {
         directive: "ServerTokens",
-        matches_value: first_argument_is_full_or_os,
+        matches_value: |_, arguments| first_argument_is_full_or_os(arguments),
         rule: &APACHE_SERVER_TOKENS_RULE,
     },
 ];
 
-static PG_HBA_CHECKS: &[ServiceConfigCheck] = &[ServiceConfigCheck {
-    directive: "",
-    matches_value: hba_tail_is_trust,
-    rule: &PG_HBA_TRUST_RULE,
-}];
+static PG_HBA_CHECKS: &[ServiceConfigCheck] = &[
+    ServiceConfigCheck {
+        directive: "",
+        matches_value: |_, arguments| hba_tail_is_trust(arguments),
+        rule: &PG_HBA_TRUST_RULE,
+    },
+    ServiceConfigCheck {
+        directive: "",
+        matches_value: hba_record_is_remote_ident,
+        rule: &PG_HBA_IDENT_RULE,
+    },
+];
 
 static POSTGRESQL_CHECKS: &[ServiceConfigCheck] = &[
     ServiceConfigCheck {
         directive: "ssl",
-        matches_value: value_is_off,
+        matches_value: |_, value| value_is_off(value),
         rule: &POSTGRES_SSL_OFF_RULE,
     },
     ServiceConfigCheck {
         directive: "password_encryption",
-        matches_value: value_is_md5_or_plain,
+        matches_value: |_, value| value_is_md5_or_plain(value),
         rule: &POSTGRES_WEAK_PASSWORD_RULE,
     },
 ];
@@ -326,12 +387,12 @@ static POSTGRESQL_CHECKS: &[ServiceConfigCheck] = &[
 static REDIS_CHECKS: &[ServiceConfigCheck] = &[
     ServiceConfigCheck {
         directive: "protected-mode",
-        matches_value: value_is_no,
+        matches_value: |_, value| value_is_no(value),
         rule: &REDIS_PROTECTED_MODE_RULE,
     },
     ServiceConfigCheck {
         directive: "requirepass",
-        matches_value: str::is_empty,
+        matches_value: |_, value| str::is_empty(value),
         rule: &REDIS_EMPTY_PASSWORD_RULE,
     },
 ];
@@ -339,22 +400,22 @@ static REDIS_CHECKS: &[ServiceConfigCheck] = &[
 static SSHD_CHECKS: &[ServiceConfigCheck] = &[
     ServiceConfigCheck {
         directive: "PermitRootLogin",
-        matches_value: first_argument_is_yes,
+        matches_value: |_, arguments| first_argument_is_yes(arguments),
         rule: &SSHD_ROOT_LOGIN_RULE,
     },
     ServiceConfigCheck {
         directive: "PasswordAuthentication",
-        matches_value: first_argument_is_yes,
+        matches_value: |_, arguments| first_argument_is_yes(arguments),
         rule: &SSHD_PASSWORD_AUTH_RULE,
     },
     ServiceConfigCheck {
         directive: "Protocol",
-        matches_value: first_argument_is_protocol_one,
+        matches_value: |_, arguments| arguments_contain_protocol_one(arguments),
         rule: &SSHD_PROTOCOL_ONE_RULE,
     },
     ServiceConfigCheck {
         directive: "PermitEmptyPasswords",
-        matches_value: first_argument_is_yes,
+        matches_value: |_, arguments| first_argument_is_yes(arguments),
         rule: &SSHD_EMPTY_PASSWORDS_RULE,
     },
 ];
@@ -377,20 +438,28 @@ fn first_argument_is_yes(arguments: &str) -> bool {
     first_argument_is(arguments, "yes")
 }
 
-fn first_argument_is_protocol_one(arguments: &str) -> bool {
-    first_argument_is(arguments, "1")
+/// `Protocol 2,1` still enables SSHv1, so any token equal to `1` flags.
+fn arguments_contain_protocol_one(arguments: &str) -> bool {
+    argument_tokens(arguments).any(|token| token == "1")
 }
 
 fn arguments_contain_weak_protocol(arguments: &str) -> bool {
     argument_tokens(arguments).any(is_weak_protocol_token)
 }
 
+/// `SSLProtocol all` enables every protocol including SSLv3 and TLSv1, so a
+/// bare `all` token counts as enabling weak protocols alongside explicit
+/// weak tokens that are not negated with `-`.
 fn arguments_enable_weak_protocol(arguments: &str) -> bool {
-    argument_tokens(arguments).any(enables_weak_protocol)
+    argument_tokens(arguments)
+        .any(|token| enables_weak_protocol(token) || token.eq_ignore_ascii_case("all"))
 }
 
+/// PostgreSQL accepts `off`, `false`, `0`, and `no` as boolean false.
 fn value_is_off(value: &str) -> bool {
-    value.eq_ignore_ascii_case("off")
+    ["off", "false", "0", "no"]
+        .iter()
+        .any(|off| value.eq_ignore_ascii_case(off))
 }
 
 fn value_is_md5_or_plain(value: &str) -> bool {
@@ -413,6 +482,21 @@ fn hba_tail_is_trust(arguments: &str) -> bool {
             .is_some_and(|method| method.eq_ignore_ascii_case("trust"))
 }
 
+/// Remote (`host`/`hostssl`/`hostnossl`/`hostgssenc`/`hostnogssenc`)
+/// pg_hba records whose auth method is `ident` or `peer` trust the remote
+/// host's account claims — effectively trust-equivalent over the network.
+/// `local` records legitimately use peer auth and are not flagged.
+fn hba_record_is_remote_ident(directive: &str, arguments: &str) -> bool {
+    directive.starts_with("host")
+        && arguments.split_whitespace().count() >= 3
+        && arguments
+            .split_whitespace()
+            .next_back()
+            .is_some_and(|method| {
+                method.eq_ignore_ascii_case("ident") || method.eq_ignore_ascii_case("peer")
+            })
+}
+
 /// Shared directive-style driver (nginx, Apache, sshd, pg_hba): at most one
 /// finding per line, first matching table entry wins.
 fn scan_directive_config(
@@ -427,7 +511,7 @@ fn scan_directive_config(
         };
         let Some(check) = checks.iter().find(|check| {
             (check.directive.is_empty() || directive.eq_ignore_ascii_case(check.directive))
-                && (check.matches_value)(arguments)
+                && (check.matches_value)(directive, arguments)
         }) else {
             continue;
         };
@@ -452,7 +536,7 @@ fn scan_key_value_config(
             continue;
         };
         let Some(check) = checks.iter().find(|check| {
-            key.eq_ignore_ascii_case(check.directive) && (check.matches_value)(value)
+            key.eq_ignore_ascii_case(check.directive) && (check.matches_value)(key, value)
         }) else {
             continue;
         };
