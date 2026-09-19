@@ -443,3 +443,102 @@ test('ignores copied markers from unrelated bots and ambiguous notice identity',
   );
   assert.equal(ambiguousUser.state.comments[0].body.includes(NEEDS_INFO_MARKER), true);
 });
+
+test('verifyNeedsInfoOwnership tiebreaks same-timestamp events by id and rejects ambiguous ordering', async () => {
+  // Two needs-info events at the same instant: the higher id wins, so a
+  // later maintainer re-add at the same second is honored.
+  const sameInstant = createGithubModel({
+    body: bodyFrom(),
+    labels: ['needs-info'],
+    comments: [comment(81, `${NEEDS_INFO_MARKER}\nNotice.`)],
+    events: [
+      timelineEvent(801, 1, 'labeled', 'needs-info', BOT),
+      timelineEvent(802, 1, 'unlabeled', 'needs-info', MAINTAINER),
+      timelineEvent(803, 1, 'labeled', 'needs-info', MAINTAINER),
+    ],
+  });
+  await runModel(sameInstant);
+  // Latest event is the maintainer's re-add (highest id) → not bot-owned →
+  // the label is retained.
+  assert.equal(sameInstant.labels().includes('needs-info'), true);
+  assert.equal(
+    sameInstant.mutations.some(
+      (mutation) => mutation.operation === 'removeLabel' && mutation.label === 'needs-info',
+    ),
+    false,
+  );
+
+  // An event with an unparseable timestamp makes ordering ambiguous: the
+  // run must fail rather than guess ownership.
+  const ambiguous = createGithubModel({
+    body: bodyFrom(),
+    labels: ['needs-info'],
+    comments: [comment(82, `${NEEDS_INFO_MARKER}\nNotice.`)],
+    events: [
+      {
+        id: 804,
+        event: 'labeled',
+        label: { name: 'needs-info' },
+        actor: { ...BOT },
+        created_at: 'not-a-date',
+      },
+    ],
+  });
+  const outcome = await runMayFail(ambiguous);
+  assert.equal(Boolean(outcome && outcome.error), true);
+  assert.deepEqual(ambiguous.mutations, []);
+  assert.deepEqual(ambiguous.labels(), ['needs-info']);
+});
+
+test('retains unowned needs-info on a valid body and resolves the notice', async () => {
+  // needs-info present but the notice marker says the bot does not own it
+  // (needs-info-owned=false): the label stays and the notice resolves.
+  const retained = createGithubModel({
+    body: bodyFrom(),
+    labels: ['needs-info'],
+    comments: [comment(91, `${RESOLVED_MARKER}\nOlder resolved notice.`)],
+    events: [timelineEvent(901, 1, 'labeled', 'needs-info', MAINTAINER)],
+  });
+  await runModel(retained);
+  assert.equal(retained.labels().includes('needs-info'), true);
+  assert.equal(
+    retained.mutations.some(
+      (mutation) => mutation.operation === 'removeLabel' && mutation.label === 'needs-info',
+    ),
+    false,
+  );
+  // needs-triage is not added while a manual needs-info is retained.
+  assert.equal(retained.labels().includes('needs-triage'), false);
+});
+
+test('protected states block both needs-info and needs-triage transitions', async () => {
+  // Invalid body + wontfix: needs-info must not be added over a protected
+  // maintainer state.
+  const wontfix = createGithubModel({
+    body: incompleteBody(),
+    labels: ['wontfix'],
+  });
+  await runModel(wontfix);
+  assert.deepEqual(wontfix.labels(), ['wontfix']);
+
+  // Valid body + wontfix: needs-triage must not be added either.
+  const validWontfix = createGithubModel({
+    body: bodyFrom(),
+    labels: ['wontfix'],
+  });
+  await runModel(validWontfix);
+  assert.deepEqual(validWontfix.labels(), ['wontfix', 'bug']);
+});
+
+test('bot-owned needs-info displaces needs-triage on an invalid body', async () => {
+  // Invalid body with needs-info already present and bot-owned: the stale
+  // needs-triage is removed while needs-info is kept.
+  const model = createGithubModel({
+    body: incompleteBody(),
+    labels: ['needs-info', 'needs-triage'],
+    comments: [comment(95, `${NEEDS_INFO_MARKER}\nNotice.`)],
+    events: [timelineEvent(951, 1, 'labeled', 'needs-info', BOT)],
+  });
+  await runModel(model);
+  assert.deepEqual(model.labels(), ['needs-info']);
+});

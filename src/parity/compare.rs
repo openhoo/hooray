@@ -13,6 +13,9 @@ use crate::parity::model::{CanonicalComponent, CanonicalReport};
 /// Returns the canonical comparison form of a package URL.
 ///
 /// * splits `pkg:<type>/rest`, lowercasing the type,
+/// * percent-decodes the namespace/name path so `pkg:npm/%40org/x` and
+///   `pkg:npm/@org/x` — equivalent encodings per the purl spec — produce
+///   the same key (malformed escapes are kept verbatim),
 /// * lowercases namespace+name except for the `golang` type, whose module
 ///   paths are case-sensitive per the Go specification,
 /// * strips all qualifiers (`?…`) and fragments (`#…`),
@@ -29,10 +32,11 @@ pub fn purl_match_key(purl: &str) -> String {
         Some((path, version)) => (path, Some(version)),
         None => (rest, None),
     };
+    let decoded = crate::util::percent_decode_strict(path).unwrap_or_else(|| path.to_owned());
     let path = if type_lower == "golang" {
-        path.to_owned()
+        decoded
     } else {
-        path.to_ascii_lowercase()
+        decoded.to_ascii_lowercase()
     };
     match version {
         Some(version) => format!("pkg:{type_lower}/{path}@{version}"),
@@ -61,12 +65,31 @@ fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
     intersection as f64 / union as f64
 }
 
-fn component_key_map(report: &CanonicalReport) -> BTreeMap<String, &CanonicalComponent> {
-    report
-        .components
-        .iter()
-        .map(|component| (purl_match_key(&component.purl), component))
-        .collect()
+/// Groups a report's components by purl match key. Several components can
+/// legitimately share one key (qualifier-only or encoding differences), so
+/// every representative is kept: dropping duplicates would hide divergent
+/// versions or licenses from the comparison.
+fn component_key_map(report: &CanonicalReport) -> BTreeMap<String, Vec<&CanonicalComponent>> {
+    let mut map: BTreeMap<String, Vec<&CanonicalComponent>> = BTreeMap::new();
+    for component in &report.components {
+        map.entry(purl_match_key(&component.purl))
+            .or_default()
+            .push(component);
+    }
+    map
+}
+
+/// Canonicalizes a license string for comparison: whitespace is collapsed,
+/// case is normalized, and `OR`/`AND` operand order is sorted so
+/// `MIT OR Apache-2.0` and `Apache-2.0 OR MIT` — the same grant spelled
+/// differently — compare equal.
+fn license_match_key(license: &str) -> String {
+    let mut tokens: Vec<String> = license
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    tokens.sort();
+    tokens.join(" ")
 }
 
 /// CVE id to severity label mapping; first occurrence wins because canonical
@@ -136,6 +159,10 @@ pub struct Scorecard {
     pub cves_extra_in_hooray: Vec<String>,
     /// Severity disagreements over CVEs matched on both sides, sorted by CVE.
     pub severity_mismatches: Vec<SeverityMismatch>,
+    /// Match keys shared by more than one component on a side
+    /// (`side:key xN`), sorted. Collisions are reported instead of silently
+    /// dropping the duplicate representatives.
+    pub key_collisions: Vec<String>,
 }
 
 /// Computes the full scorecard comparing `hooray` against `xray`.
@@ -146,18 +173,26 @@ pub fn scorecard(hooray: &CanonicalReport, xray: &CanonicalReport) -> Scorecard 
     let mut shared_keys = Vec::new();
     let mut missing_purls = Vec::new();
     let mut extra_purls = Vec::new();
-    for (key, component) in &xray_keys {
+    let mut key_collisions = Vec::new();
+    for (key, components) in &xray_keys {
+        if components.len() > 1 {
+            key_collisions.push(format!("xray:{key} x{}", components.len()));
+        }
         if hooray_keys.contains_key(key) {
             shared_keys.push(key.clone());
         } else {
-            missing_purls.push(component.purl.clone());
+            missing_purls.extend(components.iter().map(|component| component.purl.clone()));
         }
     }
-    for (key, component) in &hooray_keys {
+    for (key, components) in &hooray_keys {
+        if components.len() > 1 {
+            key_collisions.push(format!("hooray:{key} x{}", components.len()));
+        }
         if !xray_keys.contains_key(key) {
-            extra_purls.push(component.purl.clone());
+            extra_purls.extend(components.iter().map(|component| component.purl.clone()));
         }
     }
+    key_collisions.sort();
 
     let hooray_cves = cve_set(hooray);
     let xray_cves = cve_set(xray);
@@ -185,18 +220,23 @@ pub fn scorecard(hooray: &CanonicalReport, xray: &CanonicalReport) -> Scorecard 
     }
 
     let shared: BTreeSet<&String> = shared_keys.iter().collect();
-    let license_pairs = |report_keys: &BTreeMap<String, &CanonicalComponent>| -> BTreeSet<String> {
-        report_keys
-            .iter()
-            .filter(|(key, _)| shared.contains(key))
-            .flat_map(|(key, component)| {
-                component
-                    .licenses
-                    .iter()
-                    .map(move |license| format!("{key}|{license}"))
-            })
-            .collect()
-    };
+    // `\u{1f}` (unit separator) cannot appear in a purl match key or a
+    // normalized license token, so joined pairs can never collide the way
+    // a printable separator could.
+    let license_pairs =
+        |report_keys: &BTreeMap<String, Vec<&CanonicalComponent>>| -> BTreeSet<String> {
+            report_keys
+                .iter()
+                .filter(|(key, _)| shared.contains(key))
+                .flat_map(|(key, components)| {
+                    components.iter().flat_map(move |component| {
+                        component.licenses.iter().map(move |license| {
+                            format!("{key}\u{1f}{}", license_match_key(license))
+                        })
+                    })
+                })
+                .collect()
+        };
     let license_agreement = jaccard(&license_pairs(&hooray_keys), &license_pairs(&xray_keys));
 
     Scorecard {
@@ -216,6 +256,7 @@ pub fn scorecard(hooray: &CanonicalReport, xray: &CanonicalReport) -> Scorecard 
         cves_missing_in_hooray: xray_cves.difference(&hooray_cves).cloned().collect(),
         cves_extra_in_hooray: hooray_cves.difference(&xray_cves).cloned().collect(),
         severity_mismatches,
+        key_collisions,
     }
 }
 
@@ -286,9 +327,11 @@ pub fn apply_recording_check(
 ) {
     let mut notes = drift_notes;
     notes.extend(threshold_notes);
-    let has_tier1_violation = results
-        .iter()
-        .any(|r| r.case_id == recording_case_id && r.status == "violation");
+    // Only tier-1 rows (scorecard-less) count as inherited violations; a
+    // duplicate recording must not inherit a prior recording's outcome.
+    let has_tier1_violation = results.iter().any(|r| {
+        r.case_id == recording_case_id && r.scorecard.is_none() && r.status == "violation"
+    });
     let violating = !notes.is_empty() || has_tier1_violation;
     match results
         .iter_mut()
@@ -354,7 +397,7 @@ mod tests {
     fn match_key_strips_qualifiers_fragments_and_keeps_version() {
         assert_eq!(
             purl_match_key("pkg:npm/%40org/name@1.2.3?vulnerabilities=1#sub/path"),
-            "pkg:npm/%40org/name@1.2.3"
+            "pkg:npm/@org/name@1.2.3"
         );
         // Version itself stays verbatim, including unusual casing/characters.
         assert_eq!(
@@ -683,5 +726,75 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!((results[0].scorecard.as_ref().unwrap().purl_recall - 1.0).abs() < 1e-9);
         assert!((results[1].scorecard.as_ref().unwrap().purl_recall - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn match_key_percent_decodes_namespace() {
+        assert_eq!(
+            purl_match_key("pkg:npm/%40org/widget@2.0.0"),
+            purl_match_key("pkg:npm/@org/widget@2.0.0")
+        );
+        // Malformed escapes stay verbatim rather than panicking.
+        assert_eq!(purl_match_key("pkg:npm/%zz/name@1"), "pkg:npm/%zz/name@1");
+    }
+
+    #[test]
+    fn license_expressions_compare_canonically() {
+        assert_eq!(
+            license_match_key("MIT OR Apache-2.0"),
+            license_match_key("Apache-2.0 OR MIT")
+        );
+        assert_eq!(
+            license_match_key("MIT  OR   Apache-2.0"),
+            license_match_key("mit or apache-2.0")
+        );
+    }
+
+    #[test]
+    fn key_collisions_are_reported_not_hidden() {
+        let mut hooray = CanonicalReport::new(
+            "case",
+            Generator {
+                name: "h".into(),
+                version: "1".into(),
+            },
+            "offline",
+        );
+        // Two components sharing one match key (qualifier-only difference).
+        hooray
+            .components
+            .push(component("pkg:npm/a@1?arch=x86", &["MIT"]));
+        hooray
+            .components
+            .push(component("pkg:npm/a@1?arch=arm", &["Apache-2.0"]));
+        let xray = hooray.clone();
+        let card = scorecard(&hooray, &xray);
+        assert_eq!(card.key_collisions.len(), 2);
+        assert!(card.key_collisions.iter().all(|c| c.contains("x2")));
+    }
+
+    #[test]
+    fn duplicate_recording_does_not_inherit_prior_violation() {
+        let mut results: Vec<CaseCheck> = Vec::new();
+        apply_recording_check(
+            &mut results,
+            "case-a",
+            vec!["components differ from recording".to_owned()],
+            Vec::new(),
+            Scorecard::default(),
+        );
+        assert_eq!(results[0].status, "violation");
+        // A clean second recording for the same case must not inherit the
+        // first recording's violation.
+        apply_recording_check(
+            &mut results,
+            "case-a",
+            Vec::new(),
+            Vec::new(),
+            Scorecard::default(),
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].status, "ok");
+        assert!(results[1].notes.is_empty());
     }
 }
