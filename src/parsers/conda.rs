@@ -2,16 +2,19 @@ use std::collections::BTreeSet;
 
 use serde_yaml::Value as Yaml;
 
-use super::python::parse_requirements;
-use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
+use super::{python::parse_requirements, yaml_doc};
+use crate::input::{InputError, InventoryBuilder, entry_bound, malformed_msg, utf8};
 use crate::model::Scope;
 pub(crate) fn parse_conda_environment(
     path: &str,
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "environment.yml")?)
-        .map_err(|e| malformed(path, "environment.yml", e))?;
+    let doc: Yaml = yaml_doc(
+        utf8(bytes, path, "environment.yml")?,
+        path,
+        "environment.yml",
+    )?;
     let Some(dependencies) = doc.get("dependencies").and_then(Yaml::as_sequence) else {
         return Err(malformed_msg(
             path,

@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::CStr,
     fs::{self, File, OpenOptions},
     io::{self, Read},
+    mem::MaybeUninit,
     path::{Component as PathComponent, Path, PathBuf},
 };
 
@@ -1170,6 +1172,155 @@ fn malformed_msg(path: impl ToString, format: &'static str, message: impl ToStri
     }
 }
 
+/// serde_yaml materializes every alias as a deep copy of its anchored
+/// subtree, so a hostile document amplifies roughly quadratically: `n`
+/// aliases replaying an `n`-node anchor produce `n²` nodes while serde_yaml's
+/// own jump limit (100 jumps per event) never binds. The byte input cap
+/// therefore does not bound the parsed `Value` — a ~100 KiB document can
+/// already expand past a gigabyte of nodes. `yaml_expansion_within_budget`
+/// walks the libyaml event stream (the same parser serde_yaml drives) and
+/// computes exactly what `serde_yaml::from_str::<Value>` would materialize,
+/// so callers can reject over-budget documents before that memory is
+/// allocated.
+///
+/// The budget is `clamp(input_bytes × YAML_MATERIALIZED_RATIO,
+/// MIN_YAML_MATERIALIZED, MAX_YAML_MATERIALIZED)` measured in materialized
+/// units — one per `Value` node plus one per scalar byte: alias-free YAML
+/// needs at least one input byte per node, so the ratio only binds on
+/// alias amplification; the floor keeps small documents' legitimate anchor
+/// reuse working, and the absolute cap bounds memory on large inputs.
+const YAML_MATERIALIZED_RATIO: u64 = 8;
+const MIN_YAML_MATERIALIZED: u64 = 256 * 1024;
+const MAX_YAML_MATERIALIZED: u64 = 4 * 1024 * 1024;
+
+/// Reports whether `text` parses as a YAML stream whose per-document
+/// materialized `serde_yaml::Value` size stays within the alias-expansion
+/// budget. Unparseable input reports `true`: the subsequent serde_yaml parse
+/// surfaces the real syntax error, and nothing is materialized either way.
+pub(crate) fn yaml_expansion_within_budget(text: &str) -> bool {
+    let budget = (text.len() as u64)
+        .saturating_mul(YAML_MATERIALIZED_RATIO)
+        .clamp(MIN_YAML_MATERIALIZED, MAX_YAML_MATERIALIZED);
+    /// One open collection: its anchor name (when declared) and the
+    /// materialized size accumulated so far — the collection node itself
+    /// plus every completed child.
+    struct Frame {
+        anchor: Option<Vec<u8>>,
+        size: u64,
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    // Anchor name → materialized size of the anchored node, per document
+    // (anchors cannot be referenced across document boundaries).
+    let mut anchors: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    // Materialized size of the current document so far.
+    let mut total = 0_u64;
+    /// Accounts one completed node of `cost` units: into the enclosing
+    /// collection's size and the document total, which is checked against
+    /// the budget. Returns false once the document is over budget.
+    fn account(stack: &mut [Frame], total: &mut u64, cost: u64, budget: u64) -> bool {
+        if let Some(frame) = stack.last_mut() {
+            frame.size += cost;
+        }
+        *total += cost;
+        *total <= budget
+    }
+    // Copies a NUL-terminated libyaml anchor name.
+    unsafe fn anchor_name(anchor: *const u8) -> Vec<u8> {
+        // SAFETY: libyaml anchor fields are NUL-terminated strings owned by
+        // the event, which outlives this copy.
+        unsafe { CStr::from_ptr(anchor.cast()) }.to_bytes().to_vec()
+    }
+    // SAFETY: `parser` is initialized before use, `text` outlives the parser
+    // (libyaml reads the input in place), each event is deleted after its
+    // data is copied out, and the parser is deleted on every exit path.
+    unsafe {
+        let mut parser = MaybeUninit::<unsafe_libyaml::yaml_parser_t>::uninit();
+        if unsafe_libyaml::yaml_parser_initialize(parser.as_mut_ptr()).fail {
+            return true;
+        }
+        let parser = parser.as_mut_ptr();
+        unsafe_libyaml::yaml_parser_set_encoding(parser, unsafe_libyaml::YAML_UTF8_ENCODING);
+        unsafe_libyaml::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
+        let mut event = MaybeUninit::<unsafe_libyaml::yaml_event_t>::uninit();
+        let mut within_budget = true;
+        loop {
+            if unsafe_libyaml::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
+                break;
+            }
+            let mut parsed_event = event.assume_init();
+            match parsed_event.type_ {
+                unsafe_libyaml::YAML_STREAM_END_EVENT => {
+                    unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                    break;
+                }
+                unsafe_libyaml::YAML_DOCUMENT_START_EVENT => {
+                    stack.clear();
+                    anchors.clear();
+                    total = 0;
+                }
+                unsafe_libyaml::YAML_MAPPING_START_EVENT
+                | unsafe_libyaml::YAML_SEQUENCE_START_EVENT => {
+                    let anchor = if parsed_event.type_ == unsafe_libyaml::YAML_MAPPING_START_EVENT {
+                        parsed_event.data.mapping_start.anchor
+                    } else {
+                        parsed_event.data.sequence_start.anchor
+                    };
+                    if !account(&mut stack, &mut total, 1, budget) {
+                        within_budget = false;
+                        unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                        break;
+                    }
+                    stack.push(Frame {
+                        anchor: (!anchor.is_null()).then(|| anchor_name(anchor)),
+                        size: 1,
+                    });
+                }
+                unsafe_libyaml::YAML_MAPPING_END_EVENT
+                | unsafe_libyaml::YAML_SEQUENCE_END_EVENT => {
+                    if let Some(frame) = stack.pop()
+                        && let Some(anchor) = frame.anchor
+                    {
+                        anchors.insert(anchor, frame.size);
+                    }
+                }
+                unsafe_libyaml::YAML_SCALAR_EVENT => {
+                    let scalar = parsed_event.data.scalar;
+                    if !scalar.anchor.is_null() {
+                        // The anchored scalar's materialized size is one
+                        // node plus its bytes.
+                        anchors.insert(anchor_name(scalar.anchor), 1 + scalar.length);
+                    }
+                    if !account(&mut stack, &mut total, 1 + scalar.length, budget) {
+                        within_budget = false;
+                        unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                        break;
+                    }
+                }
+                unsafe_libyaml::YAML_ALIAS_EVENT => {
+                    let alias = parsed_event.data.alias;
+                    // serde_yaml resolves aliases against the anchors seen so
+                    // far and errors on unknown ones; an unresolved alias
+                    // here means the document is rejected downstream without
+                    // materializing anything further, so accounting stops.
+                    let Some(size) = anchors.get(anchor_name(alias.anchor).as_slice()) else {
+                        unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                        break;
+                    };
+                    if !account(&mut stack, &mut total, *size, budget) {
+                        within_budget = false;
+                        unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+        }
+        unsafe_libyaml::yaml_parser_delete(parser);
+        within_budget
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1410,6 +1561,76 @@ mod tests {
                 Err(InputError::Malformed { .. })
             ));
         }
+    }
+
+    #[test]
+    fn yaml_alias_expansion_budget_accepts_legitimate_anchor_reuse() {
+        // Helm/Kubernetes-style defaults merging: a small anchored mapping
+        // replayed across entries stays far under the floor budget.
+        let mut doc = String::from("defaults: &defaults\n  retries: 3\n  tls: true\n");
+        for index in 0..50 {
+            doc.push_str(&format!(
+                "service{index}:\n  <<: *defaults\n  port: {index}\n"
+            ));
+        }
+        assert!(yaml_expansion_within_budget(&doc));
+    }
+
+    #[test]
+    fn yaml_alias_expansion_budget_rejects_nested_alias_amplification() {
+        // Each level replays the previous anchored subtree nine times, so
+        // serde_yaml would materialize ~9^level nodes — quadratic-or-worse
+        // amplification the byte cap cannot see — while the input stays
+        // under a kilobyte.
+        let mut doc = String::from("a: &a1 [x]\n");
+        for level in 2..=10 {
+            let refs = vec![format!("*a{}", level - 1); 9].join(", ");
+            doc.push_str(&format!("b{level}: &a{level} [{refs}]\n"));
+        }
+        assert!(!yaml_expansion_within_budget(&doc));
+    }
+
+    #[test]
+    fn yaml_alias_expansion_budget_rejects_replayed_large_subtrees() {
+        // One moderately-sized anchored sequence replayed thousands of
+        // times: each alias is a single jump (serde_yaml's 100× jump limit
+        // never binds) yet materializes the whole subtree again.
+        let mut doc = String::from("base: &base\n");
+        for index in 0..200 {
+            doc.push_str(&format!("  - key{index}: value{index}\n"));
+        }
+        for index in 0..20_000 {
+            doc.push_str(&format!("ref{index}: *base\n"));
+        }
+        assert!(!yaml_expansion_within_budget(&doc));
+    }
+
+    #[test]
+    fn yaml_alias_expansion_budget_defers_unparseable_documents() {
+        // Syntax errors are serde_yaml's to report; the budget check only
+        // bounds what a successful parse would materialize.
+        assert!(yaml_expansion_within_budget("a: [unclosed\n"));
+        assert!(yaml_expansion_within_budget("plain scalar"));
+    }
+
+    #[test]
+    fn yaml_lockfiles_reject_alias_expansion_beyond_budget() {
+        let mut lock = String::from(
+            "lockfileVersion: '9.0'\n\npackages:\n  base: &a1 {resolution: {integrity: x}}\n",
+        );
+        for level in 2..=10 {
+            let refs = vec![format!("*a{}", level - 1); 9].join(", ");
+            lock.push_str(&format!("  k{level}: &a{level} [{refs}]\n"));
+        }
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("pnpm-lock.yaml"), lock).unwrap();
+        assert!(matches!(
+            scan_path(dir.path(), &config()),
+            Err(InputError::Malformed {
+                format: "pnpm-lock.yaml",
+                ..
+            })
+        ));
     }
 
     #[test]

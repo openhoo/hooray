@@ -346,6 +346,26 @@ pub(crate) fn xml_doc<'a>(
     roxmltree::Document::parse(text).map_err(|e| crate::input::malformed(path, format, e))
 }
 
+/// Parses a YAML lockfile document, failing closed on malformed YAML and on
+/// documents whose alias expansion would materialize more `serde_yaml::Value`
+/// nodes than the input-size-derived budget allows (serde_yaml deep-copies
+/// anchored subtrees per alias, so expansion is quadratic in input size and
+/// the byte cap alone does not bound it).
+pub(crate) fn yaml_doc(
+    text: &str,
+    path: &str,
+    format: &'static str,
+) -> Result<serde_yaml::Value, crate::input::InputError> {
+    if !crate::input::yaml_expansion_within_budget(text) {
+        return Err(crate::input::malformed_msg(
+            path,
+            format,
+            "YAML alias expansion exceeds the materialized-size budget",
+        ));
+    }
+    serde_yaml::from_str(text).map_err(|e| crate::input::malformed(path, format, e))
+}
+
 /// Text of the first direct child element named `name`, trimmed; `None`
 /// when absent, empty, or mixed-content.
 pub(crate) fn child_text<'a>(node: &roxmltree::Node<'a, 'a>, name: &str) -> Option<&'a str> {

@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde_yaml::Value as Yaml;
 
 use super::npm::npm_scope;
-use super::{LockComponents, resolve_lock_component, split_descriptor};
-use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
+use super::{LockComponents, resolve_lock_component, split_descriptor, yaml_doc};
+use crate::input::{InputError, InventoryBuilder, entry_bound, malformed_msg, utf8};
 use crate::model::Scope;
 
 /// A resolved package identity: `(name, version)` with pnpm peer suffixes and
@@ -19,8 +19,7 @@ pub(crate) fn parse_pnpm_lock(
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "pnpm-lock.yaml")?)
-        .map_err(|e| malformed(path, "pnpm-lock.yaml", e))?;
+    let doc: Yaml = yaml_doc(utf8(bytes, path, "pnpm-lock.yaml")?, path, "pnpm-lock.yaml")?;
     let packages = doc.get("packages").and_then(Yaml::as_mapping);
     let snapshots = doc.get("snapshots").and_then(Yaml::as_mapping);
     let importers = doc.get("importers").and_then(Yaml::as_mapping);
