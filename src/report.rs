@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::model::{
-    ApplicabilityStatus, AssetKind, Component, ComponentId, Finding, FindingId, FindingStatus,
-    Location, LocationId, PolicyDecision, PolicyOutcome, ScanReport, Scope, Severity, SourceKind,
+    ApplicabilityStatus, AssetKind, Component, ComponentId, Finding, FindingId, FindingKind,
+    FindingStatus, Location, LocationId, PolicyDecision, PolicyOutcome, ScanReport, Scope,
+    Severity, SourceKind,
 };
 use crate::util::{is_path_uri_byte, percent_encode, sanitize_cell_text, sha256_hex};
 
@@ -625,7 +626,13 @@ fn render_table(
         let paths = index.paths(finding);
         for path in paths {
             output.push_str("          path: ");
-            output.push_str(&path.join(" -> "));
+            output.push_str(&clean_cell(
+                &path
+                    .iter()
+                    .map(|component| clean_cell(component))
+                    .collect::<Vec<_>>()
+                    .join(" -> "),
+            ));
             output.push('\n');
         }
         if let Some(remediation) = &finding.remediation {
@@ -633,14 +640,14 @@ fn render_table(
             output.push_str(&clean_cell(&remediation.description));
             if !remediation.fixed_versions.is_empty() {
                 output.push_str(" [fixed: ");
-                output.push_str(
+                output.push_str(&clean_cell(
                     &remediation
                         .fixed_versions
                         .iter()
                         .map(String::as_str)
                         .collect::<Vec<_>>()
                         .join(", "),
-                );
+                ));
                 output.push(']');
             }
             output.push('\n');
@@ -650,13 +657,17 @@ fn render_table(
             output.push_str(&clean_cell(&evidence.description));
             output.push('\n');
             for (key, value) in &evidence.properties {
-                output.push_str(&format!("            {key}: {}\n", clean_cell(value)));
+                output.push_str(&format!(
+                    "            {}: {}\n",
+                    clean_cell(key),
+                    clean_cell(value)
+                ));
             }
         }
         for decision in index.policies(&finding.id) {
             output.push_str(&format!(
                 "          policy: {}={} ({})\n",
-                decision.policy_id,
+                clean_cell(decision.policy_id.as_str()),
                 policy_outcome(decision.outcome),
                 clean_cell(&decision.reason)
             ));
@@ -715,19 +726,34 @@ impl<'a> ReportIndex<'a> {
         }
     }
 
+    /// Enumerates simple root-to-target paths for display. Enumeration is
+    /// work-bounded: a global expansion budget caps total DFS steps across
+    /// all roots and a depth cap bounds per-path memory, so a dense graph
+    /// (worst-case exponential simple-path count) cannot hang rendering.
+    /// The 100-path cap bounds only what is collected, not what is explored.
     fn paths(&self, finding: &'a Finding) -> Vec<Vec<&'a str>> {
+        const MAX_PATH_STEPS: usize = 100_000;
+        const MAX_PATH_DEPTH: usize = 128;
         let Some(target) = finding.component_id.as_ref() else {
             return Vec::new();
         };
         let mut paths = Vec::new();
-        for root in &self.roots {
+        let mut steps = 0_usize;
+        'roots: for root in &self.roots {
             let mut stack = vec![(*root, vec![*root], BTreeSet::from([*root]))];
             while let Some((node, path, visited)) = stack.pop() {
+                steps += 1;
+                if steps > MAX_PATH_STEPS {
+                    break 'roots;
+                }
                 if node == target {
                     paths.push(path.into_iter().map(ComponentId::as_str).collect());
                     if paths.len() >= 100 {
                         return paths;
                     }
+                    continue;
+                }
+                if path.len() >= MAX_PATH_DEPTH {
                     continue;
                 }
                 if let Some(children) = self.adjacency.get(node) {
@@ -857,7 +883,15 @@ pub(crate) fn gitlab_code_quality_entry(
         "fingerprint": finding.id.as_str(),
         "severity": gitlab_severity(finding.severity),
         "location": {"path": location.path, "lines": {"begin": location.line}},
-        "categories": [finding.kind.as_str()],
+        // GitLab Code Quality only documents a fixed category enum
+        // (Bug/Security/Performance/Style/Compatibility/Complexity/
+        // Duplication/Clarity/Maintainability/Readability); finding kinds
+        // like `vulnerability` or `sast` are ignored there, so security
+        // findings map to "Security" and everything else to "Bug".
+        "categories": [match finding.kind {
+            FindingKind::Vulnerability | FindingKind::Sast | FindingKind::Secret | FindingKind::Malware | FindingKind::Iac => "Security",
+            _ => "Bug",
+        }],
         "hooray": {
             "format_version": CANONICAL_REPORT_VERSION,
             "finding_id": finding.id.as_str(),
@@ -934,7 +968,7 @@ fn render_sarif(
             "version": "2.1.0",
             "runs": [{
                 "tool": {"driver": {
-                    "name": "hooray", "semanticVersion": report.run.scanner_version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")),
+                    "name": "hooray", "version": report.run.scanner_version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")),
                     "informationUri": "https://github.com/openhoo/hooray", "rules": rules
                 }},
                 "automationDetails": {"id": report.run.id.as_str()},
@@ -1064,10 +1098,18 @@ fn gitlab_sarif_document(
         .scanner_version
         .as_deref()
         .unwrap_or(env!("CARGO_PKG_VERSION"));
+    // `semanticVersion` is schema-constrained to semver; a free-form
+    // scanner_version (e.g. "1.2.3-dirty") would produce invalid SARIF, so
+    // it is emitted only when the value parses as semver. `version` is
+    // unconstrained and always present.
+    let mut driver = json!({"name": "Hooray", "organization": "OpenHoo", "informationUri": "https://github.com/openhoo/hooray", "version": version, "rules": rules});
+    if is_semver(version) {
+        driver["semanticVersion"] = json!(version);
+    }
     json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
         "runs": [{
-            "tool": {"driver": {"name": "Hooray", "organization": "OpenHoo", "informationUri": "https://github.com/openhoo/hooray", "version": version, "semanticVersion": version, "rules": rules}},
+            "tool": {"driver": driver},
             "automationDetails": {"id": report.run.id.as_str()}, "results": results,
             "properties": {"totalFindings": report.findings.len(), "includedFindings": candidates.len(), "omittedResolved": omitted_resolved, "omittedWithoutLocation": omitted_without_location, "omittedByLimit": omitted_by_limit}
         }]
@@ -1300,6 +1342,17 @@ fn cyclonedx_license_objects(
     let mut rendered = BTreeSet::new();
     for (expression, name, url) in records {
         let single_id = expression.and_then(single_spdx_id);
+        // Expression-only records (e.g. "MIT OR Apache-2.0" with no name)
+        // are valid CycloneDX license choices and must not be dropped.
+        if single_id.is_none() && name.is_none() {
+            if let Some(expression) = expression {
+                rendered.insert(
+                    serde_json::to_string(&json!({"expression": expression}))
+                        .expect("license JSON is serializable"),
+                );
+            }
+            continue;
+        }
         let mut license = serde_json::Map::new();
         if let Some(id) = single_id {
             license.insert("id".into(), json!(id));
@@ -1329,6 +1382,16 @@ fn cyclonedx_license_objects(
 fn single_spdx_id(expression: &str) -> Option<&str> {
     let trimmed = expression.trim();
     spdx::license_id(trimmed).map(|_| trimmed)
+}
+
+/// Minimal semver check for SARIF `semanticVersion`: MAJOR.MINOR.PATCH with
+/// optional -prerelease / +build suffixes, numeric core segments.
+fn is_semver(version: &str) -> bool {
+    let core = version.split(['-', '+']).next().unwrap_or_default();
+    let mut segments = core.split('.');
+    matches!(segments.clone().count(), 3)
+        && segments
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn render_junit(
@@ -1371,12 +1434,17 @@ fn render_junit(
                 xml_text(&body)
             ));
         }
-        output.push_str(&format!(
-            "      <system-out>{}</system-out>\n",
-            xml_text(&body)
-        ));
         output.push_str("    </testcase>\n");
     }
+    // The JUnit XSD places system-out under <testsuite>, not <testcase>;
+    // strict parsers reject testcase-level placement, so the per-finding
+    // detail text is emitted once as suite-level output.
+    output.push_str("    <system-out>");
+    for finding in report.findings.values() {
+        output.push_str(&xml_text(&finding_detail_text(index, finding)));
+        output.push_str("\n");
+    }
+    output.push_str("</system-out>\n");
     output.push_str("  </testsuite>\n</testsuites>\n");
     output.finish()
 }
@@ -1432,10 +1500,17 @@ fn render_cyclonedx_vex(
             "properties": [{"name": "hooray:scope", "value": format!("{:?}", component.scope).to_ascii_lowercase()}]
         })
     }).collect();
-    let vulnerabilities: Vec<Value> = report.findings.values().map(|finding| {
+    // CycloneDX `vulnerabilities[]` is consumed as vulnerability records by
+    // VEX tooling (Dependency-Track etc.), so only vulnerability findings
+    // belong there; license/secret/iac/sast/malware/risk findings would be
+    // ingested as bogus CVE-style entries.
+    let vulnerabilities: Vec<Value> = report.findings.values().filter(|finding| finding.kind == FindingKind::Vulnerability).map(|finding| {
         let affects: Vec<Value> = finding.component_id.as_ref().map(|id| vec![json!({"ref": id.as_str()})]).unwrap_or_default();
         let analysis = cdx_analysis(finding);
-        let advisories: Vec<Value> = finding.evidence.iter().flat_map(|evidence| evidence.references.iter()).map(|url| json!({"url": url})).collect();
+        // CycloneDX `advisories[].url` expects a URL/iri-reference; evidence
+        // references are arbitrary strings (advisory ids, free text), so
+        // only values that parse as URLs are emitted.
+        let advisories: Vec<Value> = finding.evidence.iter().flat_map(|evidence| evidence.references.iter()).filter(|url| reqwest::Url::parse(url).is_ok()).map(|url| json!({"url": url})).collect();
         let ratings = vec![json!({"severity": cdx_severity(finding.severity), "method": "other"})];
         let properties = common_properties(index, finding);
         json!({
@@ -1468,7 +1543,10 @@ fn render_spdx(
         .map(|id| (id.clone(), spdx_id(id.as_str())))
         .collect();
     let packages: Vec<Value> = report.inventory.components.values().map(|component| {
-        let licenses = component.licenses.iter().filter_map(|license| license.expression.as_deref()).collect::<Vec<_>>();
+        // Each declared expression is parenthesized before the AND join:
+        // `MIT OR Apache-2.0 AND ISC` parses as `MIT OR (Apache-2.0 AND ISC)`
+        // - a different grant than `(MIT OR Apache-2.0) AND (ISC)`.
+        let licenses = component.licenses.iter().filter_map(|license| license.expression.as_deref()).map(|expression| format!("({expression})")).collect::<Vec<_>>();
         json!({
             "SPDXID": ids.get(&component.identity).expect("all component IDs are mapped"), "name": component.name, "versionInfo": component.version,
             "downloadLocation": "NOASSERTION", "filesAnalyzed": false,
@@ -1523,6 +1601,20 @@ fn render_gitlab(
             Some(gitlab_code_quality_entry(index, finding, &location))
         })
         .collect();
+    // GitLab Code Quality is a bare array with no properties channel, so
+    // findings without a repository-relative location cannot be counted in
+    // the document; they are still accounted for in the render log.
+    let omitted = report
+        .findings
+        .values()
+        .filter(|finding| finding.status != FindingStatus::Resolved)
+        .count()
+        .saturating_sub(findings.len());
+    if omitted > 0 {
+        eprintln!(
+            "gitlab-code-quality: omitted {omitted} findings without a repository-relative location"
+        );
+    }
     pretty_json(&findings, limit)
 }
 
@@ -1712,8 +1804,14 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-fn enum_label(value: impl fmt::Debug) -> String {
-    format!("{value:?}").to_ascii_lowercase()
+/// Renders an enum as its canonical serde wire spelling (kebab-case), not
+/// the Debug name lowercased: `NotAffected` must emit `not-affected`, not
+/// `notaffected`.
+fn enum_label(value: impl Serialize) -> String {
+    serde_json::to_value(&value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 fn pretty_json(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, ReportError> {
@@ -1852,7 +1950,16 @@ fn value_contains_sensitive_key(value: &Value) -> bool {
 
 fn redact_sensitive_values(value: &mut Value, key: Option<&str>) {
     if key.is_some_and(is_sensitive_key) {
-        *value = Value::String(REDACTED.to_owned());
+        // Redaction must preserve the JSON type: `Risk.factors` values are
+        // i32, and replacing one with a string makes the whole report fail
+        // deserialization after the JSON roundtrip.
+        *value = match value {
+            Value::Number(_) => Value::from(0),
+            Value::Bool(_) => Value::Bool(false),
+            Value::Array(_) => Value::Array(Vec::new()),
+            Value::Object(_) => Value::Object(serde_json::Map::new()),
+            _ => Value::String(REDACTED.to_owned()),
+        };
         return;
     }
     match value {
@@ -3059,10 +3166,8 @@ mod tests {
             .unwrap();
         assert_eq!(redacted.properties.get("password").unwrap(), REDACTED);
 
-        // Carrier: Risk.factors key. The prescan routes this
-        // to the slow path, where the `[REDACTED]` sentinel cannot
-        // deserialize into i32 - the same terminal state the pre-fast-path
-        // implementation reached, so the contract is the error itself.
+        // Carrier: Risk.factors key. Redaction preserves the i32 type so
+        // the report still deserializes after the JSON roundtrip.
         let mut report = isolated();
         report
             .findings
@@ -3075,7 +3180,20 @@ mod tests {
             .factors
             .insert("access_token".into(), 1);
         assert!(contains_sensitive_key(&report));
-        assert!(sanitize_report(&report).is_err());
+        let sanitized = sanitize_report(&report).unwrap();
+        assert_eq!(
+            sanitized
+                .findings
+                .values()
+                .next()
+                .unwrap()
+                .risk
+                .as_ref()
+                .unwrap()
+                .factors
+                .get("access_token"),
+            Some(&0)
+        );
     }
 
     /// Pins the zero-allocation scanner against the retired collect-based

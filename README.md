@@ -437,11 +437,11 @@ hooray [--config FILE] <COMMAND>
 Commands and subcommands:
 
 ```text
-hooray scan project INPUT [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--format FORMAT] [--output FILE]
-hooray scan sbom INPUT    [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--format FORMAT] [--output FILE]
-hooray scan artifact INPUT [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--format FORMAT] [--output FILE]
-hooray scan container INPUT [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--format FORMAT] [--output FILE]
-hooray scan auto INPUT    [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--format FORMAT] [--output FILE]
+hooray scan project INPUT [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--offline] [--format FORMAT] [--output FILE]
+hooray scan sbom INPUT    [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--offline] [--format FORMAT] [--output FILE]
+hooray scan artifact INPUT [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--offline] [--format FORMAT] [--output FILE]
+hooray scan container INPUT [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--offline] [--format FORMAT] [--output FILE]
+hooray scan auto INPUT    [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--offline] [--format FORMAT] [--output FILE]
 hooray policy validate FILE
 hooray policy evaluate FILE --run-id RUN_ID [--format json|yaml] [--output FILE]
 hooray inventory [--run-id RUN_ID] [--format json|yaml] [--output FILE]
@@ -467,6 +467,7 @@ Examples:
 
 ```bash
 hooray scan project . --policy hooray-policy.yaml --format table
+hooray scan project . --offline --format table
 hooray scan sbom bom.cdx.json --format cyclonedx-vex --output result.cdx.json
 cat bom.cdx.json | hooray scan sbom - --format json-lines
 hooray scan artifact release.zip --format sarif --output hooray.sarif
@@ -497,7 +498,7 @@ history, and standalone policy-evaluation commands support JSON and YAML only.
 | `gitlab-code-quality` | GitLab Code Quality JSON |
 | `json-lines` | NDJSON envelopes for run, component, finding, policy, and summary records |
 | `csv` | RFC 4180 flat finding rows with fixed columns from `stable_finding_id` through `first_location_path` |
-| `gitlab-artifacts` | Atomic directory bundle containing all five GitLab artifacts |
+| `gitlab-artifacts` | Atomic directory bundle containing all five GitLab artifacts (Linux/Android only; other platforms return `UnsupportedAtomicPublication`) |
 
 The `gitlab-artifacts` directory contains exactly
 `gl-code-quality-report.json`, `gl-sarif-report.sarif`,
