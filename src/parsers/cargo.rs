@@ -17,14 +17,28 @@ pub(crate) fn parse_cargo_lock(
         .and_then(toml::Value::as_array)
         .ok_or_else(|| malformed_msg(path, "Cargo.lock", "missing package array"))?;
     entry_bound(packages.len(), path, "Cargo.lock")?;
-    let declared_license = manifest
-        .and_then(|b| toml::from_str::<toml::Value>(std::str::from_utf8(b).ok()?).ok())
-        .and_then(|v| {
-            v.get("package")?
-                .get("license")?
-                .as_str()
-                .map(str::to_owned)
-        });
+    let manifest_package = manifest
+        .and_then(|b| utf8(b, path, "Cargo.toml").ok())
+        .and_then(|text| toml::from_str::<toml::Value>(text).ok())
+        .and_then(|v| v.get("package").cloned());
+    let declared_license = manifest_package
+        .as_ref()
+        .and_then(|package| package.get("license")?.as_str().map(str::to_owned));
+    // Root-anchored identity: the crate name/version claims the asset like
+    // the manifest-name claims of the npm/maven/bun parsers.
+    if let Some(package) = &manifest_package {
+        out.claim_asset_identity(
+            path,
+            package
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned),
+            package
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
     let mut ids = LockComponents::new();
     for package in packages {
         let name = required_toml(package, "name", path)?;
@@ -99,5 +113,28 @@ mod tests {
         let inventory = scan_path(dir.path(), &config()).unwrap();
         assert_eq!(inventory.components.len(), 2);
         assert_eq!(inventory.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn bom_manifest_yields_license_and_identity() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "\u{feff}[package]\nname='app'\nversion='1.0.0'\nlicense='MIT'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Cargo.lock"),
+            "version = 3\n[[package]]\nname='app'\nversion='1.0.0'\n",
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.name, "app");
+        assert_eq!(inventory.asset.version.as_deref(), Some("1.0.0"));
+        assert!(inventory.components.values().any(|c| {
+            c.licenses
+                .iter()
+                .any(|l| l.expression.as_deref() == Some("MIT"))
+        }));
     }
 }
