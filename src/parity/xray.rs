@@ -32,12 +32,16 @@ use crate::parity::model::{
 /// Tolerant-parsing statistics for one Xray normalization run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParseSummary {
-    /// Components that made it into the canonical report.
+    /// Components that made it into the canonical report, including
+    /// synthesized audit-only references.
     pub returned_components: usize,
     /// Vulnerabilities that made it into the canonical report.
     pub returned_vulnerabilities: usize,
     /// Entries skipped because their shape was unusable.
     pub skipped_entries: usize,
+    /// Component references resolved to synthesized `pkg:generic` purls
+    /// because no SBOM inventory entry matched them.
+    pub synthesized_refs: usize,
     /// Reasons for every skipped entry, in encounter order.
     pub skip_reasons: Vec<String>,
 }
@@ -66,13 +70,19 @@ struct CdxDocument {
 
 #[derive(Debug, Deserialize)]
 struct CdxComponent {
-    name: String,
+    /// CycloneDX permits nameless components; they are skipped and counted
+    /// rather than aborting the whole document.
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     version: Option<String>,
     #[serde(default)]
     purl: Option<String>,
     #[serde(default)]
     licenses: Vec<CdxLicenseChoice>,
+    /// Nested components (valid CycloneDX) are walked recursively.
+    #[serde(default)]
+    components: Vec<CdxComponent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,8 +115,21 @@ fn generic_purl(name: &str, version: &str) -> String {
     format!(
         "pkg:generic/{}@{}",
         crate::util::percent_encode(name, crate::util::is_purl_byte),
-        version
+        crate::util::percent_encode(version, crate::util::is_purl_byte)
     )
+}
+
+/// Severity rank used to pick the strongest label when several entries
+/// share one issue id; `unknown` ranks below every real severity so a
+/// later concrete label always wins over an earlier unknown.
+fn severity_rank_of(label: &str) -> u8 {
+    match label {
+        "low" => 1,
+        "medium" => 2,
+        "high" => 3,
+        "critical" => 4,
+        _ => 0,
+    }
 }
 
 fn severity_label(raw: Option<&str>) -> String {
@@ -121,6 +144,8 @@ fn severity_label(raw: Option<&str>) -> String {
 
 #[derive(Default)]
 struct VulnAccumulator {
+    /// Highest severity rank seen so far; `unknown` ranks 0.
+    severity_rank: u8,
     severity_label: String,
     aliases: BTreeSet<String>,
     cves: BTreeSet<String>,
@@ -220,9 +245,14 @@ fn parse_audit_vulnerabilities(
                 continue;
             };
             let accumulator = accumulators.entry(issue_id.to_owned()).or_default();
-            if accumulator.severity_label.is_empty() {
-                accumulator.severity_label =
-                    severity_label(vuln.get("severity").and_then(Value::as_str));
+            // Severity accumulates as MAX rank across every entry sharing
+            // an issue id, so the comparison is order-independent and a
+            // real severity always beats an earlier `unknown`.
+            let label = severity_label(vuln.get("severity").and_then(Value::as_str));
+            let rank = severity_rank_of(&label);
+            if rank > accumulator.severity_rank {
+                accumulator.severity_rank = rank;
+                accumulator.severity_label = label;
             }
             for cve in collect_strings(vuln.get("cves"), "cve") {
                 accumulator.cves.insert(cve.clone());
@@ -236,9 +266,9 @@ fn parse_audit_vulnerabilities(
                     accumulator.affected_purls.insert(purl);
                 } else {
                     let purl = generic_purl(&name, &version);
-                    summary.skip(format!(
-                        "component reference '{name}:{version}' resolved to synthesized {purl}"
-                    ));
+                    // Synthesized, not skipped: the reference still reaches
+                    // the comparison as a `pkg:generic` component.
+                    summary.synthesized_refs += 1;
                     accumulator.affected_purls.insert(purl.clone());
                     synthesize_components
                         .entry(purl_match_key(&purl))
@@ -279,17 +309,26 @@ pub fn build_xray_canonical(
     let mut by_name_version: BTreeMap<(String, String), String> = BTreeMap::new();
     if let Some(sbom) = artifacts.sbom_json {
         let document: CdxDocument = serde_json::from_str(sbom)?;
-        for raw in document.components {
+        let mut pending: Vec<CdxComponent> = document.components;
+        while let Some(raw) = pending.pop() {
+            pending.extend(raw.components);
+            let Some(name) = raw.name else {
+                summary.skip("cyclonedx component without 'name'".to_owned());
+                continue;
+            };
             summary.returned_components += 1;
+            // Purl-less components fall back to the same `name@version`
+            // convention hooray's own SBOM parser uses (sbom.rs), so the
+            // same input shape keys identically on both sides.
             let purl = raw.purl.clone().unwrap_or_else(|| {
-                generic_purl(&raw.name, raw.version.as_deref().unwrap_or_default())
+                format!("{}@{}", name, raw.version.as_deref().unwrap_or_default())
             });
             let licenses = sorted_unique(raw.licenses.iter().filter_map(CdxLicenseChoice::label));
             let component = CanonicalComponent {
                 ecosystem: ecosystem_of_purl(&purl),
                 version: raw.version.clone().unwrap_or_default(),
                 purl: purl.clone(),
-                name: raw.name,
+                name,
                 licenses,
                 scope: "runtime".to_owned(),
                 directness: "disconnected".to_owned(),
@@ -342,9 +381,12 @@ pub fn build_xray_canonical(
             &mut synthesized,
         );
     }
+    let synthesized_count = synthesized.len();
     for (key, component) in synthesized {
         components.entry(key).or_insert(component);
     }
+    // Synthesized components are part of the returned inventory too.
+    summary.returned_components += synthesized_count;
 
     let vulnerabilities: Vec<CanonicalVuln> = accumulators
         .into_iter()
@@ -376,6 +418,16 @@ pub fn build_xray_canonical(
         },
         "provider-replay",
     );
+    // Tolerated parse problems are evidence: they persist into recordings
+    // so the drift guard and downstream consumers can see them.
+    report.parse_errors = summary
+        .skip_reasons
+        .iter()
+        .map(|reason| crate::parity::model::ParseError {
+            path: "xray".to_owned(),
+            reason: reason.clone(),
+        })
+        .collect();
     report.components = components;
     report.vulnerabilities = vulnerabilities;
     Ok((report, summary))
@@ -513,7 +565,8 @@ mod tests {
             vuln.affected_purls,
             vec!["pkg:generic/weird-pkg@0.1.0".to_owned()]
         );
-        assert_eq!(summary.skipped_entries, 1); // unresolved reference note
+        assert_eq!(summary.skipped_entries, 0);
+        assert_eq!(summary.synthesized_refs, 1); // unresolved reference synthesized
     }
 
     #[test]
@@ -555,10 +608,106 @@ mod tests {
             returned_components: 3,
             returned_vulnerabilities: 1,
             skipped_entries: 2,
+            synthesized_refs: 1,
             skip_reasons: vec!["r1".into(), "r2".into()],
         };
         let back: ParseSummary =
             serde_json::from_str(&serde_json::to_string(&summary).unwrap()).unwrap();
         assert_eq!(back, summary);
+    }
+
+    #[test]
+    fn nameless_and_nested_components_are_handled() {
+        let sbom = r#"{
+            "bomFormat": "CycloneDX",
+            "components": [
+                {"version": "9.9.9"},
+                {
+                    "name": "outer",
+                    "version": "1.0.0",
+                    "purl": "pkg:npm/outer@1.0.0",
+                    "components": [
+                        {"name": "inner", "version": "2.0.0", "purl": "pkg:npm/inner@2.0.0"}
+                    ]
+                }
+            ]
+        }"#;
+        let (report, summary) = build_xray_canonical(
+            "case-nested",
+            None,
+            &XrayArtifacts {
+                audit_json: None,
+                sbom_json: Some(sbom),
+            },
+        )
+        .unwrap();
+        // The nameless component is skipped and counted; the nested
+        // component is walked into the inventory.
+        assert_eq!(report.components.len(), 2);
+        assert!(report.components.iter().any(|c| c.name == "inner"));
+        assert_eq!(summary.skipped_entries, 1);
+        assert!(
+            summary
+                .skip_reasons
+                .iter()
+                .any(|r| r.contains("without 'name'"))
+        );
+        // Skipped entries persist as parse errors on the report.
+        assert_eq!(report.parse_errors.len(), 1);
+    }
+
+    #[test]
+    fn severity_max_wins_over_ordering() {
+        // A later entry for the same issue_id with a higher severity must
+        // override an earlier lower/unknown label.
+        let audit = r#"[{"vulnerabilities": [
+            {"issue_id": "XRAY-1", "severity": "Low", "components": {}},
+            {"issue_id": "XRAY-1", "severity": "Critical", "components": {}}
+        ]}]"#;
+        let (report, _) = build_xray_canonical(
+            "case-sev",
+            None,
+            &XrayArtifacts {
+                audit_json: Some(audit),
+                sbom_json: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.vulnerabilities[0].severity_label, "critical");
+
+        // Reverse order: same result — selection is order-independent.
+        let audit_rev = r#"[{"vulnerabilities": [
+            {"issue_id": "XRAY-1", "severity": "Critical", "components": {}},
+            {"issue_id": "XRAY-1", "severity": "Low", "components": {}}
+        ]}]"#;
+        let (report_rev, _) = build_xray_canonical(
+            "case-sev",
+            None,
+            &XrayArtifacts {
+                audit_json: Some(audit_rev),
+                sbom_json: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(report_rev.vulnerabilities[0].severity_label, "critical");
+    }
+
+    #[test]
+    fn synthesized_refs_counted_not_skipped() {
+        let audit = r#"[{"vulnerabilities": [
+            {"issue_id": "XRAY-9", "components": {"weird:1.0": {}}}
+        ]}]"#;
+        let (_, summary) = build_xray_canonical(
+            "case-syn",
+            None,
+            &XrayArtifacts {
+                audit_json: Some(audit),
+                sbom_json: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.synthesized_refs, 1);
+        assert_eq!(summary.skipped_entries, 0);
+        assert_eq!(summary.returned_components, 1);
     }
 }

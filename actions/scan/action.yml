@@ -84,6 +84,24 @@ runs:
           echo "::error::output must not contain newlines."
           exit 2
         fi
+        # Every input must be exactly one argument: a value starting with
+        # '-' would be re-parsed as a flag and inject extra options into
+        # the hooray invocation (e.g. input: --help exits 0 having scanned
+        # nothing).
+        for pair in \
+          "input:$INPUT_PATH" \
+          "policy:$INPUT_POLICY" \
+          "config:$INPUT_CONFIG" \
+          "format:$INPUT_FORMAT" \
+          "output:$INPUT_OUTPUT" \
+          "executable:$INPUT_EXECUTABLE"; do
+          name="${pair%%:*}"
+          value="${pair#*:}"
+          if [[ "$value" == -* ]]; then
+            echo "::error::${name} must not start with '-' (got '${value}')."
+            exit 2
+          fi
+        done
         if [[ -z "$INPUT_POLICY" ]]; then
           echo "::error::A Hooray policy path is required for a gating scan."
           exit 2

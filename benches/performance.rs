@@ -46,10 +46,16 @@ fn measure(mut operation: impl FnMut()) -> (u64, Duration) {
         operation();
     }
     let started = Instant::now();
+    // Always run at least one timed iteration: a single call slower than
+    // SAMPLE_TIME would otherwise leave `iterations` at 0 and report
+    // elapsed/0 = inf (or NaN) instead of a real sample.
     let mut iterations = 0_u64;
-    while started.elapsed() < SAMPLE_TIME {
+    loop {
         operation();
         iterations += 1;
+        if started.elapsed() >= SAMPLE_TIME {
+            break;
+        }
     }
     (iterations, started.elapsed())
 }
