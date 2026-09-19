@@ -790,6 +790,11 @@ impl MonitorRunner for CliMonitorRunner {
                     &database_path,
                     max_input_bytes,
                     max_archive_entries,
+                    // The fingerprint walk must honor the same depth bound
+                    // the scanner uses (ScannerConfig::default().max_depth),
+                    // or deep files the scanner ignores still churn the
+                    // fingerprint and cause spurious rescans.
+                    hooray::scanners::ScannerConfig::default().max_depth,
                 )
             })
             .await
