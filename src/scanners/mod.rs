@@ -725,7 +725,7 @@ fn pem_block<'a>(
     let label_start = "-----BEGIN ".len();
     let label_end = label_start
         + block
-            .get(label_start..label_start + PEM_LABEL_MAX_BYTES)?
+            .get(label_start..(label_start + PEM_LABEL_MAX_BYTES).min(block.len()))?
             .find("-----")?;
     let body_start = label_end + 5;
     let end_start = *end_offsets.get(end_offsets.partition_point(|offset| *offset < body_start))?;
@@ -735,7 +735,7 @@ fn pem_block<'a>(
     let end_label_start = end_start.checked_sub(begin_offset)? + "-----END ".len();
     let end_label_end = end_label_start
         + block
-            .get(end_label_start..end_label_start + PEM_LABEL_MAX_BYTES)?
+            .get(end_label_start..(end_label_start + PEM_LABEL_MAX_BYTES).min(block.len()))?
             .find("-----")?;
     if block[label_start..label_end] != block[end_label_start..end_label_end] {
         return None;
@@ -778,6 +778,9 @@ fn pem_block<'a>(
 fn plausible_pem_body(body: &str) -> bool {
     let mut rest = body;
     loop {
+        if rest.is_empty() {
+            break;
+        }
         let line = rest.split('\n').next().unwrap_or("");
         let trimmed = line.trim_end_matches(['\r', ' ', '\t']);
         if trimmed.is_empty() {
@@ -3116,7 +3119,9 @@ mod tests {
             ),
             "sast.rust.command-shell"
         ));
-        assert!(has(
+        // Bare `exec(...)` without a child_process alias is not reported —
+        // it is indistinguishable from RegExp.prototype.exec (#206).
+        assert!(!has(
             &analyze("x.js", "exec(command)"),
             "sast.javascript.exec-dynamic"
         ));
@@ -3143,7 +3148,7 @@ runSync(`git ${branch}`);
 const { exec: destructured, execSync: destructuredSync } = require("child_process");
 destructured(input);
 destructuredSync(`git ${branch}`);
-exec(command);
+// exec(command); — bare exec without an alias is not reported (#206)
 
 /^(?:rgba|hsla)\(([^)]+)\)$/.exec(computed);
 RegExp.prototype.exec(computed);
@@ -3161,7 +3166,7 @@ cp.exec(`fixed`);
             .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
             .count();
         assert_eq!(
-            findings, 10,
+            findings, 9,
             "all proven dynamic child_process sinks are reported once"
         );
     }
@@ -4439,9 +4444,16 @@ childProcess.exec(input);"#;
         let source = "const Map<String, String> autofillHints = <String, String>{\n  'password': 'current-password',\n  'newPassword': 'new-password',\n};\nconst token = '0123456789abcdef';\n";
         let output = analyze("autofill_hint.dart", source);
         assert!(!has(&output, "secret.high-entropy-assignment"));
-        // Kubernetes namespace/name secret references are pointers, not keys.
+        // Kubernetes namespace/name secret references are pointers, not
+        // keys — but only when the assignment key names a reference
+        // (secret_name/secretRef); a `password` key with a slash value is a
+        // credential (#178).
         assert!(!has(
-            &analyze("deploy.yaml", "password: \"default/other-demo-secret\""),
+            &analyze("deploy.yaml", "secret_name: \"default/other-demo-secret\""),
+            "secret.high-entropy-assignment"
+        ));
+        assert!(has(
+            &analyze("deploy.yaml", "password: \"admin/panel123\""),
             "secret.high-entropy-assignment"
         ));
         // Negative control: a real token assignment still flags.

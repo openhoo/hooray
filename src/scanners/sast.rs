@@ -554,6 +554,15 @@ static JAVASCRIPT_ESM_DEFAULT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     .expect("constant ES-module child_process default regex")
 });
 
+static JAVASCRIPT_MEMBER_REQUIRE_ALIAS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    // `const cp = require("child_process").exec` binds the method itself;
+    // the alias resolves as a Named alias of that method's family.
+    Regex::new(
+        r#"(?m)(?:^|[^.A-Za-z0-9_$])(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.\s*(execSync|exec|spawn|spawnSync|execFile|execFileSync|fork)\b"#,
+    )
+    .expect("constant member-require alias regex")
+});
+
 static JAVASCRIPT_MEMBER_EXEC_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?m)(?:^|[^.A-Za-z0-9_$])(?P<receiver>[A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*(?P<method>execSync|exec)\s*\("#,
@@ -843,6 +852,27 @@ fn scan_javascript_exec_receivers(
             continue;
         }
         collect_named_child_process_aliases(bindings.as_str(), bindings.start(), &mut aliases);
+    }
+    for captures in JAVASCRIPT_MEMBER_REQUIRE_ALIAS_REGEX.captures_iter(text) {
+        let (Some(alias), Some(method), Some(declaration)) =
+            (captures.get(1), captures.get(2), captures.get(0))
+        else {
+            continue;
+        };
+        if offset_in_non_code_span(non_code, alias.start())
+            || !has_javascript_declaration_boundary(text, declaration.end())
+        {
+            continue;
+        }
+        let kind = match method.as_str() {
+            "exec" | "execSync" => JavascriptAliasKind::NamedExec,
+            _ => JavascriptAliasKind::NamedSpawn,
+        };
+        aliases.push(JavascriptAlias {
+            name: alias.as_str().to_owned(),
+            start: alias.start(),
+            kind,
+        });
     }
     let model = JavascriptBindingModel::new(text, &tokens, &aliases);
     let mut finding = SastFindingContext {
