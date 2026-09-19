@@ -10,26 +10,41 @@ use crate::model::Scope;
 /// entries (build tooling, not shipped code).
 fn gradle_scope(configurations: &str) -> Scope {
     let mut saw_test = false;
-    let mut saw_classpath = false;
+    let mut saw_build = false;
     for configuration in configurations.split(',') {
         let configuration = configuration.trim();
+        let lowered = configuration.to_ascii_lowercase();
         if configuration == "classpath" {
-            saw_classpath = true;
-        } else if configuration.to_ascii_lowercase().contains("test") {
+            saw_build = true;
+        } else if lowered.contains("test") {
             saw_test = true;
+        } else if gradle_build_only_configuration(&lowered) {
+            saw_build = true;
         } else {
             return Scope::Runtime;
         }
     }
     if saw_test {
         Scope::Development
-    } else if saw_classpath {
+    } else if saw_build {
         Scope::Build
     } else {
         // Only reachable for an empty configuration list, which the caller
         // rejects; kept total so the mapping stays honest if that changes.
         Scope::Unknown
     }
+}
+
+/// Gradle configurations whose artifacts never ship at runtime: annotation
+/// processors (`annotationProcessor`, `debugAnnotationProcessor`), Kotlin
+/// `kapt` variants, and `compileOnly*`/`developmentOnly*` compile-time
+/// inputs. Entries locked only under these configurations are
+/// build tooling, not shipped code.
+fn gradle_build_only_configuration(configuration: &str) -> bool {
+    configuration.contains("annotationprocessor")
+        || configuration.starts_with("kapt")
+        || configuration.starts_with("compileonly")
+        || configuration.starts_with("developmentonly")
 }
 
 /// Parses a Gradle dependency lockfile. Modern Gradle 7+ `--write-locks`
@@ -264,5 +279,34 @@ mod tests {
                 "expected malformed in {name} for: {contents}"
             );
         }
+    }
+
+    #[test]
+    fn build_only_configurations_classify_as_build() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("gradle.lockfile"),
+            concat!(
+                "org.example:processor:1.0=annotationProcessor\n",
+                "org.example:kapted:1.0=kapt\n",
+                "org.example:compileonly:1.0=compileOnly\n",
+                "org.example:devonly:1.0=developmentOnly\n",
+                "org.example:shipped:1.0=runtimeClasspath\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let scope_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == format!("org.example/{name}"))
+                .map(|c| c.scope)
+        };
+        assert_eq!(scope_of("processor"), Some(Scope::Build));
+        assert_eq!(scope_of("kapted"), Some(Scope::Build));
+        assert_eq!(scope_of("compileonly"), Some(Scope::Build));
+        assert_eq!(scope_of("devonly"), Some(Scope::Build));
+        assert_eq!(scope_of("shipped"), Some(Scope::Runtime));
     }
 }
