@@ -290,6 +290,70 @@ pub(crate) fn oci_manifest_filesystem(
     Ok(filesystem)
 }
 
+/// Extracted layer filesystem for an unpacked OCI layout, exposed so
+/// `ScanInput::virtual_files` can feed image contents to the filesystem and
+/// license analyzers without duplicating manifest resolution.
+pub(crate) fn oci_layout_filesystem(
+    root: &Path,
+    config: &Config,
+) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
+    reject_symlink_ancestors(root)?;
+    let index = read_limited(&root.join("index.json"), config.max_input_bytes)?;
+    let index: OciIndex =
+        serde_json::from_slice(&index).map_err(|e| malformed("index.json", "OCI index", e))?;
+    let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
+    let manifest_bytes = read_oci_blob(root, &descriptor.digest, config)?;
+    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| malformed("manifest", "OCI manifest", e))?;
+    oci_manifest_filesystem(&manifest, config, |digest| {
+        read_oci_blob(root, digest, config)
+    })
+}
+
+/// Extracted layer filesystem for an OCI/docker-save tar, mirroring the
+/// manifest resolution of `scan_oci_tar` for `ScanInput::virtual_files`.
+pub(crate) fn oci_tar_filesystem(
+    path: &Path,
+    config: &Config,
+) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
+    let outer = read_tar_file(path, config)?;
+    if let Some(index_bytes) = outer.get("index.json") {
+        let index: OciIndex = serde_json::from_slice(index_bytes)
+            .map_err(|e| malformed("index.json", "OCI index", e))?;
+        let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
+        let manifest_bytes = outer
+            .get(&blob_path(&descriptor.digest)?)
+            .ok_or_else(|| InputError::MissingBlob(descriptor.digest.clone()))?;
+        verify_digest(&descriptor.digest, manifest_bytes)?;
+        let manifest: OciManifest = serde_json::from_slice(manifest_bytes)
+            .map_err(|e| malformed("manifest", "OCI manifest", e))?;
+        oci_manifest_filesystem(&manifest, config, |digest| {
+            let bytes = outer
+                .get(&blob_path(digest)?)
+                .ok_or_else(|| InputError::MissingBlob(digest.to_owned()))?;
+            verify_digest(digest, bytes)?;
+            Ok(bytes.clone())
+        })
+    } else {
+        let manifest_bytes = outer
+            .get("manifest.json")
+            .ok_or(InputError::MissingManifest)?;
+        let docker: Vec<DockerManifest> = serde_json::from_slice(manifest_bytes)
+            .map_err(|e| malformed("manifest.json", "Docker image manifest", e))?;
+        let manifest =
+            select_docker_manifest(&docker, &outer).ok_or(InputError::MissingManifest)?;
+        let mut filesystem = BTreeMap::new();
+        let mut expanded = 0;
+        for layer in &manifest.layers {
+            let bytes = outer
+                .get(layer)
+                .ok_or_else(|| InputError::MissingBlob(layer.clone()))?;
+            apply_layer(bytes, None, config, &mut expanded, &mut filesystem)?;
+        }
+        Ok(filesystem)
+    }
+}
+
 /// Wraps a layer blob in the decompressor its bytes and media type declare.
 /// Magic bytes decide the codec (gzip `1f 8b`, zstd `28 b5 2f fd`); the
 /// media type only guards fail-closed handling: a declared codec the blob
@@ -793,14 +857,13 @@ mod tests {
 
         // An object-shaped (or unparseable) manifest.json is a web app
         // manifest or garbage, not a docker-save archive: detection falls
-        // back to archive scanning, which rejects the tar as unsupported
-        // instead of the image parser's Malformed.
+        // back to archive scanning, which yields an empty inventory for a
+        // recognized container with no lockfiles.
         let path = dir.path().join("web-manifest.tar");
         write_tar(&path, &[("manifest.json", br#"{"name":"app"}"#)]);
-        assert!(matches!(
-            scan_path(&path, &config()),
-            Err(InputError::UnsupportedFormat(_))
-        ));
+        let inventory = scan_path(&path, &config()).unwrap();
+        assert!(inventory.components.is_empty());
+        assert!(inventory.dependencies.is_empty());
 
         let claimed = digest(8);
         let index = format!(r#"{{"manifests":[{{"digest":"{claimed}"}}]}}"#);

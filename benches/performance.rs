@@ -289,6 +289,7 @@ fn affected_ranges_fixture() -> Vec<OsvAffectedRange> {
         .map(|range| OsvAffectedRange {
             range_type: OsvRangeType::Semver,
             ecosystem: Some("cargo".into()),
+            versions: Vec::new(),
             events: (0..10)
                 .flat_map(|interval| {
                     let introduced = format!("{}.{}.0", range + 1, interval * 2);
