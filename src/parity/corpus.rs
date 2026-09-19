@@ -6,7 +6,7 @@
 //! integration tests consume these definitions so tier-1 checks, tier-2
 //! drift re-scans, and recordings always agree on how a case is classified.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -58,6 +58,10 @@ impl CorpusManifest {
     }
 
     /// Validates the manifest header and case ids.
+    ///
+    /// Case ids must additionally be unique: tier-2 drift re-scans resolve
+    /// a recording's `case_id` back to one manifest row, so a duplicate
+    /// would silently classify the re-scan under the first row's kind.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.schema_version != CORPUS_SCHEMA_VERSION {
             bail!(
@@ -66,12 +70,16 @@ impl CorpusManifest {
                 CORPUS_SCHEMA_VERSION
             );
         }
+        let mut seen = BTreeSet::new();
         for case in &self.cases {
             if !is_valid_case_id(&case.case_id) {
                 bail!(
                     "invalid corpus case_id {:?}: expected a plain directory name",
                     case.case_id
                 );
+            }
+            if !seen.insert(case.case_id.as_str()) {
+                bail!("duplicate corpus case_id {:?}", case.case_id);
             }
         }
         Ok(())
@@ -233,6 +241,16 @@ mod tests {
                 "case_id {bad:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn manifest_parse_rejects_duplicate_case_ids() {
+        let text = r#"{"schema_version": 1, "cases": [
+            {"case_id": "npm-basic", "kind": "project-directory"},
+            {"case_id": "npm-basic", "kind": "cyclonedx-sbom"}
+        ]}"#;
+        let error = CorpusManifest::parse(text).unwrap_err();
+        assert!(error.to_string().contains("duplicate corpus case_id"));
     }
 
     #[test]
