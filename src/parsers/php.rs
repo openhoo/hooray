@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg};
+use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::Scope;
 pub(crate) fn parse_composer_json(
     path: &str,
@@ -10,17 +10,21 @@ pub(crate) fn parse_composer_json(
     lock: Option<&Vec<u8>>,
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|e| malformed(path, "composer.json", e))?;
+    let value: Value = serde_json::from_str(utf8(bytes, path, "composer.json")?)
+        .map_err(|e| malformed(path, "composer.json", e))?;
     let root = value
         .as_object()
         .ok_or_else(|| malformed_msg(path, "composer.json", "expected a JSON object"))?;
-    if let Some(version) = root
+    let name = root
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty());
+    let version = root
         .get("version")
         .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-    {
-        out.claim_asset_identity(path, None, Some(version.to_owned()));
+        .filter(|v| !v.is_empty());
+    if name.is_some() || version.is_some() {
+        out.claim_asset_identity(path, name.map(str::to_owned), version.map(str::to_owned));
     }
     // A sibling composer.lock already resolved these constraints; the
     // lockfile's pinned versions supersede the declared ranges.
@@ -61,8 +65,8 @@ pub(crate) fn parse_composer_lock(
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|e| malformed(path, "composer.lock", e))?;
+    let value: Value = serde_json::from_str(utf8(bytes, path, "composer.lock")?)
+        .map_err(|e| malformed(path, "composer.lock", e))?;
     let root = value
         .as_object()
         .ok_or_else(|| malformed_msg(path, "composer.lock", "expected a JSON object"))?;
@@ -87,6 +91,7 @@ pub(crate) fn parse_composer_lock(
             }
             None => continue,
         };
+        entry_bound(packages.len(), path, "composer.lock")?;
         for package in packages {
             let Some(name) = package.get("name").and_then(Value::as_str) else {
                 return Err(malformed_msg(
@@ -339,5 +344,36 @@ mod tests {
             matches!(&error, InputError::Malformed { format, .. } if *format == "composer.lock"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn composer_json_claims_name_and_bom_parses() {
+        let dir = tempdir().unwrap();
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend_from_slice(
+            br#"{"name":"vendor/app","version":"1.2.3","require":{"vendor/dep":"^2.0"}}"#,
+        );
+        fs::write(dir.path().join("composer.json"), bytes).unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.asset.name, "vendor/app");
+        assert_eq!(inventory.asset.version.as_deref(), Some("1.2.3"));
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "vendor/dep")
+        );
+    }
+
+    #[test]
+    fn composer_lock_with_utf8_bom_parses() {
+        let dir = tempdir().unwrap();
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend_from_slice(
+            br#"{"packages":[{"name":"vendor/dep","version":"2.0.0"}],"packages-dev":[]}"#,
+        );
+        fs::write(dir.path().join("composer.lock"), bytes).unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 1);
     }
 }

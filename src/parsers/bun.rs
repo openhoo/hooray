@@ -69,6 +69,7 @@ pub(crate) fn parse_bun_lock(
             ("dependencies", Scope::Runtime, false),
             ("devDependencies", Scope::Development, false),
             ("optionalDependencies", Scope::Optional, true),
+            ("peerDependencies", Scope::Runtime, false),
         ] {
             let Some(deps) = meta.get(field).and_then(Value::as_object) else {
                 continue;
