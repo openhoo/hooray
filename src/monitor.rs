@@ -19,8 +19,10 @@ pub const MAX_SOURCE_BYTES: usize = 4096;
 pub const MAX_CURSOR_BYTES: usize = 16 * 1024;
 pub const MAX_ETAG_BYTES: usize = 4096;
 pub const MAX_ERROR_BYTES: usize = 2048;
-pub const MAX_DUE_TARGETS: usize = 10_000;
-pub const MAX_DUE_EVENTS: usize = 10_000;
+// Batch sizes are bounded by the store page cap: a larger configured
+// value would pass validation here but fail every cycle in the store.
+pub const MAX_DUE_TARGETS: usize = 1_000;
+pub const MAX_DUE_EVENTS: usize = 1_000;
 pub const MAX_BACKOFF_SECONDS: i64 = 86_400;
 /// Lease granted to claimed events while a delivery batch runs; sized to a
 /// realistic delivery-batch duration instead of the retry backoff ceiling,
@@ -327,6 +329,7 @@ pub fn source_fingerprint(
     database_path: &Path,
     max_input_bytes: u64,
     max_files: usize,
+    max_depth: usize,
 ) -> Result<String, MonitorError> {
     use sha2::{Digest, Sha256};
 
@@ -362,7 +365,7 @@ pub fn source_fingerprint(
             .collect()
     } else {
         let mut paths = BTreeSet::new();
-        for entry in crate::filesystem::repository_walk(&root, false, None) {
+        for entry in crate::filesystem::repository_walk(&root, false, Some(max_depth)) {
             let entry = entry.map_err(|error| {
                 MonitorError::Runner(format!(
                     "failed to walk source '{}': {error}",
@@ -445,7 +448,13 @@ pub trait MonitorRepository: Send {
     fn advisory_cursor(&mut self) -> Result<AdvisoryCursor, MonitorError>;
     fn save_advisory_cursor(&mut self, cursor: &AdvisoryCursor) -> Result<(), MonitorError>;
     fn due_targets(&mut self, now: i64, limit: usize) -> Result<Vec<MonitorTarget>, MonitorError>;
-    fn save_target(&mut self, target: &MonitorTarget) -> Result<(), MonitorError>;
+    /// Saves the target only when the stored row still carries
+    /// `expected_updated_at` (compare-and-swap against racing writers).
+    fn save_target(
+        &mut self,
+        target: &MonitorTarget,
+        expected_updated_at: i64,
+    ) -> Result<(), MonitorError>;
     fn enqueue_event(&mut self, event: &AlertEvent) -> Result<bool, MonitorError>;
     fn claim_events(
         &mut self,
@@ -455,6 +464,10 @@ pub trait MonitorRepository: Send {
     ) -> Result<Vec<AlertEvent>, MonitorError>;
     fn save_event(&mut self, event: &AlertEvent) -> Result<(), MonitorError>;
     fn prune_before(&mut self, cutoff: i64) -> Result<usize, MonitorError>;
+
+    /// Prunes scan history (scan_runs plus audit/retention bookkeeping)
+    /// older than `cutoff`; returns the number of deleted runs.
+    fn prune_reports_before(&mut self, cutoff: i64) -> Result<usize, MonitorError>;
 }
 
 impl MonitorRepository for crate::store::Store {
@@ -480,17 +493,41 @@ impl MonitorRepository for crate::store::Store {
 
     fn due_targets(&mut self, now: i64, limit: usize) -> Result<Vec<MonitorTarget>, MonitorError> {
         let limit = u32::try_from(limit).map_err(|_| MonitorError::InvalidBatchSize(limit))?;
-        self.list_due_monitor_targets(&encode_time(now), limit, 0)
+        Ok(self
+            .list_due_monitor_targets(&encode_time(now), limit, 0)
             .map_err(store_error)?
             .into_iter()
-            .map(target_from_store)
-            .collect()
+            .filter_map(|target| match target_from_store(target) {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    // One undecodable row must not starve every healthy
+                    // target; skip it and report instead of aborting.
+                    eprintln!("skipping undecodable monitor target row: {error}");
+                    None
+                }
+            })
+            .collect())
     }
 
-    fn save_target(&mut self, target: &MonitorTarget) -> Result<(), MonitorError> {
+    fn save_target(
+        &mut self,
+        target: &MonitorTarget,
+        expected_updated_at: i64,
+    ) -> Result<(), MonitorError> {
         let stored = target_to_store(target)?;
-        if !self.update_monitor_target(&stored).map_err(store_error)? {
-            self.upsert_monitor_target(&stored).map_err(store_error)?;
+        // Compare-and-swap on the previously observed updated_at: a racing
+        // monitor that saved first (or a `targets remove` that deleted the
+        // row) makes this write affect 0 rows, which surfaces as a conflict
+        // instead of silently losing the winner's state or resurrecting a
+        // deleted target.
+        if !self
+            .update_monitor_target(&stored, &encode_time(expected_updated_at))
+            .map_err(store_error)?
+        {
+            return Err(MonitorError::Persistence(format!(
+                "monitor target '{}' changed or was removed concurrently",
+                target.id
+            )));
         }
         Ok(())
     }
@@ -507,11 +544,18 @@ impl MonitorRepository for crate::store::Store {
         limit: usize,
     ) -> Result<Vec<AlertEvent>, MonitorError> {
         let limit = u32::try_from(limit).map_err(|_| MonitorError::InvalidEventBatchSize(limit))?;
-        self.claim_monitor_events(&encode_time(now), &encode_time(lease_until), limit)
+        Ok(self
+            .claim_monitor_events(&encode_time(now), &encode_time(lease_until), limit)
             .map_err(store_error)?
             .into_iter()
-            .map(event_from_store)
-            .collect()
+            .filter_map(|event| match event_from_store(event) {
+                Ok(event) => Some(event),
+                Err(error) => {
+                    eprintln!("skipping undecodable monitor event row: {error}");
+                    None
+                }
+            })
+            .collect())
     }
 
     fn save_event(&mut self, event: &AlertEvent) -> Result<(), MonitorError> {
@@ -531,6 +575,15 @@ impl MonitorRepository for crate::store::Store {
     fn prune_before(&mut self, cutoff: i64) -> Result<usize, MonitorError> {
         self.prune_monitor_before(&encode_time(cutoff))
             .map_err(store_error)
+    }
+
+    fn prune_reports_before(&mut self, cutoff: i64) -> Result<usize, MonitorError> {
+        // scan_runs.started_at is RFC 3339 text, not the biased-sortable
+        // monitor encoding, so the cutoff is rendered as RFC 3339 here.
+        let cutoff = chrono::DateTime::from_timestamp(cutoff, 0)
+            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .ok_or_else(|| MonitorError::Persistence("retention cutoff out of range".into()))?;
+        self.delete_before(&cutoff).map_err(store_error)
     }
 }
 
@@ -737,8 +790,9 @@ where
             error: redact_error(error),
         });
         target.next_due_at = now.saturating_add(self.config.retry.delay_after(streak));
+        let expected_updated_at = target.updated_at;
         target.updated_at = now;
-        self.repository.save_target(target)
+        self.repository.save_target(target, expected_updated_at)
     }
 
     pub async fn run_once(&mut self) -> Result<RunSummary, MonitorError> {
@@ -854,14 +908,15 @@ where
             target.advisory_digest = Some(advisory_digest.clone());
             target.policy_digest = Some(policy_digest.clone());
             target.next_due_at = advance_due(target.next_due_at, target.interval_seconds, now);
+            let expected_updated_at = target.updated_at;
             target.updated_at = now;
-            self.repository.save_target(&target)?;
+            self.repository.save_target(&target, expected_updated_at)?;
         }
 
-        self.deliver_events(now, &mut summary).await?;
-        summary.records_pruned = self
-            .repository
-            .prune_before(now.saturating_sub(self.config.retention_seconds))?;
+        self.deliver_events(&mut summary).await?;
+        let cutoff = now.saturating_sub(self.config.retention_seconds);
+        summary.records_pruned =
+            self.repository.prune_before(cutoff)? + self.repository.prune_reports_before(cutoff)?;
         Ok(summary)
     }
 
@@ -875,10 +930,21 @@ where
             tokio::select! {
                 () = &mut shutdown => return Ok(()),
                 result = self.run_once() => {
-                    if result.is_ok() {
-                        failure_count = 0;
-                    } else {
-                        failure_count = failure_count.saturating_add(1);
+                    match result {
+                        Ok(_) => failure_count = 0,
+                        Err(error) => {
+                            failure_count = failure_count.saturating_add(1);
+                            // A permanently failing cycle retries forever;
+                            // surface the error on the first failure and on
+                            // powers of ten so persistent failures are
+                            // diagnosable without flooding stderr.
+                            if failure_count == 1 || failure_count.is_multiple_of(10) {
+                                eprintln!(
+                                    "monitor cycle failed ({failure_count} consecutive): {}",
+                                    redact_error(&error.to_string())
+                                );
+                            }
+                        }
                     }
                 },
             }
@@ -894,11 +960,11 @@ where
         }
     }
 
-    async fn deliver_events(
-        &mut self,
-        now: i64,
-        summary: &mut RunSummary,
-    ) -> Result<(), MonitorError> {
+    async fn deliver_events(&mut self, summary: &mut RunSummary) -> Result<(), MonitorError> {
+        // The lease must be sampled at claim time: `now` captured before a
+        // long per-target scan loop could already be older than the lease,
+        // letting a second monitor re-claim and duplicate deliveries.
+        let now = self.clock.now();
         let lease_until = now.saturating_add(MONITOR_EVENT_LEASE_SECONDS);
         let mut events =
             self.repository
@@ -918,7 +984,9 @@ where
                     summary.events_delivered += 1;
                 }
                 Err(error) => {
-                    event.attempts = event.attempts.saturating_add(1);
+                    // `attempts` was already incremented by the claim UPDATE,
+                    // so a crash after claiming still counts toward
+                    // max_attempts and eventually dead-letters.
                     event.last_error = Some(redact_error(&error));
                     if event.attempts >= self.config.retry.max_attempts {
                         event.dead_lettered_at = Some(now);
@@ -949,7 +1017,7 @@ fn advance_due(previous_due: i64, interval: i64, now: i64) -> i64 {
         return previous_due;
     }
     let elapsed = now.saturating_sub(previous_due);
-    let intervals = elapsed / interval + 1;
+    let intervals = (elapsed / interval).saturating_add(1);
     previous_due.saturating_add(interval.saturating_mul(intervals))
 }
 
@@ -980,10 +1048,20 @@ fn validate_optional_text(
     Ok(())
 }
 
+/// Redacts secret material from persisted error text. The byte bound is a
+/// byte bound: truncation happens on a UTF-8 boundary at MAX_ERROR_BYTES,
+/// not after MAX_ERROR_BYTES scalar values (which could store ~4x the
+/// limit). Matching mirrors the integrations `looks_secret` contract:
+/// `name=value`/`name: value`/`name = value` assignments for known secret
+/// markers, `Bearer <token>` pairs, bare token prefixes (ghp_, glpat-,
+/// xoxb-, AKIA...), and URLs, which can carry credentials in path/query.
 fn redact_error(error: &str) -> String {
-    let sanitized: String = error
+    let mut end = error.len().min(MAX_ERROR_BYTES);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    let sanitized: String = error[..end]
         .chars()
-        .take(MAX_ERROR_BYTES)
         .map(|character| {
             if character.is_control() {
                 ' '
@@ -992,21 +1070,50 @@ fn redact_error(error: &str) -> String {
             }
         })
         .collect();
-    let mut words = sanitized.split_whitespace();
+    const MARKERS: [&str; 6] = ["token", "password", "passwd", "secret", "api_key", "apikey"];
+    let words: Vec<&str> = sanitized.split_whitespace().collect();
     let mut result = Vec::new();
-    while let Some(word) = words.next() {
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index];
         let lowercase = word.to_ascii_lowercase();
+        let trimmed = lowercase.trim_matches(|c: char| {
+            matches!(c, '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']')
+        });
+        let bare_token = trimmed.starts_with("ghp_")
+            || trimmed.starts_with("gho_")
+            || trimmed.starts_with("github_pat_")
+            || trimmed.starts_with("glpat-")
+            || trimmed.starts_with("xoxb-")
+            || trimmed.starts_with("xoxp-")
+            || (trimmed.starts_with("akia") && trimmed.len() >= 20)
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://");
+        let assigned = MARKERS.iter().any(|marker| {
+            trimmed.starts_with(&format!("{marker}=")) || trimmed.starts_with(&format!("{marker}:"))
+        });
+        // `token = abc` / `token : abc`: marker word followed by an
+        // assignment word; the value two words ahead is the secret.
+        let spaced = MARKERS.contains(&trimmed)
+            && words
+                .get(index + 1)
+                .is_some_and(|next| matches!(next.trim(), "=" | ":" | ":="));
         if lowercase == "bearer" {
-            let _ = words.next();
+            let _ = words.get(index + 1);
             result.push("Bearer [REDACTED]".to_owned());
-        } else if ["token=", "password=", "secret="]
-            .iter()
-            .any(|marker| lowercase.starts_with(marker))
-        {
-            let name = word.split_once('=').map_or("secret", |(name, _)| name);
+            index += 2;
+        } else if assigned || bare_token {
+            let name = word
+                .split_once(['=', ':'])
+                .map_or("secret", |(name, _)| name);
             result.push(format!("{name}=[REDACTED]"));
+            index += 1;
+        } else if spaced {
+            result.push(format!("{word} = [REDACTED]"));
+            index += 3;
         } else {
             result.push(word.to_owned());
+            index += 1;
         }
     }
     result.join(" ")
@@ -1049,28 +1156,28 @@ mod tests {
         std::fs::write(root.join("ignored/payload.txt"), "one").unwrap();
         let database = root.join(".hooray.db");
 
-        let before = source_fingerprint(&root, &database, 1024, 2).unwrap();
+        let before = source_fingerprint(&root, &database, 1024, 2, 64).unwrap();
         std::fs::write(root.join("ignored/payload.txt"), "two").unwrap();
         assert_eq!(
             before,
-            source_fingerprint(&root, &database, 1024, 2).unwrap(),
+            source_fingerprint(&root, &database, 1024, 2, 64).unwrap(),
             "ignored payloads must not consume fingerprint inputs"
         );
 
         std::fs::write(root.join(".gitignore"), "ignored/\n.gitignore\n").unwrap();
-        let self_ignored = source_fingerprint(&root, &database, 1024, 2).unwrap();
+        let self_ignored = source_fingerprint(&root, &database, 1024, 2, 64).unwrap();
         assert_ne!(before, self_ignored);
 
         std::fs::write(root.join(".gitignore"), "ignored/\nchanged.txt\n").unwrap();
-        let after_gitignore = source_fingerprint(&root, &database, 1024, 2).unwrap();
+        let after_gitignore = source_fingerprint(&root, &database, 1024, 2, 64).unwrap();
         assert_ne!(self_ignored, after_gitignore);
 
         std::fs::write(root.join(".ignore"), "other/\n").unwrap();
-        let after_ignore = source_fingerprint(&root, &database, 1024, 3).unwrap();
+        let after_ignore = source_fingerprint(&root, &database, 1024, 3, 64).unwrap();
         assert_ne!(after_gitignore, after_ignore);
 
         std::fs::write(root.join(".hoorayignore"), "another/\n").unwrap();
-        let after_hoorayignore = source_fingerprint(&root, &database, 1024, 4).unwrap();
+        let after_hoorayignore = source_fingerprint(&root, &database, 1024, 4, 64).unwrap();
         assert_ne!(after_ignore, after_hoorayignore);
     }
     #[test]
@@ -1081,12 +1188,12 @@ mod tests {
         std::fs::write(root.join("b.txt"), "b").unwrap();
         std::fs::write(root.join("a.txt"), "a").unwrap();
         let database = root.join("hooray.db");
-        let first = source_fingerprint(&root, &database, 1024, 8).unwrap();
+        let first = source_fingerprint(&root, &database, 1024, 8, 64).unwrap();
         std::fs::remove_file(root.join("a.txt")).unwrap();
         std::fs::write(root.join("a.txt"), "a").unwrap();
         assert_eq!(
             first,
-            source_fingerprint(&root, &database, 1024, 8).unwrap()
+            source_fingerprint(&root, &database, 1024, 8, 64).unwrap()
         );
     }
 
@@ -1122,7 +1229,7 @@ mod tests {
             values.truncate(limit);
             Ok(values)
         }
-        fn save_target(&mut self, target: &MonitorTarget) -> Result<(), MonitorError> {
+        fn save_target(&mut self, target: &MonitorTarget, _: i64) -> Result<(), MonitorError> {
             self.targets.insert(target.id.clone(), target.clone());
             Ok(())
         }
@@ -1164,6 +1271,7 @@ mod tests {
                 .into_iter()
                 .map(|event| {
                     event.next_attempt_at = lease_until;
+                    event.attempts = event.attempts.saturating_add(1);
                     event.clone()
                 })
                 .collect())
@@ -1179,6 +1287,9 @@ mod tests {
                     || (event.delivered_at.is_none() && event.dead_lettered_at.is_none())
             });
             Ok(before - self.events.len())
+        }
+        fn prune_reports_before(&mut self, _: i64) -> Result<usize, MonitorError> {
+            Ok(0)
         }
     }
 
@@ -1231,7 +1342,7 @@ mod tests {
         fn due_targets(&mut self, _: i64, _: usize) -> Result<Vec<MonitorTarget>, MonitorError> {
             Ok(vec![])
         }
-        fn save_target(&mut self, _: &MonitorTarget) -> Result<(), MonitorError> {
+        fn save_target(&mut self, _: &MonitorTarget, _: i64) -> Result<(), MonitorError> {
             Ok(())
         }
         fn enqueue_event(&mut self, _: &AlertEvent) -> Result<bool, MonitorError> {
@@ -1249,6 +1360,9 @@ mod tests {
             Ok(())
         }
         fn prune_before(&mut self, _: i64) -> Result<usize, MonitorError> {
+            Ok(0)
+        }
+        fn prune_reports_before(&mut self, _: i64) -> Result<usize, MonitorError> {
             Ok(0)
         }
     }
@@ -1274,8 +1388,12 @@ mod tests {
         ) -> Result<Vec<MonitorTarget>, MonitorError> {
             self.inner.due_targets(now, limit)
         }
-        fn save_target(&mut self, target: &MonitorTarget) -> Result<(), MonitorError> {
-            self.inner.save_target(target)
+        fn save_target(
+            &mut self,
+            target: &MonitorTarget,
+            expected_updated_at: i64,
+        ) -> Result<(), MonitorError> {
+            self.inner.save_target(target, expected_updated_at)
         }
         fn enqueue_event(&mut self, event: &AlertEvent) -> Result<bool, MonitorError> {
             self.inner.enqueue_event(event)
@@ -1299,6 +1417,9 @@ mod tests {
         }
         fn prune_before(&mut self, cutoff: i64) -> Result<usize, MonitorError> {
             self.inner.prune_before(cutoff)
+        }
+        fn prune_reports_before(&mut self, cutoff: i64) -> Result<usize, MonitorError> {
+            self.inner.prune_reports_before(cutoff)
         }
     }
 
@@ -1841,6 +1962,8 @@ mod tests {
         let mut service = service(repository, clock.clone(), runner, notifier, retry);
         service.run_once().await.unwrap();
         let stored = &service.repository().events[&event_id];
+        // attempts counts claims (delivery attempts), so a crash after
+        // claiming still counts toward max_attempts.
         assert_eq!((stored.attempts, stored.next_attempt_at), (1, 110));
         assert_eq!(
             stored.last_error.as_deref(),

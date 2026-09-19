@@ -18,7 +18,7 @@ pub(crate) fn scan_oci_layout(root: &Path, config: &Config) -> Result<Inventory,
     let index = read_limited(&root.join("index.json"), config.max_input_bytes)?;
     let index: OciIndex =
         serde_json::from_slice(&index).map_err(|e| malformed("index.json", "OCI index", e))?;
-    let descriptor = index.manifests.first().ok_or(InputError::MissingManifest)?;
+    let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
     let manifest_bytes = read_oci_blob(root, &descriptor.digest, config)?;
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| malformed("manifest", "OCI manifest", e))?;
@@ -50,7 +50,7 @@ pub(crate) fn scan_oci_tar(path: &Path, config: &Config) -> Result<Inventory, In
         if let Some(index_bytes) = outer.get("index.json") {
             let index: OciIndex = serde_json::from_slice(index_bytes)
                 .map_err(|e| malformed("index.json", "OCI index", e))?;
-            let descriptor = index.manifests.first().ok_or(InputError::MissingManifest)?;
+            let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
             let manifest_bytes = outer
                 .get(&blob_path(&descriptor.digest)?)
                 .ok_or_else(|| InputError::MissingBlob(descriptor.digest.clone()))?;
@@ -91,7 +91,8 @@ pub(crate) fn scan_oci_tar(path: &Path, config: &Config) -> Result<Inventory, In
                 .ok_or(InputError::MissingManifest)?;
             let docker: Vec<DockerManifest> = serde_json::from_slice(manifest_bytes)
                 .map_err(|e| malformed("manifest.json", "Docker image manifest", e))?;
-            let manifest = docker.first().ok_or(InputError::MissingManifest)?;
+            let manifest =
+                select_docker_manifest(&docker, &outer).ok_or(InputError::MissingManifest)?;
             let mut filesystem = BTreeMap::new();
             let mut expanded = 0;
             for layer in &manifest.layers {
@@ -125,6 +126,19 @@ struct OciDescriptor {
     digest: String,
     #[serde(rename = "mediaType", default)]
     media_type: Option<String>,
+    #[serde(rename = "artifactType", default)]
+    artifact_type: Option<String>,
+    #[serde(default)]
+    platform: Option<OciPlatform>,
+    #[serde(default)]
+    annotations: Option<BTreeMap<String, String>>,
+}
+#[derive(Deserialize)]
+struct OciPlatform {
+    #[serde(default)]
+    os: Option<String>,
+    #[serde(default)]
+    architecture: Option<String>,
 }
 #[derive(Deserialize)]
 struct OciManifest {
@@ -140,6 +154,87 @@ struct DockerManifest {
     layers: Vec<String>,
 }
 
+/// Picks the image manifest an OCI index should scan: the `linux/amd64`
+/// descriptor when present, otherwise the first descriptor that still
+/// looks like an image manifest. Attestation manifests (`artifactType`,
+/// `vnd.docker.reference.type=attestation-manifest`, the `unknown/unknown`
+/// placeholder platform) and non-manifest media types (nested indexes,
+/// docker manifest lists) are never scanned as images.
+fn select_image_manifest(index: &OciIndex) -> Option<&OciDescriptor> {
+    let candidates = index
+        .manifests
+        .iter()
+        .filter(|descriptor| is_image_manifest_descriptor(descriptor));
+    let mut fallback = None;
+    for descriptor in candidates {
+        match descriptor.platform.as_ref() {
+            Some(platform)
+                if platform.os.as_deref() == Some("linux")
+                    && platform.architecture.as_deref() == Some("amd64") =>
+            {
+                return Some(descriptor);
+            }
+            _ => {
+                if fallback.is_none() {
+                    fallback = Some(descriptor);
+                }
+            }
+        }
+    }
+    fallback
+}
+
+/// Reports whether an index descriptor points at an image manifest rather
+/// than an attestation or a nested index/manifest list.
+fn is_image_manifest_descriptor(descriptor: &OciDescriptor) -> bool {
+    if descriptor.artifact_type.is_some() {
+        return false;
+    }
+    if descriptor
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("vnd.docker.reference.type"))
+        .is_some_and(|type_| type_ == "attestation-manifest")
+    {
+        return false;
+    }
+    if descriptor.platform.as_ref().is_some_and(|platform| {
+        platform.os.as_deref() == Some("unknown")
+            || platform.architecture.as_deref() == Some("unknown")
+    }) {
+        return false;
+    }
+    match descriptor.media_type.as_deref() {
+        Some(media_type) => {
+            media_type == "application/vnd.oci.image.manifest.v1+json"
+                || media_type == "application/vnd.docker.distribution.manifest.v2+json"
+        }
+        // A descriptor without a media type is kept as a candidate: the
+        // manifest parse downstream still fails closed on non-manifests.
+        None => true,
+    }
+}
+
+/// Picks the docker `manifest.json` entry to scan: the image whose config
+/// blob declares `linux/amd64`, otherwise the first entry.
+fn select_docker_manifest<'a>(
+    manifests: &'a [DockerManifest],
+    outer: &BTreeMap<String, Vec<u8>>,
+) -> Option<&'a DockerManifest> {
+    manifests
+        .iter()
+        .find(|manifest| {
+            outer
+                .get(&manifest.config)
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+                .is_some_and(|config| {
+                    config.get("os").and_then(Value::as_str) == Some("linux")
+                        && config.get("architecture").and_then(Value::as_str) == Some("amd64")
+                })
+        })
+        .or_else(|| manifests.first())
+}
+
 fn apply_layer(
     bytes: &[u8],
     media_type: Option<&str>,
@@ -148,25 +243,40 @@ fn apply_layer(
     filesystem: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<(), InputError> {
     let layer = read_tar_with_expanded(layer_reader(bytes, media_type)?, config, expanded)?;
-    for (path, bytes) in layer {
-        let name = base_name(&path);
+    // OCI whiteouts delete files from *lower* layers only: a `.wh.` entry
+    // must never remove a file its own layer also ships (the tar map sorts
+    // `.wh..env` after `.env`, so single-pass application deleted the
+    // just-added same-layer file). Collect removals first, apply them to
+    // the accumulated lower-layer filesystem, then insert this layer.
+    let mut opaque_dirs = Vec::new();
+    let mut removals = Vec::new();
+    for path in layer.keys() {
+        let name = base_name(path);
         if name == ".wh..wh..opq" {
-            let parent = path.rsplit_once('/').map(|v| v.0).unwrap_or_default();
-            let prefix = if parent.is_empty() {
-                String::new()
-            } else {
-                format!("{parent}/")
-            };
-            filesystem.retain(|key, _| !key.starts_with(&prefix));
+            opaque_dirs.push(path.rsplit_once('/').map(|v| v.0).unwrap_or_default());
         } else if let Some(target) = name.strip_prefix(".wh.") {
             let parent = path.rsplit_once('/').map(|v| v.0).unwrap_or_default();
-            let removed = if parent.is_empty() {
+            removals.push(if parent.is_empty() {
                 target.to_owned()
             } else {
                 format!("{parent}/{target}")
-            };
-            filesystem.retain(|key, _| key != &removed && !key.starts_with(&format!("{removed}/")));
+            });
+        }
+    }
+    for parent in opaque_dirs {
+        let prefix = if parent.is_empty() {
+            String::new()
         } else {
+            format!("{parent}/")
+        };
+        filesystem.retain(|key, _| !key.starts_with(&prefix));
+    }
+    for removed in removals {
+        filesystem.retain(|key, _| key != &removed && !key.starts_with(&format!("{removed}/")));
+    }
+    for (path, bytes) in layer {
+        let name = base_name(&path);
+        if name != ".wh..wh..opq" && !name.starts_with(".wh.") {
             filesystem.insert(path, bytes);
         }
     }
@@ -268,7 +378,11 @@ fn verify_digest(digest: &str, bytes: &[u8]) -> Result<(), InputError> {
 }
 
 fn blob_path(digest: &str) -> Result<String, InputError> {
-    let (algorithm, value) = digest
+    // Digest filenames are lowercase `algo:hex`; `verify_digest` already
+    // compares case-insensitively, so normalize the whole digest before
+    // validating and building the path.
+    let normalized = digest.to_ascii_lowercase();
+    let (algorithm, value) = normalized
         .split_once(':')
         .ok_or_else(|| InputError::MissingBlob(digest.to_owned()))?;
     if algorithm != "sha256" || value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -701,5 +815,90 @@ mod tests {
     }
     fn blob_name(digest: &str) -> String {
         format!("blobs/sha256/{}", digest.strip_prefix("sha256:").unwrap())
+    }
+
+    #[test]
+    fn oci_index_prefers_linux_amd64_and_skips_attestations() {
+        let dir = tempdir().unwrap();
+        let layer = tar_bytes(&[("requirements.txt", b"requests==2.31.0\n")]);
+        let config_json = br#"{"os":"linux","architecture":"amd64"}"#;
+        let config_digest = sha256(config_json);
+        let layer_digest = sha256(&layer);
+        let manifest = format!(
+            r#"{{"config":{{"digest":"{config_digest}"}},"layers":[{{"digest":"{layer_digest}"}}]}}"#
+        );
+        let manifest_digest = sha256(manifest.as_bytes());
+        // An attestation descriptor sorts first; the amd64 image manifest
+        // must still be the one scanned.
+        let attestation_digest = sha256(b"attestation");
+        let index = format!(
+            r#"{{"manifests":[{{"digest":"{attestation_digest}","mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.in-toto+json","platform":{{"os":"unknown","architecture":"unknown"}}}},{{"digest":"{manifest_digest}","mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#
+        );
+        let path = dir.path().join("multi.tar");
+        write_tar(
+            &path,
+            &[
+                ("oci-layout", b"{}"),
+                ("index.json", index.as_bytes()),
+                (&blob_name(&manifest_digest), manifest.as_bytes()),
+                (&blob_name(&config_digest), config_json),
+                (&blob_name(&layer_digest), &layer),
+                (&blob_name(&attestation_digest), b"attestation"),
+            ],
+        );
+        let inventory = scan_path(&path, &config()).unwrap();
+        assert!(inventory.components.values().any(|c| c.name == "requests"));
+        assert_eq!(
+            inventory.asset.metadata["manifest_digest"],
+            json!(manifest_digest)
+        );
+    }
+
+    #[test]
+    fn oci_layout_resolves_uppercase_hex_digests() {
+        let dir = tempdir().unwrap();
+        let layer = tar_bytes(&[("requirements.txt", b"requests==2.31.0\n")]);
+        let config_json = br#"{"os":"linux"}"#;
+        let config_digest = sha256(config_json);
+        let layer_digest = sha256(&layer);
+        // Some producers write uppercase-hex digest strings; the blob
+        // filenames stay spec-lowercase, so lookup must normalize like
+        // verify_digest already does.
+        let manifest = format!(
+            r#"{{"config":{{"digest":"{}"}},"layers":[{{"digest":"{}"}}]}}"#,
+            config_digest.to_uppercase(),
+            layer_digest.to_uppercase()
+        );
+        let manifest_digest = sha256(manifest.as_bytes());
+        let index = format!(
+            r#"{{"manifests":[{{"digest":"{}"}}]}}"#,
+            manifest_digest.to_uppercase()
+        );
+        let root = dir.path().join("oci-layout");
+        for (name, bytes) in [
+            ("oci-layout", b"{}".as_slice()),
+            ("index.json", index.as_bytes()),
+            (&blob_name(&manifest_digest), manifest.as_bytes()),
+            (&blob_name(&config_digest), config_json),
+            (&blob_name(&layer_digest), &layer),
+        ] {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let inventory = scan_path(&root, &config()).unwrap();
+        assert!(inventory.components.values().any(|c| c.name == "requests"));
+    }
+
+    #[test]
+    fn same_layer_dotfiles_survive_their_own_whiteouts() {
+        let layer = tar_bytes(&[(".env", b"SECRET=1\n"), (".wh..env", b"")]);
+        let mut filesystem = BTreeMap::new();
+        let mut expanded = 0;
+        apply_layer(&layer, None, &config(), &mut expanded, &mut filesystem).unwrap();
+        // `.wh..env` removes lower-layer `.env` only; the same-layer file
+        // the tar also ships must survive.
+        assert_eq!(filesystem[".env"], b"SECRET=1\n");
+        assert!(!filesystem.contains_key(".wh..env"));
     }
 }

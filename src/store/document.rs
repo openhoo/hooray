@@ -237,13 +237,13 @@ mod tests {
         let mut s = Store::open_memory().unwrap();
         let d = serde_json::json!({"deny":true});
         assert_eq!(
-            s.put_policy("default", &d, 0, "2026-01-01Z", "security")
+            s.put_policy("default", &d, 0, "2026-01-01T00:00:00Z", "security")
                 .unwrap()
                 .version,
             1
         );
         assert!(matches!(
-            s.put_policy("default", &d, 0, "2026-01-02Z", "security"),
+            s.put_policy("default", &d, 0, "2026-01-02T00:00:00Z", "security"),
             Err(StoreError::VersionConflict {
                 actual: Some(1),
                 ..

@@ -209,10 +209,13 @@ impl OperationalRiskAnalyzer {
             let metadata = EvidenceProperties::new(evidence);
             // Directness mirrors the engine scoring pass: graph depth 1 is
             // direct; roots and isolated components stay unknown.
+            // A graph built from a different inventory (API misuse) yields
+            // no classification; treat the component as unknown-directness
+            // instead of panicking.
             let kind = input
                 .graph
                 .classify(&component.identity)
-                .expect("operational risk graph is built from the analyzed inventory");
+                .unwrap_or(DependencyKind::Disconnected);
             let direct = match kind {
                 DependencyKind::Direct => Some(true),
                 DependencyKind::Transitive => Some(false),
