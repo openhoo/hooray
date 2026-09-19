@@ -152,8 +152,7 @@ async fn tier1_corpus_and_normalization() {
         return;
     }
     let text = std::fs::read_to_string(&manifest_path).expect("read corpus manifest");
-    let manifest: corpus::CorpusManifest =
-        serde_json::from_str(&text).expect("parse corpus manifest");
+    let manifest = corpus::CorpusManifest::parse(&text).expect("parse corpus manifest");
     if manifest.cases.is_empty() {
         eprintln!("tier-1 skipped: corpus manifest contains no cases");
         return;
@@ -279,8 +278,7 @@ async fn tier2_scorecard_and_drift() {
     // classifies exactly like tier-1 and `record` do.
     let manifest_path = corpus_dir().join("manifest.json");
     let manifest_text = std::fs::read_to_string(&manifest_path).expect("read corpus manifest");
-    let manifest: corpus::CorpusManifest =
-        serde_json::from_str(&manifest_text).expect("parse corpus manifest");
+    let manifest = corpus::CorpusManifest::parse(&manifest_text).expect("parse corpus manifest");
 
     for path in paths {
         let recording = Recording::load(&path).expect("recording loads and validates");

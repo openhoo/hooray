@@ -615,12 +615,7 @@ async fn run_monitor_loop<N: Notifier>(
     } else {
         service
             .run_until_shutdown(async {
-                // Same shutdown contract as the API server: SIGINT and
-                // SIGTERM both stop the loop gracefully so systemctl/docker
-                // stop does not strand claimed events.
-                if let Ok(shutdown) = hooray::api::shutdown_signal() {
-                    shutdown.await;
-                }
+                let _ = tokio::signal::ctrl_c().await;
             })
             .await?;
     }
@@ -639,17 +634,9 @@ fn run_monitor_targets(config: &Config, args: MonitorTargetsArgs) -> Result<Comm
             {
                 bail!("monitor source '{}' does not exist", args.source);
             }
-            // Store the canonical absolute path: the monitor daemon may run
-            // with a different working directory than the registering CLI,
-            // and a relative source would churn "source unreachable"
-            // reschedules forever.
-            let source = std::fs::canonicalize(&args.source)
-                .with_context(|| format!("cannot resolve monitor source '{}'", args.source))?
-                .to_string_lossy()
-                .into_owned();
             let target = MonitorTarget::new(
                 args.target_id,
-                source,
+                args.source,
                 args.interval_seconds,
                 Utc::now().timestamp(),
             )?;
@@ -822,11 +809,8 @@ impl MonitorRunner for CliMonitorRunner {
         Box::pin(async move {
             let input = ScanInput::detect(Path::new(&target.source), &self.config)
                 .map_err(|error| MonitorError::Runner(error.to_string()))?;
-            // Monitor evaluations persist to the real store so alert
-            // finding IDs resolve via `history show` / `/v1/runs/{id}` and
-            // the monitor leaves an audit trail of what it saw.
-            let mut store = Store::open(&self.config.database_path)
-                .map_err(|error| MonitorError::Runner(error.to_string()))?;
+            let mut store =
+                Store::open_memory().map_err(|error| MonitorError::Runner(error.to_string()))?;
             let mut engine = Engine::new(&self.config, &mut store, None);
             let report = engine
                 .scan(ScanRequest::new(input, self.config.policy_path.clone()))
@@ -1206,18 +1190,27 @@ mod tests {
     }
 
     #[test]
-    fn scan_target_args_parse_offline_flag() {
-        // Pins the --offline flag reaching ScanTargetArgs.offline so a
-        // future clap refactor cannot silently drop it (issue #32).
-        let cli = Cli::try_parse_from(["hooray", "scan", "project", "src", "--offline"])
-            .expect("scan project --offline parses");
-        let Command::Scan(scan) = cli.command else {
-            panic!("expected scan command")
-        };
-        let ScanCommand::Project(args) = scan.command else {
-            panic!("expected scan project")
-        };
-        assert!(args.offline);
+    fn clap_offline_flag_parses_on_every_scan_target() {
+        for command in [
+            vec!["hooray", "scan", "project", ".", "--offline"],
+            vec!["hooray", "scan", "sbom", "bom.json", "--offline"],
+            vec!["hooray", "scan", "artifact", "app.zip", "--offline"],
+            vec!["hooray", "scan", "container", "image.tar", "--offline"],
+            vec!["hooray", "scan", "auto", ".", "--offline"],
+        ] {
+            let cli = Cli::try_parse_from(command).expect("--offline parses");
+            let Command::Scan(args) = cli.command else {
+                panic!("expected scan command");
+            };
+            let offline = match args.command {
+                ScanCommand::Project(target)
+                | ScanCommand::Sbom(target)
+                | ScanCommand::Artifact(target)
+                | ScanCommand::Container(target)
+                | ScanCommand::Auto(target) => target.offline,
+            };
+            assert!(offline, "--offline must reach ScanTargetArgs.offline");
+        }
     }
 
     #[test]

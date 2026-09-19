@@ -466,6 +466,7 @@ is `hooray.db`.
 Examples:
 
 ```bash
+hooray scan project . --offline --format table
 hooray scan project . --policy hooray-policy.yaml --format table
 hooray scan project . --offline --format table
 hooray scan sbom bom.cdx.json --format cyclonedx-vex --output result.cdx.json
@@ -723,8 +724,8 @@ hooray-parity record \
 ```
 
 `normalize-xray` and `record` accept one or both of `--xray-json FILE` and
-`--xray-sbom FILE`; both also take optional `--xray-cli-version VERSION` and
-`--xray-db-date DATE` provenance flags.
+`--xray-sbom FILE`; `record` also takes optional `--xray-cli-version`,
+`--xray-version`, and `--xray-db-date` provenance flags.
 
 Tier-2 refreshes capture Xray reality in a licensed environment with the JFrog
 CLI; its JSON output feeds `--xray-json` and its CycloneDX SBOM feeds
