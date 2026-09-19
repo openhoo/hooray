@@ -468,6 +468,7 @@ Examples:
 ```bash
 hooray scan project . --offline --format table
 hooray scan project . --policy hooray-policy.yaml --format table
+hooray scan project . --offline --format table
 hooray scan sbom bom.cdx.json --format cyclonedx-vex --output result.cdx.json
 cat bom.cdx.json | hooray scan sbom - --format json-lines
 hooray scan artifact release.zip --format sarif --output hooray.sarif
@@ -498,7 +499,7 @@ history, and standalone policy-evaluation commands support JSON and YAML only.
 | `gitlab-code-quality` | GitLab Code Quality JSON |
 | `json-lines` | NDJSON envelopes for run, component, finding, policy, and summary records |
 | `csv` | RFC 4180 flat finding rows with fixed columns from `stable_finding_id` through `first_location_path` |
-| `gitlab-artifacts` | Atomic directory bundle containing all five GitLab artifacts |
+| `gitlab-artifacts` | Atomic directory bundle containing all five GitLab artifacts (Linux/Android only; other platforms return `UnsupportedAtomicPublication`) |
 
 The `gitlab-artifacts` directory contains exactly
 `gl-code-quality-report.json`, `gl-sarif-report.sarif`,
