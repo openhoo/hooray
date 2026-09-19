@@ -12,11 +12,16 @@ const FORMAT: &str = "pom.xml";
 /// (uninterpolated) field text. `scope`/`optional` stay `Option`s so a
 /// `<dependencyManagement>` default can be distinguished from an explicit
 /// value on the dependency itself.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct RawDependency {
     group_id: Option<String>,
     artifact_id: Option<String>,
     version: Option<String>,
+    /// Maven `type` (packaging of the referenced artifact, default `jar`)
+    /// and `classifier`: both participate in dependency identity, so
+    /// `junit:junit` jar and `junit:junit:test-jar:tests` are distinct.
+    type_: Option<String>,
+    classifier: Option<String>,
     scope: Option<String>,
     optional: Option<bool>,
 }
@@ -44,6 +49,8 @@ fn raw_dependency(node: &roxmltree::Node<'_, '_>) -> RawDependency {
         group_id: child_text(node, "groupId").map(str::to_owned),
         artifact_id: child_text(node, "artifactId").map(str::to_owned),
         version: child_text(node, "version").map(str::to_owned),
+        type_: child_text(node, "type").map(str::to_owned),
+        classifier: child_text(node, "classifier").map(str::to_owned),
         scope: child_text(node, "scope").map(str::to_owned),
         optional: child_text(node, "optional").map(|value| value == "true"),
     }
@@ -256,14 +263,73 @@ fn maven_scope(scope: Option<&str>, optional: bool) -> Scope {
     }
 }
 
-/// `group:artifact` merge key for dependency and dependencyManagement
-/// entries; `None` when either coordinate is absent.
+/// `group:artifact:type:classifier` merge key for dependency and
+/// dependencyManagement entries; `None` when either coordinate is absent.
+/// Type defaults to `jar` and classifier to empty, matching Maven's
+/// management-key semantics so a managed `jar` entry applies to a
+/// dependency that omits `<type>`.
 fn dependency_key(dependency: &RawDependency) -> Option<String> {
     Some(format!(
-        "{}:{}",
+        "{}:{}:{}:{}",
         dependency.group_id.as_deref()?,
-        dependency.artifact_id.as_deref()?
+        dependency.artifact_id.as_deref()?,
+        dependency.type_.as_deref().unwrap_or("jar"),
+        dependency.classifier.as_deref().unwrap_or_default(),
     ))
+}
+
+/// The `dependency_key` of a raw entry after `${property}` interpolation:
+/// `None` when any coordinate cannot be statically resolved.
+fn interpolated_dependency_key(
+    dependency: &RawDependency,
+    properties: &BTreeMap<String, String>,
+) -> Option<String> {
+    dependency_key(&RawDependency {
+        group_id: dependency
+            .group_id
+            .as_deref()
+            .and_then(|value| interpolate(value, properties)),
+        artifact_id: dependency
+            .artifact_id
+            .as_deref()
+            .and_then(|value| interpolate(value, properties)),
+        type_: dependency
+            .type_
+            .as_deref()
+            .and_then(|value| interpolate(value, properties)),
+        classifier: dependency
+            .classifier
+            .as_deref()
+            .and_then(|value| interpolate(value, properties)),
+        ..RawDependency::default()
+    })
+}
+
+/// `pkg:maven/<group>/<artifact>@<version>` with `type`/`classifier`
+/// qualifiers when the artifact is not a plain jar — a test-jar or pom
+/// artifact must not collapse into the jar component's identity.
+fn maven_purl(group: &str, artifact: &str, version: &str, dependency: &RawDependency) -> String {
+    let mut purl = crate::input::package_url("maven", &format!("{group}/{artifact}"), version);
+    let mut qualifiers = String::new();
+    if let Some(type_) = dependency.type_.as_deref().filter(|type_| *type_ != "jar") {
+        qualifiers.push_str(&format!(
+            "?type={}",
+            crate::util::percent_encode(type_, crate::util::is_purl_byte)
+        ));
+    }
+    if let Some(classifier) = dependency
+        .classifier
+        .as_deref()
+        .filter(|classifier| !classifier.is_empty())
+    {
+        let separator = if qualifiers.is_empty() { '?' } else { '&' };
+        qualifiers.push_str(&format!(
+            "{separator}classifier={}",
+            crate::util::percent_encode(classifier, crate::util::is_purl_byte)
+        ));
+    }
+    purl.push_str(&qualifiers);
+    purl
 }
 
 /// Parses a Maven `pom.xml`: direct `<dependencies>` become
@@ -296,30 +362,12 @@ pub(crate) fn parse_pom_xml(
         );
         for dependency in &model.managed {
             if let Some(key) = dependency_key(dependency) {
-                managed.insert(
-                    key,
-                    RawDependency {
-                        group_id: dependency.group_id.clone(),
-                        artifact_id: dependency.artifact_id.clone(),
-                        version: dependency.version.clone(),
-                        scope: dependency.scope.clone(),
-                        optional: dependency.optional,
-                    },
-                );
+                managed.insert(key, dependency.clone());
             }
         }
         for dependency in &model.dependencies {
             if let Some(key) = dependency_key(dependency) {
-                dependencies.insert(
-                    key,
-                    RawDependency {
-                        group_id: dependency.group_id.clone(),
-                        artifact_id: dependency.artifact_id.clone(),
-                        version: dependency.version.clone(),
-                        scope: dependency.scope.clone(),
-                        optional: dependency.optional,
-                    },
-                );
+                dependencies.insert(key, dependency.clone());
             }
         }
     }
@@ -359,17 +407,38 @@ pub(crate) fn parse_pom_xml(
         }
     }
     if let Some(version) = &version {
-        for key in [
-            "project.version",
-            "project.parent.version",
-            "pom.version",
-            "revision",
-        ] {
+        for key in ["project.version", "project.parent.version", "pom.version"] {
             properties.insert(key.to_owned(), version.clone());
         }
+        // `revision` defaults to the project version only when the version
+        // is concrete; a literal `${revision}` version must not seed a
+        // self-referential property.
+        if !version.contains("${revision}") {
+            properties
+                .entry("revision".to_owned())
+                .or_insert_with(|| version.clone());
+        }
     }
+    // Maven's CI-friendly `sha1`/`changelist` variables default to empty
+    // strings, so `${revision}${sha1}${changelist}` resolves to `revision`.
+    properties.entry("sha1".to_owned()).or_default();
+    properties.entry("changelist".to_owned()).or_default();
     properties.insert("project.artifactId".to_owned(), artifact_id.clone());
     properties.insert("pom.artifactId".to_owned(), artifact_id.clone());
+
+    // #134: dependencyManagement lookups key by *interpolated* coordinates
+    // — a managed `${project.groupId}` entry must match a literal `com.x`
+    // dependency. Re-key nearest-first so the child still wins when two raw
+    // keys interpolate to the same effective key.
+    let mut managed_lookup: BTreeMap<String, &RawDependency> = BTreeMap::new();
+    for model in chain.iter().rev() {
+        for dependency in &model.managed {
+            let Some(key) = interpolated_dependency_key(dependency, &properties) else {
+                continue;
+            };
+            managed_lookup.insert(key, dependency);
+        }
+    }
 
     let asset_version = version
         .as_deref()
@@ -429,7 +498,23 @@ pub(crate) fn parse_pom_xml(
             }));
             continue;
         };
-        let managed_entry = managed.get(&format!("{group}:{artifact}"));
+        let managed_key = interpolated_dependency_key(
+            &RawDependency {
+                group_id: Some(group.clone()),
+                artifact_id: Some(artifact.clone()),
+                type_: dependency
+                    .type_
+                    .as_deref()
+                    .and_then(|value| interpolate(value, &properties)),
+                classifier: dependency
+                    .classifier
+                    .as_deref()
+                    .and_then(|value| interpolate(value, &properties)),
+                ..RawDependency::default()
+            },
+            &properties,
+        );
+        let managed_entry = managed_key.as_ref().and_then(|key| managed_lookup.get(key));
         // `import`-scope entries only exist inside dependencyManagement and
         // are BOM references, not dependencies; skip defensively.
         let scope = dependency
@@ -467,10 +552,11 @@ pub(crate) fn parse_pom_xml(
             .optional
             .or_else(|| managed_entry.and_then(|entry| entry.optional))
             .unwrap_or(false);
-        out.add(
-            "maven",
+        let purl = maven_purl(&group, &artifact, &version, dependency);
+        out.add_with_purl(
             &format!("{group}/{artifact}"),
             &version,
+            purl,
             maven_scope(scope.as_deref(), optional),
             path,
             BTreeSet::new(),
@@ -811,7 +897,7 @@ mod tests {
         assert_eq!(pom["unresolved"], 1);
         assert_eq!(pom["unresolvedDependencies"][0]["identity"], "g:external");
         assert_eq!(pom["unresolvedManagedSources"].as_array().unwrap().len(), 1);
-        assert_eq!(pom["unresolvedManagedSources"][0]["identity"], "g:bom");
+        assert_eq!(pom["unresolvedManagedSources"][0]["identity"], "g:bom:pom:");
         assert_eq!(
             pom["unresolvedManagedSources"][0]["declaredVersion"],
             "[1,2)"
@@ -868,5 +954,181 @@ mod tests {
         // dependency still inventories.
         assert_eq!(inventory.components.len(), 1);
         assert_eq!(inventory.components.values().next().unwrap().name, "g/a");
+    }
+
+    #[test]
+    fn pom_managed_property_coordinates_match_literal_dependencies() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pom.xml"),
+            concat!(
+                "<project>
+",
+                "  <modelVersion>4.0.0</modelVersion>
+",
+                "  <groupId>com.x</groupId>
+",
+                "  <artifactId>app</artifactId>
+",
+                "  <version>1.0.0</version>
+",
+                "  <dependencyManagement>
+",
+                "    <dependencies>
+",
+                "      <dependency>
+",
+                "        <groupId>${project.groupId}</groupId>
+",
+                "        <artifactId>lib</artifactId>
+",
+                "        <version>1.2.3</version>
+",
+                "      </dependency>
+",
+                "    </dependencies>
+",
+                "  </dependencyManagement>
+",
+                "  <dependencies>
+",
+                "    <dependency>
+",
+                "      <groupId>com.x</groupId>
+",
+                "      <artifactId>lib</artifactId>
+",
+                "    </dependency>
+",
+                "  </dependencies>
+",
+                "</project>
+",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "com.x/lib" && c.version == "1.2.3"),
+            "managed ${{project.groupId}} entry must resolve the literal dependency"
+        );
+    }
+
+    #[test]
+    fn pom_type_and_classifier_distinguish_dependencies() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pom.xml"),
+            concat!(
+                "<project>
+",
+                "  <modelVersion>4.0.0</modelVersion>
+",
+                "  <groupId>com.x</groupId>
+",
+                "  <artifactId>app</artifactId>
+",
+                "  <version>1.0.0</version>
+",
+                "  <dependencies>
+",
+                "    <dependency>
+",
+                "      <groupId>junit</groupId>
+",
+                "      <artifactId>junit</artifactId>
+",
+                "      <version>4.13.2</version>
+",
+                "    </dependency>
+",
+                "    <dependency>
+",
+                "      <groupId>junit</groupId>
+",
+                "      <artifactId>junit</artifactId>
+",
+                "      <version>4.13.2</version>
+",
+                "      <type>test-jar</type>
+",
+                "      <classifier>tests</classifier>
+",
+                "    </dependency>
+",
+                "  </dependencies>
+",
+                "</project>
+",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let purls: Vec<_> = inventory
+            .components
+            .values()
+            .map(|c| c.purl.as_str())
+            .collect();
+        assert_eq!(purls.len(), 2, "jar and test-jar must both survive");
+        assert!(purls.contains(&"pkg:maven/junit/junit@4.13.2"));
+        assert!(
+            purls
+                .iter()
+                .any(|p| p.contains("type=test-jar") && p.contains("classifier=tests"))
+        );
+    }
+
+    #[test]
+    fn pom_ci_friendly_sha1_changelist_resolve() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pom.xml"),
+            concat!(
+                "<project>
+",
+                "  <modelVersion>4.0.0</modelVersion>
+",
+                "  <groupId>com.x</groupId>
+",
+                "  <artifactId>app</artifactId>
+",
+                "  <version>${revision}${sha1}${changelist}</version>
+",
+                "  <properties>
+",
+                "    <revision>1.2.3</revision>
+",
+                "  </properties>
+",
+                "  <dependencies>
+",
+                "    <dependency>
+",
+                "      <groupId>com.x</groupId>
+",
+                "      <artifactId>lib</artifactId>
+",
+                "      <version>${revision}</version>
+",
+                "    </dependency>
+",
+                "  </dependencies>
+",
+                "</project>
+",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "com.x/lib" && c.version == "1.2.3"),
+            "CI-friendly ${{revision}}${{sha1}}${{changelist}} must resolve"
+        );
     }
 }

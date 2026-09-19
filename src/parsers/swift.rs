@@ -4,7 +4,7 @@ use reqwest::Url;
 use serde_json::Value;
 
 use crate::input::{
-    InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, package_url,
+    InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, package_url, utf8,
 };
 use crate::model::Scope;
 pub(crate) fn parse_package_resolved(
@@ -12,8 +12,8 @@ pub(crate) fn parse_package_resolved(
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|e| malformed(path, "Package.resolved", e))?;
+    let value: Value = serde_json::from_str(utf8(bytes, path, "Package.resolved")?)
+        .map_err(|e| malformed(path, "Package.resolved", e))?;
     let pins = value
         .get("pins")
         .and_then(Value::as_array)
@@ -30,16 +30,33 @@ pub(crate) fn parse_package_resolved(
             .get("identity")
             .or_else(|| pin.get("package"))
             .and_then(Value::as_str);
-        let version = pin
-            .get("state")
+        let state = pin.get("state");
+        // Branch- and revision-pinned packages carry no `version`; record a
+        // `0.0.0-<branch|revision>` marker rather than dropping a real
+        // dependency from the inventory.
+        let version = state
             .and_then(|state| state.get("version"))
-            .and_then(Value::as_str);
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                state
+                    .and_then(|state| state.get("branch"))
+                    .and_then(Value::as_str)
+                    .map(|branch| format!("0.0.0-{branch}"))
+            })
+            .or_else(|| {
+                state
+                    .and_then(|state| state.get("revision"))
+                    .and_then(Value::as_str)
+                    .map(|revision| format!("0.0.0-{revision}"))
+            });
         let (Some(name), Some(version)) = (name, version) else {
             continue;
         };
         if name.is_empty() || version.is_empty() {
             continue;
         }
+        let version = version.as_str();
         let repository = pin
             .get("location")
             .or_else(|| pin.get("repositoryURL"))
@@ -118,5 +135,26 @@ mod tests {
             Some("github.com/Alamofire/Alamofire")
         );
         assert_eq!(swift_purl_name("../LocalPackage"), None);
+    }
+
+    #[test]
+    fn branch_pinned_packages_stay_in_inventory() {
+        use crate::input::{config, scan_path};
+        use std::fs;
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend_from_slice(
+            br#"{"pins":[{"identity":"branchpkg","kind":"remoteSourceControl","location":"https://github.com/org/branchpkg.git","state":{"branch":"main","revision":"abc123"}},{"identity":"versioned","kind":"remoteSourceControl","location":"https://github.com/org/versioned.git","state":{"version":"1.0.0","revision":"def456"}}]}"#,
+        );
+        fs::write(dir.path().join("Package.resolved"), bytes).unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 2);
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "branchpkg" && c.version == "0.0.0-main")
+        );
     }
 }

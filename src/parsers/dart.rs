@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_yaml::Value as Yaml;
 
+use super::yaml_str;
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::Scope;
 pub(crate) fn parse_pubspec_lock(
@@ -38,7 +39,7 @@ pub(crate) fn parse_pubspec_lock(
                 "hosted package key is not a string",
             ));
         };
-        let Some(version) = entry.get("version").and_then(Yaml::as_str) else {
+        let Some(version) = entry.get("version").and_then(yaml_str) else {
             return Err(malformed_msg(
                 path,
                 "pubspec.lock",
@@ -54,7 +55,7 @@ pub(crate) fn parse_pubspec_lock(
         } else {
             Scope::Runtime
         };
-        out.add("pub", name, version, scope, path, BTreeSet::new())?;
+        out.add("pub", name, &version, scope, path, BTreeSet::new())?;
     }
     Ok(())
 }
@@ -94,5 +95,22 @@ mod tests {
         .unwrap();
         let inventory = scan_path(dir.path(), &config()).unwrap();
         assert!(inventory.components.is_empty());
+    }
+
+    #[test]
+    fn unquoted_numeric_pubspec_versions_coerce() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pubspec.lock"),
+            "packages:\n  meta:\n    source: hosted\n    version: 1.0\n",
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "meta" && c.version == "1.0")
+        );
     }
 }
