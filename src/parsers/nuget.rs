@@ -11,11 +11,15 @@ use super::{LockComponents, child_text, resolve_lock_component, xml_doc};
 /// range notation collapses to the bare `x` so the purl carries a concrete
 /// version rather than a specifier.
 fn nuget_version(version: &str) -> &str {
-    version
+    let version = version
         .strip_prefix('[')
         .and_then(|v| v.strip_suffix(']'))
         .filter(|v| !v.contains(','))
-        .unwrap_or(version)
+        .unwrap_or(version);
+    // MSBuild property references (`$(NewtonsoftVersion)`) are not concrete
+    // versions; recording them verbatim fabricated `$` purls. `*` yields a
+    // versionless purl that matches the package across its versions.
+    if version.contains("$(") { "*" } else { version }
 }
 
 /// Parses `Directory.Packages.props`, the Central Package Management
@@ -103,8 +107,8 @@ pub(crate) fn parse_csproj(
             continue;
         };
         let Some(version) = node
-            .attribute("Version")
-            .or_else(|| node.attribute("VersionOverride"))
+            .attribute("VersionOverride")
+            .or_else(|| node.attribute("Version"))
             .or_else(|| child_text(&node, "Version"))
             .filter(|version| !version.is_empty())
         else {
@@ -173,15 +177,23 @@ pub(crate) fn parse_nuget_lock(
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|e| malformed(path, "packages.lock.json", e))?;
+    let value: Value = serde_json::from_str(utf8(bytes, path, "packages.lock.json")?)
+        .map_err(|e| malformed(path, "packages.lock.json", e))?;
     let frameworks = value
         .get("dependencies")
         .and_then(Value::as_object)
         .ok_or_else(|| malformed_msg(path, "packages.lock.json", "missing dependencies object"))?;
     let mut ids = LockComponents::new();
+    let mut entries = 0_usize;
     for packages in frameworks.values().filter_map(Value::as_object) {
         for (name, package) in packages {
+            entries += 1;
+            entry_bound(entries, path, "packages.lock.json")?;
+            // `type: "Project"` records a ProjectReference, not a package:
+            // it carries no resolved version and produces no component.
+            if package.get("type").and_then(Value::as_str) == Some("Project") {
+                continue;
+            }
             let version = package
                 .get("resolved")
                 .and_then(Value::as_str)
@@ -193,8 +205,7 @@ pub(crate) fn parse_nuget_lock(
                     )
                 })?;
             let scope = match package.get("type").and_then(Value::as_str) {
-                Some("Direct") => Scope::Runtime,
-                Some("Transitive") => Scope::Runtime,
+                Some("Direct") | Some("Transitive") | Some("CentralTransitive") => Scope::Runtime,
                 _ => Scope::Unknown,
             };
             let id = out.add(
@@ -426,6 +437,74 @@ mod tests {
             "\u{feff}<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><PackageReference Include=\"A\" Version=\"1.0\" /></ItemGroup></Project>",
         )
         .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 1);
+    }
+
+    #[test]
+    fn nuget_lock_skips_project_entries_and_scopes_central_transitive() {
+        use std::collections::BTreeSet;
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("packages.lock.json"),
+            r#"{"version":1,"dependencies":{"net8.0":{"Newtonsoft.Json":{"type":"Direct","resolved":"13.0.3"},"MyApp.Lib":{"type":"Project"},"Pinned":{"type":"CentralTransitive","resolved":"2.0.0"}}}}"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let names: BTreeSet<_> = inventory
+            .components
+            .values()
+            .map(|c| (c.name.as_str(), c.scope))
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                ("newtonsoft.json", Scope::Runtime),
+                ("pinned", Scope::Runtime)
+            ])
+        );
+    }
+
+    #[test]
+    fn nuget_property_versions_and_version_override_precedence() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("App.csproj"),
+            concat!(
+                "<Project Sdk=\"Microsoft.NET.Sdk\">\n",
+                "  <ItemGroup>\n",
+                "    <PackageReference Include=\"Prop\" Version=\"$(NewtonsoftVersion)\" />\n",
+                "    <PackageReference Include=\"Overridden\" Version=\"1.0.0\" VersionOverride=\"9.9.9\" />\n",
+                "  </ItemGroup>\n",
+                "</Project>\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let purl_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.purl.clone())
+        };
+        // $(Property) versions never fabricate a `$`/`%24` purl.
+        assert_eq!(purl_of("prop").as_deref(), Some("pkg:nuget/prop"));
+        // CPM semantics: VersionOverride wins over Version.
+        assert_eq!(
+            purl_of("overridden").as_deref(),
+            Some("pkg:nuget/overridden@9.9.9")
+        );
+    }
+
+    #[test]
+    fn nuget_lock_with_utf8_bom_parses() {
+        let dir = tempdir().unwrap();
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend_from_slice(
+            br#"{"version":1,"dependencies":{"net8.0":{"A":{"type":"Direct","resolved":"1.0.0"}}}}"#,
+        );
+        fs::write(dir.path().join("packages.lock.json"), bytes).unwrap();
         let inventory = scan_path(dir.path(), &config()).unwrap();
         assert_eq!(inventory.components.len(), 1);
     }

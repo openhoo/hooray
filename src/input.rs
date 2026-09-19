@@ -1547,10 +1547,18 @@ mod tests {
         )
         .unwrap();
         let inventory = scan_path(resolved.path(), &config()).unwrap();
-        assert_eq!(inventory.components.len(), 1);
+        // Branch-pinned packages carry no `version`; they stay in inventory
+        // under a `0.0.0-<branch>` marker rather than being dropped.
+        assert_eq!(inventory.components.len(), 2);
         assert!(inventory.components.values().any(|c| c.name == "swift-log"
             && c.version == "1.5.3"
             && c.purl == "pkg:swift/github.com/apple/swift-log@1.5.3"));
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "swift-argument-parser" && c.version == "0.0.0-main")
+        );
 
         let legacy = tempdir().unwrap();
         fs::write(
