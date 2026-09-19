@@ -542,6 +542,9 @@ consumer@1:
                 "  optionalDependencies:\n",
                 "    fsevents \"^2.3.2\"\n",
                 "\n",
+                "\"@babel/code-generator@^7.22.0\":\n",
+                "  version \"7.22.5\"\n",
+                "\n",
                 "fsevents@^2.3.2:\n",
                 "  version \"2.3.2\"\n",
             ),
@@ -567,14 +570,34 @@ consumer@1:
                 .any(|c| c.name == "kind-of" && c.version == "6.0.3")
         );
         assert!(
-            !inventory
+            inventory
                 .components
                 .values()
-                .any(|c| c.name == "@babel/code-generator")
+                .any(|c| c.name == "@babel/code-generator" && c.version == "7.22.5")
         );
-        assert_eq!(inventory.components.len(), 4);
-        assert_eq!(inventory.dependencies.len(), 2);
-        assert!(inventory.dependencies.iter().any(|e| e.optional));
+        assert_eq!(inventory.components.len(), 5);
+        let edges: BTreeSet<_> = inventory
+            .dependencies
+            .iter()
+            .map(|edge| {
+                let from = &inventory.components[&edge.from];
+                let to = &inventory.components[&edge.to];
+                (
+                    from.name.as_str(),
+                    to.name.as_str(),
+                    to.version.as_str(),
+                    edge.optional,
+                )
+            })
+            .collect();
+        assert_eq!(
+            edges,
+            BTreeSet::from([
+                ("left-pad", "kind-of", "6.0.3", false),
+                ("@babel/core", "@babel/code-generator", "7.22.5", false),
+                ("@babel/core", "fsevents", "2.3.2", true),
+            ])
+        );
 
         let berry = tempdir().unwrap();
         fs::write(
