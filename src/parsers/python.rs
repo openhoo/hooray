@@ -54,7 +54,10 @@ fn add_requirement(path: &str, line: &str, out: &mut InventoryBuilder) -> Result
     if name.is_empty() {
         // `https://…`, `./path` and bare URLs are valid requirement lines
         // that name no package.
-        if requirement.contains("://") || requirement.starts_with('.') {
+        if requirement.contains("://")
+            || requirement.starts_with('.')
+            || requirement.starts_with('/')
+        {
             return Ok(());
         }
         return Err(malformed_msg(
@@ -137,6 +140,17 @@ pub(crate) fn parse_poetry_lock(
             .get("name")
             .and_then(toml::Value::as_str)
             .ok_or_else(|| malformed_msg(path, "poetry.lock", "package missing name"))?;
+        // Non-PyPI sources (git/legacy/file/directory) must not emit
+        // pkg:pypi purls — a private or VCS package would false-match OSV
+        // advisories for the same-named PyPI package (dart.rs precedent).
+        let non_pypi = package
+            .get("source")
+            .and_then(|source| source.get("type"))
+            .and_then(toml::Value::as_str)
+            .is_some_and(|type_| type_ != "pypi");
+        if non_pypi {
+            continue;
+        }
         let version = package
             .get("version")
             .and_then(toml::Value::as_str)
@@ -185,13 +199,13 @@ pub(crate) fn parse_poetry_lock(
             path,
             BTreeSet::new(),
         )?;
-        ids.insert(name.to_ascii_lowercase(), id);
+        ids.insert(normalize_pypi_name(name), id);
     }
     for package in packages {
         let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
             continue;
         };
-        let Some(from) = ids.get(&name.to_ascii_lowercase()) else {
+        let Some(from) = ids.get(&normalize_pypi_name(name)) else {
             continue;
         };
         let Some(deps) = package.get("dependencies").and_then(toml::Value::as_table) else {
@@ -201,7 +215,7 @@ pub(crate) fn parse_poetry_lock(
             if dep == "python" {
                 continue;
             }
-            if let Some(to) = ids.get(&dep.to_ascii_lowercase()) {
+            if let Some(to) = ids.get(&normalize_pypi_name(dep)) {
                 out.edge(from, to, Scope::Runtime, false);
             }
         }
@@ -214,8 +228,8 @@ pub(crate) fn parse_pipfile_lock(
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|e| malformed(path, "Pipfile.lock", e))?;
+    let value: Value = serde_json::from_str(utf8(bytes, path, "Pipfile.lock")?)
+        .map_err(|e| malformed(path, "Pipfile.lock", e))?;
     let Some(root) = value.as_object() else {
         return Err(malformed_msg(
             path,
@@ -442,5 +456,86 @@ mod tests {
         assert_eq!(version_of("tomli").as_deref(), Some("*"));
         // Options, editable/path includes, and bare URLs produce nothing.
         assert_eq!(inventory.components.len(), 6);
+    }
+
+    #[test]
+    fn poetry_non_pypi_sources_emit_no_pypi_purls() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("poetry.lock"),
+            r#"[[package]]
+name = "public"
+version = "1.0.0"
+
+[[package]]
+name = "private"
+version = "2.0.0"
+source = {type = "git", url = "https://example.com/private.git", reference = "main", resolved_reference = "abc"}
+
+[[package]]
+name = "legacy-pkg"
+version = "3.0.0"
+source = {type = "legacy", url = "https://mirror.example.com"}
+"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 1);
+        assert_eq!(
+            inventory
+                .components
+                .values()
+                .next()
+                .map(|c| c.purl.as_str()),
+            Some("pkg:pypi/public@1.0.0")
+        );
+    }
+
+    #[test]
+    fn poetry_edges_resolve_through_normalized_names() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("poetry.lock"),
+            r#"[[package]]
+name = "app"
+version = "1.0.0"
+dependencies = {charset_normalizer = "^3"}
+
+[[package]]
+name = "charset-normalizer"
+version = "3.3.2"
+"#,
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn requirements_absolute_paths_and_includes_skip_cleanly() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("requirements.txt"),
+            "-r base.txt\n-c constraints.txt\n/opt/pkg\nrequests==2.31.0\n",
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 1);
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "requests" && c.version == "2.31.0")
+        );
+    }
+
+    #[test]
+    fn pipfile_lock_with_utf8_bom_parses() {
+        let dir = tempdir().unwrap();
+        let mut bytes = b"\xef\xbb\xbf".to_vec();
+        bytes.extend_from_slice(br#"{"default":{"requests":{"version":"==2.31.0"}}}"#);
+        fs::write(dir.path().join("Pipfile.lock"), bytes).unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert_eq!(inventory.components.len(), 1);
     }
 }
