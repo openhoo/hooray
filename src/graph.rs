@@ -13,7 +13,25 @@ pub struct DependencyGraph {
     incoming: BTreeMap<ComponentId, BTreeSet<ComponentId>>,
     connected_roots: BTreeSet<ComponentId>,
     depth_from_root: BTreeMap<ComponentId, usize>,
+    /// Synthesized project-root node for inventories whose lockfiles emit
+    /// edges but no project component (npm/Yarn/pnpm/bun/Poetry/bundler/
+    /// NuGet lockfiles): the virtual root parents every dependency root so
+    /// real direct dependencies classify `Direct` instead of `Disconnected`.
+    /// It is never a member of `inventory.components` and is stripped from
+    /// emitted paths.
+    virtual_root: Option<ComponentId>,
 }
+
+/// Asset metadata flag set by `InventoryBuilder` when a lockfile claimed the
+/// asset identity but no component matches it — the project root is not a
+/// locked package, so dependency roots are direct dependencies.
+pub const VIRTUAL_ROOT_METADATA: &str = "hooray:virtual-root";
+
+/// Total node-expansion budget for `all_paths`: collected paths are capped
+/// by `max_paths`, but a dense DAG can force exponentially many partial
+/// paths before the cap fills, so the traversal itself is work-bounded and
+/// reports truncation once the budget is spent.
+const MAX_PATH_EXPANSIONS: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GraphError {
@@ -31,16 +49,66 @@ struct PathCollection<'a> {
     max_paths: usize,
     paths: Vec<DependencyPath>,
     truncated: bool,
+    /// Node expansions spent so far; bounded by `MAX_PATH_EXPANSIONS`.
+    expansions: usize,
 }
 
 impl DependencyGraph {
     pub fn from_inventory(inventory: &Inventory) -> Result<Self, GraphError> {
-        Self::new(
+        let mut graph = Self::new(
             inventory.components.keys().cloned(),
             &inventory.dependencies,
-        )
+        )?;
+        if inventory
+            .asset
+            .metadata
+            .get(VIRTUAL_ROOT_METADATA)
+            .is_some_and(|flag| flag == &serde_json::Value::Bool(true))
+        {
+            graph.add_virtual_root();
+        }
+        Ok(graph)
     }
 
+    /// Parents every dependency root under a synthesized project-root node:
+    /// lockfiles that claim an asset identity without locking the project
+    /// itself (npm-family, bundler, NuGet, …) treat their roots as direct
+    /// dependencies, so depth 1 becomes `Direct` and deeper stays
+    /// `Transitive`. Inventories that lock the project as a component
+    /// (Cargo) never set the flag and keep the legacy depth mapping.
+    fn add_virtual_root(&mut self) {
+        let virtual_root =
+            ComponentId::new("hooray:virtual-root").expect("static virtual root id is valid");
+        let dependency_roots: Vec<ComponentId> = self
+            .nodes
+            .iter()
+            .filter(|node| self.incoming[*node].is_empty())
+            .cloned()
+            .collect();
+        self.nodes.insert(virtual_root.clone());
+        self.outgoing.insert(
+            virtual_root.clone(),
+            dependency_roots.iter().cloned().collect(),
+        );
+        self.incoming.insert(virtual_root.clone(), BTreeSet::new());
+        for root in dependency_roots {
+            self.incoming
+                .get_mut(&root)
+                .expect("root node exists")
+                .insert(virtual_root.clone());
+        }
+        self.connected_roots = BTreeSet::from([virtual_root.clone()]);
+        self.depth_from_root = shortest_depths(&self.connected_roots, &self.outgoing);
+        self.virtual_root = Some(virtual_root);
+    }
+
+    /// Strips the synthesized root from an emitted path; the node exists
+    /// only to anchor classification and must not leak into reports.
+    fn strip_virtual_root(&self, components: &mut Vec<ComponentId>) {
+        if self.virtual_root.as_ref() == components.first() {
+            components.remove(0);
+        }
+    }
     pub fn new(
         nodes: impl IntoIterator<Item = ComponentId>,
         edges: &BTreeSet<DependencyEdge>,
@@ -84,6 +152,7 @@ impl DependencyGraph {
             incoming,
             connected_roots,
             depth_from_root,
+            virtual_root: None,
         })
     }
 
@@ -125,6 +194,7 @@ impl DependencyGraph {
                     components.push(component);
                 }
                 components.reverse();
+                self.strip_virtual_root(&mut components);
                 return Ok(Some(DependencyPath { components }));
             }
             for next in &self.outgoing[&node] {
@@ -154,6 +224,7 @@ impl DependencyGraph {
             max_paths,
             paths: Vec::new(),
             truncated: false,
+            expansions: 0,
         };
         let mut roots = self.connected_roots().iter().cloned();
         while let Some(root) = roots.next() {
@@ -185,11 +256,19 @@ impl DependencyGraph {
         let node = current.last().unwrap();
         if node == collection.target {
             if collection.paths.len() < collection.max_paths {
-                collection.paths.push(DependencyPath {
-                    components: current.clone(),
-                });
+                let mut components = current.clone();
+                self.strip_virtual_root(&mut components);
+                collection.paths.push(DependencyPath { components });
             }
             return collection.truncated && collection.paths.len() == collection.max_paths;
+        }
+        // Work bound: a dense DAG can force exponentially many partial
+        // paths before `max_paths` fills, so expansions are budgeted and
+        // exhaustion reports truncation instead of pinning the scan.
+        collection.expansions += 1;
+        if collection.expansions >= MAX_PATH_EXPANSIONS {
+            collection.truncated = true;
+            return true;
         }
         if current.len() > collection.max_depth {
             if self.can_reach(node, collection.target, current) {

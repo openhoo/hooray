@@ -1,12 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    fs,
     future::Future,
+    io::{self, Read},
     path::{Path, PathBuf},
     pin::Pin,
     time::Duration,
 };
+
+#[cfg(test)]
+use std::fs;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
@@ -343,21 +346,31 @@ impl<'a> Engine<'a> {
 }
 
 pub fn load_policy(path: &Path) -> Result<Policy, EngineError> {
-    let metadata = fs::metadata(path).map_err(|source| EngineError::PolicyRead {
-        path: path.to_owned(),
-        source,
-    })?;
-    if metadata.len() > MAX_POLICY_BYTES {
+    // Open with the same nofollow + regular-file contract as every other
+    // input reader, then bound the read stream itself: a pre-stat size check
+    // alone is a TOCTOU window, and a FIFO/device path would block forever.
+    let file =
+        crate::input::open_regular_nofollow(path).map_err(|source| EngineError::PolicyRead {
+            path: path.to_owned(),
+            source: match source {
+                crate::input::InputError::Io { source, .. } => source,
+                other => io::Error::other(other.to_string()),
+            },
+        })?;
+    let mut contents = String::new();
+    file.take(MAX_POLICY_BYTES.saturating_add(1))
+        .read_to_string(&mut contents)
+        .map_err(|source| EngineError::PolicyRead {
+            path: path.to_owned(),
+            source,
+        })?;
+    if contents.len() as u64 > MAX_POLICY_BYTES {
         return Err(EngineError::PolicyTooLarge {
             path: path.to_owned(),
-            actual: metadata.len(),
+            actual: contents.len() as u64,
             maximum: MAX_POLICY_BYTES,
         });
     }
-    let contents = fs::read_to_string(path).map_err(|source| EngineError::PolicyRead {
-        path: path.to_owned(),
-        source,
-    })?;
     match path
         .extension()
         .and_then(OsStr::to_str)
@@ -474,6 +487,21 @@ fn license_findings(
     inventory: &Inventory,
     config: &Config,
 ) -> Result<Vec<Finding>, license::LicenseError> {
+    // Archive inputs carry their members in memory: evaluate license-shaped
+    // files from the extracted set instead of walking a filesystem root.
+    if let Some(files) = input
+        .virtual_files(config)
+        .map_err(|error| license::LicenseError::Io {
+            path: input_path(input).to_owned(),
+            source: io::Error::other(error.to_string()),
+        })?
+    {
+        let files = files
+            .into_iter()
+            .filter(|(_, bytes)| bytes.len() as u64 <= config.max_input_bytes.min(8 * 1024 * 1024))
+            .collect();
+        return Ok(license::analyze_with_files(inventory, files)?.findings);
+    }
     let root = match input {
         ScanInput::ProjectDirectory(path) | ScanInput::OciImageLayout(path) => Some(path.as_path()),
         _ => None,
@@ -499,12 +527,46 @@ fn filesystem_findings(
         max_archive_uncompressed_bytes: config.max_archive_bytes,
         ..ScannerConfig::default()
     };
-    let output = scanners::scan_path(
-        path,
-        &inventory.asset.id,
-        &scanner_config,
-        &MalwareSignatures::default(),
-    )?;
+    let output = if let Some(files) =
+        input
+            .virtual_files(config)
+            .map_err(|error| scanners::ScanError::Read {
+                path: input_path(input).to_owned(),
+                source: io::Error::other(error.to_string()),
+            })? {
+        // Archive members exist only in memory: run the same analyzers over
+        // the extracted set under the scanner's file/total budgets.
+        let mut merged = scanners::ScanOutput::default();
+        let mut total = 0_u64;
+        for (member, bytes) in &files {
+            if merged.scanned_files >= scanner_config.max_files
+                || total.saturating_add(bytes.len() as u64) > scanner_config.max_total_bytes
+            {
+                merged.skipped_files += 1;
+                continue;
+            }
+            total += bytes.len() as u64;
+            let output = scanners::analyze_bytes(
+                member,
+                bytes,
+                &inventory.asset.id,
+                &scanner_config,
+                &MalwareSignatures::default(),
+            );
+            merged.locations.extend(output.locations);
+            merged.findings.extend(output.findings);
+            merged.scanned_files += 1;
+            merged.scanned_bytes += bytes.len() as u64;
+        }
+        merged
+    } else {
+        scanners::scan_path(
+            path,
+            &inventory.asset.id,
+            &scanner_config,
+            &MalwareSignatures::default(),
+        )?
+    };
     let scanners::ScanOutput {
         locations,
         mut findings,

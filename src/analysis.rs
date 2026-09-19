@@ -37,6 +37,9 @@ pub struct OsvEvent {
 pub struct OsvAffectedRange {
     pub range_type: OsvRangeType,
     pub ecosystem: Option<String>,
+    /// Explicitly enumerated affected versions from `affected[].versions`;
+    /// exact membership is an affected verdict alongside `events`.
+    pub versions: Vec<String>,
     pub events: Vec<OsvEvent>,
 }
 
@@ -417,12 +420,40 @@ fn evaluate_range(
     if version.trim().is_empty() {
         return RangeOutcome::Unknown("component version is absent".to_owned());
     }
+    // `affected[].versions` enumerates exact affected versions; membership
+    // is an affected verdict on its own, even when the range carries no
+    // events.
+    if range
+        .versions
+        .iter()
+        .any(|listed| listed.trim() == version.trim())
+    {
+        return RangeOutcome::Affected(format!(
+            "component version {version} is explicitly enumerated as affected"
+        ));
+    }
     if range.events.is_empty() {
-        return RangeOutcome::Unknown("OSV range contains no events".to_owned());
+        return if range.versions.is_empty() {
+            RangeOutcome::Unknown("OSV range contains no events".to_owned())
+        } else {
+            RangeOutcome::NotAffected(format!(
+                "component version {version} is not among the explicitly enumerated affected versions"
+            ))
+        };
     }
 
+    // OSV says events SHOULD be sorted by version boundary, but producers
+    // do not always comply; sort a copy so document order cannot change the
+    // verdict. The stable sort keeps the original order for events whose
+    // boundaries cannot be compared.
+    let mut events: Vec<&OsvEvent> = range.events.iter().collect();
+    events.sort_by(|left, right| {
+        compare_boundaries(scoped, &event_boundary(left), &event_boundary(right))
+            .unwrap_or(Ordering::Equal)
+    });
+
     let mut state = RangeState::default();
-    for event in &range.events {
+    for event in events {
         if let Some(outcome) = apply_event(&mut state, event, version_parts, version, scoped) {
             return outcome;
         }
@@ -430,11 +461,45 @@ fn evaluate_range(
     state.outcome(version)
 }
 
+/// Sort key for one OSV event: its version boundary, whichever field carries
+/// it. Events with no boundary sort equal and keep document order.
+fn event_boundary(event: &OsvEvent) -> String {
+    event
+        .introduced
+        .as_deref()
+        .or(event.fixed.as_deref())
+        .or(event.last_affected.as_deref())
+        .or(event.limit.as_deref())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Orders two OSV event boundaries: the scoped comparator when both parse,
+/// else the legacy token heuristic; `None` when either side is incomparable.
+fn compare_boundaries(
+    scoped: Option<&ScopedOrdering>,
+    left: &str,
+    right: &str,
+) -> Option<Ordering> {
+    if let Some(scoped) = scoped
+        && let (Some(a), Some(b)) = (
+            VersionKey::parse(scoped.ecosystem, left),
+            VersionKey::parse(scoped.ecosystem, right),
+        )
+    {
+        return Some(a.cmp(&b));
+    }
+    compare_version_parts(version_parts(left).as_deref(), right)
+}
+
 /// Version-range walk state for one OSV affected range.
 #[derive(Debug, Default)]
 struct RangeState<'a> {
     active: bool,
     saw_comparable: bool,
+    /// Whether any `introduced` event was seen; ranges without one cannot
+    /// yield a confident negative verdict.
+    saw_introduced: bool,
     crossed_fixed: Option<&'a str>,
     crossed_last_affected: Option<&'a str>,
 }
@@ -455,6 +520,7 @@ impl<'a> RangeState<'a> {
         version_parts: Option<&[String]>,
         introduced: &str,
     ) {
+        self.saw_introduced = true;
         if let Some(ordering) = compare_scoped(scoped, version_parts, introduced) {
             self.saw_comparable = true;
             if ordering != Ordering::Less {
@@ -516,6 +582,13 @@ impl<'a> RangeState<'a> {
 
     /// Resolves the final outcome once every event has been applied.
     fn outcome(self, version: &str) -> RangeOutcome {
+        // The OSV spec requires at least one `introduced` event; without one
+        // the range is malformed and must not produce a confident verdict.
+        if !self.saw_introduced {
+            return RangeOutcome::Unknown(format!(
+                "OSV range for component version {version} declares no introduced event"
+            ));
+        }
         if self.active {
             RangeOutcome::Affected(format!(
                 "component version {version} falls within the supplied OSV event interval"
@@ -613,7 +686,18 @@ fn compare_version_identifiers(lhs: &str, rhs: &str) -> Ordering {
         // Numeric identifiers rank below alphanumeric ones (semver rule 11).
         (Ok(_), Err(_)) => Ordering::Less,
         (Err(_), Ok(_)) => Ordering::Greater,
-        (Err(_), Err(_)) => lhs.cmp(rhs),
+        (Err(_), Err(_)) => {
+            // Digit runs too long for u64 still compare numerically: length
+            // first, then lexicographically (equal-length digit strings order
+            // like their values).
+            match (
+                lhs.bytes().all(|b| b.is_ascii_digit()),
+                rhs.bytes().all(|b| b.is_ascii_digit()),
+            ) {
+                (true, true) => lhs.len().cmp(&rhs.len()).then_with(|| lhs.cmp(rhs)),
+                _ => lhs.cmp(rhs),
+            }
+        }
     }
 }
 
@@ -858,6 +942,7 @@ mod tests {
         vec![OsvAffectedRange {
             range_type: OsvRangeType::Semver,
             ecosystem: Some("cargo".into()),
+            versions: Vec::new(),
             events,
         }]
     }
@@ -903,6 +988,7 @@ mod tests {
         let ranges = vec![OsvAffectedRange {
             range_type: OsvRangeType::Semver,
             ecosystem: Some(purl_type.into()),
+            versions: Vec::new(),
             events,
         }];
         ApplicabilityAnalyzer::analyze(ApplicabilityInput {
@@ -1018,6 +1104,7 @@ mod tests {
         let git = [OsvAffectedRange {
             range_type: OsvRangeType::Git,
             ecosystem: Some("cargo".into()),
+            versions: Vec::new(),
             events: vec![OsvEvent {
                 introduced: Some("abc".into()),
                 ..OsvEvent::default()
@@ -1080,6 +1167,7 @@ mod tests {
             OsvAffectedRange {
                 range_type: OsvRangeType::Semver,
                 ecosystem: Some("cargo".into()),
+                versions: Vec::new(),
                 events: vec![OsvEvent {
                     introduced: Some("0".into()),
                     ..OsvEvent::default()
@@ -1088,6 +1176,7 @@ mod tests {
             OsvAffectedRange {
                 range_type: OsvRangeType::Git,
                 ecosystem: Some("cargo".into()),
+                versions: Vec::new(),
                 events: vec![OsvEvent {
                     introduced: Some("abc".into()),
                     ..OsvEvent::default()
