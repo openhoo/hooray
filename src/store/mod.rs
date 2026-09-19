@@ -307,7 +307,12 @@ fn create_private_database_if_missing(_path: &Path) -> Result<(), StoreError> {
 fn configure_connection(c: &Connection, wal: bool) -> Result<(), rusqlite::Error> {
     c.busy_timeout(BUSY_TIMEOUT)?;
     c.pragma_update(None, "foreign_keys", "ON")?;
-    c.pragma_update(None, "synchronous", "NORMAL")?;
+    // FULL (not NORMAL): under WAL, NORMAL only checkpoints on sync and can
+    // lose the last committed transaction(s) on power loss. This store holds
+    // the audit trail (`audit_events`, `retention_events`), whose entire
+    // purpose is a durable record, so every commit must reach stable storage.
+    // Under WAL the extra cost of FULL is one WAL fsync per commit.
+    c.pragma_update(None, "synchronous", "FULL")?;
     if wal {
         c.pragma_update(None, "journal_mode", "WAL")?;
     }
@@ -693,6 +698,22 @@ mod tests {
                 .unwrap(),
             "ok"
         );
+    }
+    #[test]
+    fn connections_require_full_synchronous_for_commit_durability() {
+        // synchronous=FULL (2) is the durability contract: NORMAL (1) under
+        // WAL can drop the last committed audit/retention rows on power loss.
+        let dir = tempdir().unwrap();
+        let file_store = Store::open(dir.path().join("db")).unwrap();
+        for store in [file_store, Store::open_memory().unwrap()] {
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+        }
     }
     #[test]
     fn pagination_rejects_zero_oversize_and_unrepresentable_offsets() {
