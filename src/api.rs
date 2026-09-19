@@ -37,7 +37,7 @@ use crate::{
     },
     graph::DependencyGraph,
     license,
-    model::{Finding, FindingKind, Inventory, RunId, ScanReport, Severity},
+    model::{Finding, FindingKind, Inventory, RunId, ScanReport, Scope, Severity},
     monitor::FindingDiff,
     osv::{OsvClient, OsvError},
     policy::{Policy, PolicyException},
@@ -356,11 +356,9 @@ async fn list_runs(
     page.validate()?;
     let limit = page.limit;
     let offset = page.offset;
-    let runs = store_call(&state, move |store| store.list_runs(limit, offset)).await?;
-    let runs = runs
-        .iter()
-        .map(sanitize_api_report)
-        .collect::<Result<Vec<_>, _>>()?;
+    // Run summaries only: deserializing up to 1000 full reports per
+    // request would let a single GET force multi-hundred-MB allocations.
+    let runs = store_call(&state, move |store| store.list_run_summaries(limit, offset)).await?;
     Ok(Json(json!({
         "version": API_VERSION,
         "limit": limit,
@@ -498,12 +496,27 @@ async fn query_inventory(
     ] {
         validate_filter(name, value)?;
     }
+    // `scope` is validated against the Scope enum like `kind`/`severity`:
+    // an unknown value must 400, not silently return an empty page.
+    let scope = query
+        .scope
+        .as_deref()
+        .map(|value| {
+            serde_json::from_value::<Scope>(Value::String(value.to_owned()))
+                .map_err(|error| ApiError::bad_request("invalid_filter", error.to_string()))
+        })
+        .transpose()?;
     let filter = InventoryFilter {
         asset_id: query.asset_id,
         component_id: query.component_id,
         name: query.name,
         purl: query.purl,
-        scope: query.scope,
+        scope: scope.and_then(|value| {
+            serde_json::to_value(value)
+                .ok()?
+                .as_str()
+                .map(str::to_owned)
+        }),
         ..Default::default()
     };
     let limit = query.limit;
@@ -1812,18 +1825,19 @@ mod tests {
             assert!(!body.contains("finding-secret"), "{path}: {body}");
             assert!(!body.contains("run-secret"), "{path}: {body}");
             assert!(!body.contains("asset-secret"), "{path}: {body}");
-            assert!(body.contains("[REDACTED]"), "{path}: {body}");
-            assert!(
-                body.contains("visible") || path.ends_with("inventory"),
-                "{path}: {body}"
-            );
-            if path == "/v1/runs"
-                || path == "/v1/runs/run:sensitive"
-                || path == "/v1/reports/run:sensitive"
-            {
+            // /v1/runs returns bounded summaries without report metadata, so
+            // the redaction sentinel only appears on full-report routes.
+            if path != "/v1/runs" {
+                assert!(body.contains("[REDACTED]"), "{path}: {body}");
+                assert!(
+                    body.contains("visible") || path.ends_with("inventory"),
+                    "{path}: {body}"
+                );
+            }
+            if path == "/v1/runs/run:sensitive" || path == "/v1/reports/run:sensitive" {
                 assert!(body.contains("main"), "{path}: {body}");
             }
-            if !path.ends_with("findings") && path != "/v1/findings" {
+            if !path.ends_with("findings") && path != "/v1/findings" && path != "/v1/runs" {
                 assert!(body.contains("eu"), "{path}: {body}");
             }
         }
