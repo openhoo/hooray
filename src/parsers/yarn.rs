@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_yaml::Value as Yaml;
 
-use super::{split_descriptor, yaml_str};
+use super::{split_descriptor, yaml_doc, yaml_str};
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::{ComponentId, Scope};
 struct YarnEntry {
@@ -122,7 +122,7 @@ fn parse_yarn_classic(
 }
 
 fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Result<(), InputError> {
-    let doc: Yaml = serde_yaml::from_str(text).map_err(|e| malformed(path, "yarn.lock", e))?;
+    let doc: Yaml = yaml_doc(text, path, "yarn.lock")?;
     let Some(root) = doc.as_mapping() else {
         return Err(malformed_msg(
             path,

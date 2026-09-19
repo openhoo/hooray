@@ -2,16 +2,15 @@ use std::collections::BTreeSet;
 
 use serde_yaml::Value as Yaml;
 
-use super::yaml_str;
-use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
+use super::{yaml_doc, yaml_str};
+use crate::input::{InputError, InventoryBuilder, entry_bound, malformed_msg, utf8};
 use crate::model::Scope;
 pub(crate) fn parse_pubspec_lock(
     path: &str,
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "pubspec.lock")?)
-        .map_err(|e| malformed(path, "pubspec.lock", e))?;
+    let doc: Yaml = yaml_doc(utf8(bytes, path, "pubspec.lock")?, path, "pubspec.lock")?;
     let Some(packages) = doc.get("packages").and_then(Yaml::as_mapping) else {
         return Err(malformed_msg(
             path,

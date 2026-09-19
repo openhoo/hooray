@@ -15,6 +15,7 @@ use thiserror::Error;
 use zip::ZipArchive;
 
 use crate::filesystem::repository_walk;
+use crate::input::yaml_expansion_within_budget;
 use crate::model::{
     Applicability, ApplicabilityStatus, AssetId, Confidence, Evidence, Finding, FindingKind,
     FindingStatus, Location, Position, Remediation, Risk, RuleId, Severity, stable_finding_id,
@@ -1692,9 +1693,16 @@ fn scan_structured_iac(text: &str, extension: &str, builder: &mut FindingBuilder
     }
     let mut dropped_documents = 0_usize;
     for (document_text, document_offset) in split_yaml_documents(parse_text) {
-        let parsed = serde_yaml::from_str::<serde_yaml::Value>(&document_text)
-            .ok()
-            .and_then(|value| serde_json::to_value(value).ok());
+        // serde_yaml deep-copies anchored subtrees per alias, so expansion
+        // is quadratic in input size; over-budget documents are rejected
+        // before that memory is allocated, like any unparseable document.
+        let parsed = if yaml_expansion_within_budget(&document_text) {
+            serde_yaml::from_str::<serde_yaml::Value>(&document_text)
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok())
+        } else {
+            None
+        };
         match parsed {
             Some(document) => {
                 let index = yaml_path_index(&document_text);

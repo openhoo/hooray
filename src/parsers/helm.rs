@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use serde_yaml::Value as Yaml;
 
-use super::yaml_str;
-use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
+use super::{yaml_doc, yaml_str};
+use crate::input::{InputError, InventoryBuilder, entry_bound, malformed_msg, utf8};
 use crate::model::Scope;
 pub(crate) fn parse_chart_yaml(
     path: &str,
@@ -11,8 +11,7 @@ pub(crate) fn parse_chart_yaml(
     lock: Option<&Vec<u8>>,
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "Chart.yaml")?)
-        .map_err(|e| malformed(path, "Chart.yaml", e))?;
+    let doc: Yaml = yaml_doc(utf8(bytes, path, "Chart.yaml")?, path, "Chart.yaml")?;
     let name = doc
         .get("name")
         .and_then(Yaml::as_str)
@@ -94,8 +93,7 @@ pub(crate) fn parse_chart_lock(
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "Chart.lock")?)
-        .map_err(|e| malformed(path, "Chart.lock", e))?;
+    let doc: Yaml = yaml_doc(utf8(bytes, path, "Chart.lock")?, path, "Chart.lock")?;
     let dependencies = doc
         .get("dependencies")
         .and_then(Yaml::as_sequence)
