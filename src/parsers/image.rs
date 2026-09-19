@@ -746,14 +746,13 @@ mod tests {
 
         // An object-shaped (or unparseable) manifest.json is a web app
         // manifest or garbage, not a docker-save archive: detection falls
-        // back to archive scanning, which rejects the tar as unsupported
-        // instead of the image parser's Malformed.
+        // back to archive scanning, which yields an empty inventory for a
+        // recognized container with no lockfiles.
         let path = dir.path().join("web-manifest.tar");
         write_tar(&path, &[("manifest.json", br#"{"name":"app"}"#)]);
-        assert!(matches!(
-            scan_path(&path, &config()),
-            Err(InputError::UnsupportedFormat(_))
-        ));
+        let inventory = scan_path(&path, &config()).unwrap();
+        assert!(inventory.components.is_empty());
+        assert!(inventory.dependencies.is_empty());
 
         let claimed = digest(8);
         let index = format!(r#"{{"manifests":[{{"digest":"{claimed}"}}]}}"#);

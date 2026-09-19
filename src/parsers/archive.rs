@@ -374,10 +374,9 @@ mod tests {
 
         let empty_path = dir.path().join("empty.tar");
         write_tar(&empty_path, &[]);
-        assert!(matches!(
-            scan_path(&empty_path, &config()),
-            Err(InputError::UnsupportedFormat(_))
-        ));
+        let inventory = scan_path(&empty_path, &config()).unwrap();
+        assert!(inventory.components.is_empty());
+        assert!(inventory.dependencies.is_empty());
     }
     #[test]
     fn zip_enforces_entry_count_size_links_and_ignores_directories() {
