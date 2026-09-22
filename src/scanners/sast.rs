@@ -35,7 +35,9 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
         &[
             SastRuleSpec {
                 rule: "sast.rust.command-shell",
-                pattern: r#"\bCommand\s*::\s*new\s*\(\s*["'](?:sh|bash|cmd|powershell)["']\s*\)\s*\.\s*arg\s*\(\s*["'](?:-c|/C|Command)["']\s*\)\s*\.\s*arg\s*\("#,
+                // Path-prefixed shells allowed; the chained-call shape is
+                // verified in emit (flag argument + dynamic command arg).
+                pattern: r#"\bCommand\s*::\s*new\s*\(\s*["'](?:[A-Za-z]:)?(?:[\\/][A-Za-z0-9_.-]+)*[\\/]?(?:sh|bash|cmd|powershell|pwsh)(?:\.exe)?["']\s*\)(?:\s*\.\s*\w+\s*\([^()\n]*\))+"#,
                 summary: "Dynamic shell command execution",
                 cwe: "CWE-78",
                 severity: Severity::High,
@@ -43,7 +45,16 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.rust.sql-format",
-                pattern: r#"(?s)\b(?:query|execute)\s*\(\s*&?format!\s*\(\s*["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)\b"#,
+                pattern: r#"(?s)\b(?:query|execute)\s*\(\s*&?format!\s*\(\s*["'][^"']*(?i:SELECT|INSERT|UPDATE|DELETE)\b"#,
+                summary: "Formatted SQL passed to a database API",
+                cwe: "CWE-89",
+                severity: Severity::High,
+                remediation: "Use parameterized queries and bind every untrusted value.",
+            },
+            SastRuleSpec {
+                rule: "sast.rust.sql-format",
+                // Bare format! building a SQL statement with arguments.
+                pattern: r#"\bformat!\s*\(\s*["'][^"']*(?i:select|insert|update|delete)\b[^"']*["']\s*,"#,
                 summary: "Formatted SQL passed to a database API",
                 cwe: "CWE-89",
                 severity: Severity::High,
@@ -51,7 +62,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.rust.weak-hash-md5",
-                pattern: r"\bMd5\s*::\s*new\s*\(",
+                pattern: r"\b(?:Md5\s*::\s*(?:new|default)|md5\s*::\s*compute)\s*\(",
                 summary: "MD5 hash construction",
                 cwe: "CWE-327",
                 severity: Severity::Medium,
@@ -59,7 +70,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.rust.weak-hash-sha1",
-                pattern: r"\bSha1\s*::\s*new\s*\(",
+                pattern: r"\b(?:Sha1\s*::\s*(?:new|default)|sha1\s*::\s*compute)\s*\(",
                 summary: "SHA-1 hash construction",
                 cwe: "CWE-327",
                 severity: Severity::Medium,
@@ -68,7 +79,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
         ],
     ),
     (
-        &["js", "jsx", "ts", "tsx"],
+        &["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"],
         &[
             SastRuleSpec {
                 rule: "sast.javascript.eval-dynamic",
@@ -79,12 +90,14 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
                 remediation: "Replace dynamic evaluation with explicit parsing and a fixed dispatch table.",
             },
             SastRuleSpec {
-                rule: "sast.javascript.exec-dynamic",
-                pattern: r#"(?m)(?:^|[^.A-Za-z0-9_$])(?:exec|execSync)\s*\(\s*(?:`[^`]*\$\{|[^"'`])"#,
-                summary: "Dynamic command execution",
-                cwe: "CWE-78",
+                rule: "sast.javascript.timer-eval",
+                // String arguments to timers evaluate like eval; function
+                // references are filtered in emit.
+                pattern: r#"\bset(?:Timeout|Interval)\s*\(\s*["'`]"#,
+                summary: "Timer evaluates a string as code",
+                cwe: "CWE-95",
                 severity: Severity::High,
-                remediation: "Use spawn/execFile with a fixed executable and validated argument array.",
+                remediation: "Pass a function reference to setTimeout/setInterval, never a string.",
             },
             SastRuleSpec {
                 rule: "sast.javascript.sql-template",
@@ -96,7 +109,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.javascript.weak-hash",
-                pattern: r#"\bcreateHash\s*\(\s*["'](md5|sha1)["']\s*\)"#,
+                pattern: r#"(?i)\bcreateHash\s*\(\s*["'](?:md5|sha-?1)["']"#,
                 summary: "Weak hash algorithm selected",
                 cwe: "CWE-327",
                 severity: Severity::Medium,
@@ -105,7 +118,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
         ],
     ),
     (
-        &["py"],
+        &["py", "pyi"],
         &[
             SastRuleSpec {
                 rule: "sast.python.eval-dynamic",
@@ -117,15 +130,25 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.python.shell-true",
-                pattern: r"\bsubprocess\.(?:run|call|Popen|check_output)\s*\([^\)]*\bshell\s*=\s*True",
+                pattern: r"\bsubprocess\.(?:run|call|Popen|check_output|check_call|getstatusoutput)\s*\([^\)]*\bshell\s*=\s*True",
                 summary: "Python subprocess enables a command shell",
                 cwe: "CWE-78",
                 severity: Severity::High,
                 remediation: "Set shell=False and pass a fixed executable plus a validated argument list.",
             },
             SastRuleSpec {
+                rule: "sast.python.os-command",
+                // os.system/os.popen/subprocess.getoutput always invoke a
+                // shell; literal commands are filtered in emit.
+                pattern: r#"\b(?:os\.(?:system|popen)|subprocess\.getoutput)\s*\("#,
+                summary: "OS command execution through a shell",
+                cwe: "CWE-78",
+                severity: Severity::High,
+                remediation: "Use subprocess with a fixed executable and a validated argument list instead of a shell string.",
+            },
+            SastRuleSpec {
                 rule: "sast.python.sql-format",
-                pattern: r#"(?i)\.execute\s*\(\s*(?:f["']|["'][^"']*(?:select|insert|update|delete)[^"']*["']\s*(?:%|\.format\s*\())"#,
+                pattern: r#"(?i)\.(?:execute|executemany|executescript)\s*\(\s*(?:[fF]["']|["'][^"']*(?:select|insert|update|delete)[^"']*["']\s*(?:%|\.format\s*\(|\+))"#,
                 summary: "Formatted SQL execution",
                 cwe: "CWE-89",
                 severity: Severity::High,
@@ -133,7 +156,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.python.weak-hash-md5",
-                pattern: r"\bhashlib\.md5\s*\(",
+                pattern: r#"(?:\bhashlib\s*\.\s*(?:md5\s*\(|new\s*\(\s*["']md5["'])|(?:^|[^.\w])md5\s*\()"#,
                 summary: "MD5 hash usage",
                 cwe: "CWE-327",
                 severity: Severity::Medium,
@@ -141,7 +164,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.python.weak-hash-sha1",
-                pattern: r"\bhashlib\.sha1\s*\(",
+                pattern: r#"(?:\bhashlib\s*\.\s*(?:sha1\s*\(|new\s*\(\s*["']sha-?1["'])|(?:^|[^.\w])sha1\s*\()"#,
                 summary: "SHA-1 hash usage",
                 cwe: "CWE-327",
                 severity: Severity::Medium,
@@ -149,7 +172,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.python.pickle-deserialization",
-                pattern: r"\bpickle\.loads?\s*\(",
+                pattern: r"\b(?:[cC]?[Pp]ickle|dill)\s*\.\s*(?:loads?|Unpickler)\s*\(",
                 summary: "Pickle deserialization",
                 cwe: "CWE-502",
                 severity: Severity::High,
@@ -157,7 +180,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.python.yaml-unsafe-load",
-                pattern: r"\byaml\.load\s*\(",
+                pattern: r"\byaml\s*\.\s*(?:unsafe_load|full_load|load)\s*\(",
                 summary: "YAML load without a restricted Loader",
                 cwe: "CWE-502",
                 severity: Severity::High,
@@ -170,7 +193,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
         &[
             SastRuleSpec {
                 rule: "sast.go.command-shell",
-                pattern: r#"\bexec\.Command\s*\(\s*["'](?:sh|bash|cmd|powershell)["']\s*,\s*["'](?i:-c|/c|-command)["']\s*,"#,
+                pattern: r#"\bexec\.Command(?:Context)?\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*,\s*)?["'](?:[A-Za-z]:)?(?:[\\/][A-Za-z0-9_.-]+)*[\\/]?(?:sh|bash|cmd|powershell|pwsh)(?:\.exe)?["']\s*,\s*["'](?i:-c|/c|-command)["']\s*,"#,
                 summary: "Dynamic shell command execution",
                 cwe: "CWE-78",
                 severity: Severity::High,
@@ -178,7 +201,16 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.go.sql-format",
-                pattern: r#"\b(?:Query|Exec|QueryRow)\s*\(\s*fmt\.Sprintf\s*\(\s*["'](?:SELECT|INSERT|UPDATE|DELETE)\b"#,
+                pattern: r#"(?i)\b(?:Query|Exec|QueryRow)(?:Context)?\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*,\s*)?fmt\.Sprintf\s*\(\s*["'](?:select|insert|update|delete)\b"#,
+                summary: "Formatted SQL passed to database/sql",
+                cwe: "CWE-89",
+                severity: Severity::High,
+                remediation: "Use database/sql placeholders and pass values as query arguments.",
+            },
+            SastRuleSpec {
+                rule: "sast.go.sql-format",
+                // Bare fmt.Sprintf building a SQL statement with arguments.
+                pattern: r#"(?i)\bfmt\.Sprintf\s*\(\s*["'](?:select|insert|update|delete)\b[^"']*["']\s*,"#,
                 summary: "Formatted SQL passed to database/sql",
                 cwe: "CWE-89",
                 severity: Severity::High,
@@ -186,7 +218,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.go.weak-hash-md5",
-                pattern: r"\bmd5\.New\s*\(",
+                pattern: r"\bmd5\.(?:New|Sum)\s*\(",
                 summary: "MD5 hash construction",
                 cwe: "CWE-327",
                 severity: Severity::Medium,
@@ -194,7 +226,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.go.weak-hash-sha1",
-                pattern: r"\bsha1\.New\s*\(",
+                pattern: r"\bsha1\.(?:New|Sum)\s*\(",
                 summary: "SHA-1 hash construction",
                 cwe: "CWE-327",
                 severity: Severity::Medium,
@@ -215,7 +247,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.java.sql-concat",
-                pattern: r#"\b(?:executeQuery|executeUpdate|execute)\s*\(\s*["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)[^"']*["']\s*\+"#,
+                pattern: r#"(?i)\b(?:executeQuery|executeUpdate|execute|executeBatch)\s*\(\s*["'][^"']*(?:select|insert|update|delete)[^"']*["']\s*\+"#,
                 summary: "Concatenated SQL execution",
                 cwe: "CWE-89",
                 severity: Severity::High,
@@ -223,7 +255,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.java.weak-hash",
-                pattern: r#"\bMessageDigest\s*\.\s*getInstance\s*\(\s*["'](MD5|SHA-1|SHA1)["']\s*\)"#,
+                pattern: r#"(?i)\b(?:MessageDigest\s*\.\s*getInstance\s*\(\s*["'](?:md5|sha-?1)["']|DigestUtils\s*\.\s*(?:md5|sha1|sha)\s*\(|Hashing\s*\.\s*(?:md5|sha1)\s*\()"#,
                 summary: "Weak MessageDigest algorithm requested",
                 cwe: "CWE-327",
                 severity: Severity::Medium,
@@ -231,7 +263,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.java.unsafe-deserialization",
-                pattern: r"\bObjectInputStream\b[^;\n]*?\.readObject\s*\(",
+                pattern: r"\bObjectInputStream\b[^;\n]*?\.(?:readObject|readUnshared)\s*\(",
                 summary: "Native Java deserialization",
                 cwe: "CWE-502",
                 severity: Severity::High,
@@ -244,7 +276,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
         &[
             SastRuleSpec {
                 rule: "sast.csharp.process-shell",
-                pattern: r#"\bProcess\.Start\s*\(\s*["'](?:cmd\.exe|powershell(?:\.exe)?)["']\s*,\s*[^"']"#,
+                pattern: r#"\bProcess\.Start\s*\(\s*["'](?:cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh(?:\.exe)?|/bin/(?:ba)?sh)["']\s*,\s*[^)\n]+"#,
                 summary: "Dynamic shell process execution",
                 cwe: "CWE-78",
                 severity: Severity::High,
@@ -252,7 +284,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.csharp.sql-concat",
-                pattern: r#"\b(?:SqlCommand|ExecuteSqlRaw)\s*\(\s*(?:\$["']|["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE)[^"']*["']\s*\+)"#,
+                pattern: r#"(?i)\b(?:SqlCommand|ExecuteSqlRaw(?:Async)?|ExecuteSqlCommand|FromSqlRaw)\s*\(\s*(?:\$["']|["'][^"']*(?:select|insert|update|delete)[^"']*["']\s*\+)"#,
                 summary: "Interpolated or concatenated SQL",
                 cwe: "CWE-89",
                 severity: Severity::High,
@@ -260,7 +292,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.csharp.weak-hash",
-                pattern: r"\b(?:MD5|SHA1)\.Create\s*\(\s*\)",
+                pattern: r#"(?i)\b(?:(?:MD5|SHA1)(?:CryptoServiceProvider|Managed)?\s*\.\s*Create\s*\(|new\s+(?:MD5|SHA1)CryptoServiceProvider\s*\(|HashAlgorithm\s*\.\s*Create\s*\(\s*["'](?:MD5|SHA-?1)["'])"#,
                 summary: "Weak hash algorithm instance",
                 cwe: "CWE-327",
                 severity: Severity::Medium,
@@ -268,7 +300,7 @@ const SAST_RULE_TABLE: &[(&[&str], &[SastRuleSpec])] = &[
             },
             SastRuleSpec {
                 rule: "sast.csharp.unsafe-deserialization",
-                pattern: r"\bBinaryFormatter\b[^;\n]*?\.Deserialize\s*\(",
+                pattern: r"\b(?:BinaryFormatter|SoapFormatter|LosFormatter|NetDataContractSerializer|ObjectStateFormatter)\b[^;\n]*?\.Deserialize\s*\(",
                 summary: "BinaryFormatter deserialization",
                 cwe: "CWE-502",
                 severity: Severity::High,
@@ -320,26 +352,50 @@ pub(super) fn scan_sast(path: &str, text: &str, builder: &mut FindingBuilder<'_>
             non_code: &non_code,
             line_starts: &line_starts,
             emitted_spans: &mut emitted_exec_spans,
-            deduplicate: rule.rule == "sast.javascript.exec-dynamic",
             builder,
         };
         for matched in rule.regex.find_iter(text) {
             emit_sast_finding(&mut finding, matched.start(), matched.end());
         }
     }
-    if matches!(extension.as_str(), "js" | "jsx" | "ts" | "tsx")
-        && let Some(rule) = rules
-            .iter()
-            .find(|rule| rule.rule == "sast.javascript.exec-dynamic")
-    {
+    if matches!(
+        extension.as_str(),
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
+    ) {
+        // `exec`/`execSync` calls are reported through the receiver pass
+        // only: bare `exec(` matches too many unrelated APIs, so the rules
+        // have no base regex and are constructed here for the receiver scan.
+        let exec_rule = SastRule {
+            rule: "sast.javascript.exec-dynamic",
+            regex: Regex::new("$^").expect("constant never-match regex"),
+            summary: "Dynamic command execution",
+            cwe: "CWE-78",
+            severity: Severity::High,
+            remediation: "Use spawn/execFile with a fixed executable and validated argument array.",
+        };
+        let spawn_rule = SastRule {
+            rule: "sast.javascript.spawn-dynamic",
+            regex: Regex::new("$^").expect("constant never-match regex"),
+            summary: "Dynamic process spawn",
+            cwe: "CWE-78",
+            severity: Severity::High,
+            remediation: "Spawn a fixed executable with a validated argument array.",
+        };
         scan_javascript_exec_receivers(
             text,
             &non_code,
             &line_starts,
-            rule,
+            &exec_rule,
+            &spawn_rule,
             &mut emitted_exec_spans,
             builder,
         );
+    }
+    if extension == "java" {
+        scan_java_deserialization_receivers(text, &non_code, &line_starts, builder);
+    }
+    if extension == "cs" {
+        scan_csharp_deserialization_receivers(text, &non_code, &line_starts, builder);
     }
 }
 
@@ -348,20 +404,20 @@ struct SastFindingContext<'a, 'b> {
     text: &'a str,
     non_code: &'a [(usize, usize)],
     line_starts: &'a [usize],
-    emitted_spans: &'a mut Vec<(usize, usize)>,
-    deduplicate: bool,
+    /// (rule, start, end) of every emitted finding so a second match of the
+    /// same rule at an overlapping span (table alternates, receiver pass)
+    /// reports once; different rules at one site still report separately.
+    emitted_spans: &'a mut Vec<(&'static str, usize, usize)>,
     builder: &'a mut FindingBuilder<'b>,
 }
-
 fn emit_sast_finding(context: &mut SastFindingContext<'_, '_>, start: usize, end: usize) {
     if offset_in_non_code_span(context.non_code, start)
-        || (context.deduplicate
-            && context
-                .emitted_spans
-                .iter()
-                .any(|(previous_start, previous_end)| {
-                    *previous_start < end && start < *previous_end
-                }))
+        || context
+            .emitted_spans
+            .iter()
+            .any(|(rule, previous_start, previous_end)| {
+                *rule == context.rule.rule && *previous_start < end && start < *previous_end
+            })
     {
         return;
     }
@@ -383,25 +439,56 @@ fn emit_sast_finding(context: &mut SastFindingContext<'_, '_>, start: usize, end
     {
         return;
     }
+    if context.rule.rule == "sast.javascript.eval-dynamic"
+        && (has_single_literal_argument(&context.text[end..])
+            || javascript_call_is_method_definition(&context.text[end..]))
+    {
+        return;
+    }
     if matches!(
         context.rule.rule,
-        "sast.javascript.eval-dynamic" | "sast.python.eval-dynamic" | "sast.java.runtime-exec"
+        "sast.python.eval-dynamic" | "sast.java.runtime-exec"
     ) && has_single_literal_argument(&context.text[end..])
     {
         return;
     }
-    if context.rule.rule == "sast.python.yaml-unsafe-load"
-        && yaml_call_specifies_loader(&context.text[end..])
+    // Only `yaml.load(` accepts a Loader argument; `unsafe_load` and
+    // `full_load` are unsafe regardless of what follows.
+    if context.rule.rule == "sast.python.yaml-unsafe-load" {
+        let matched = &context.text[start..end];
+        if !matched.contains("unsafe_load")
+            && !matched.contains("full_load")
+            && yaml_call_specifies_loader(&context.text[end..])
+        {
+            return;
+        }
+    }
+    if context.rule.rule == "sast.python.os-command"
+        && has_single_literal_argument(&context.text[end..])
     {
         return;
     }
     // Command-shell rules match up to the command-string argument; a
     // complete string literal there is a static, auditable command — only
     // dynamic or interpolated command strings are reported.
-    if matches!(
-        context.rule.rule,
-        "sast.go.command-shell" | "sast.rust.command-shell"
-    ) && starts_with_string_literal(&context.text[end..])
+    if context.rule.rule == "sast.go.command-shell"
+        && starts_with_string_literal(&context.text[end..])
+    {
+        return;
+    }
+    // The Rust chain match ends inside the flag argument's call; the
+    // command argument follows it. A chain whose remaining arguments are
+    // all literals is a static command and is not reported.
+    if context.rule.rule == "sast.rust.command-shell" {
+        let Some(flag_end) = context.text[start..end].rfind(['"', '\'']) else {
+            return;
+        };
+        if !remaining_command_args_dynamic(&context.text[start + flag_end + 1..]) {
+            return;
+        }
+    }
+    if context.rule.rule == "sast.csharp.process-shell"
+        && !csharp_second_argument_dynamic(&context.text[start..end], &context.text[end..])
     {
         return;
     }
@@ -429,9 +516,7 @@ fn emit_sast_finding(context: &mut SastFindingContext<'_, '_>, start: usize, end
         remediation: context.rule.remediation,
         cwe: Some(context.rule.cwe),
     });
-    if context.deduplicate {
-        context.emitted_spans.push((start, end));
-    }
+    context.emitted_spans.push((context.rule.rule, start, end));
 }
 
 static JAVASCRIPT_COMMONJS_NAMESPACE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -456,8 +541,26 @@ static JAVASCRIPT_COMMONJS_NAMED_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static JAVASCRIPT_ESM_NAMED_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)^\s*import\s+\{([^}]*)\}\s+from\s+["'](?:node:)?child_process["']"#)
-        .expect("constant ES-module child_process named regex")
+    Regex::new(
+        r#"(?m)^\s*import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+["'](?:node:)?child_process["']"#,
+    )
+    .expect("constant ES-module child_process named regex")
+});
+
+static JAVASCRIPT_ESM_DEFAULT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)^\s*import\s+(?:type\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:,\s*\{[^}]*\})?\s*from\s+["'](?:node:)?child_process["']"#,
+    )
+    .expect("constant ES-module child_process default regex")
+});
+
+static JAVASCRIPT_MEMBER_REQUIRE_ALIAS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    // `const cp = require("child_process").exec` binds the method itself;
+    // the alias resolves as a Named alias of that method's family.
+    Regex::new(
+        r#"(?m)(?:^|[^.A-Za-z0-9_$])(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.\s*(execSync|exec|spawn|spawnSync|execFile|execFileSync|fork)\b"#,
+    )
+    .expect("constant member-require alias regex")
 });
 
 static JAVASCRIPT_MEMBER_EXEC_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -481,8 +584,16 @@ static JAVASCRIPT_NAMED_EXEC_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JavascriptAliasKind {
+    /// `const cp = require("child_process")` / `import cp from` /
+    /// `import * as cp from` — member calls `cp.exec(` resolve through it.
     Namespace,
-    Named,
+    /// Named exec-family import: `{exec, execSync}` — a string command runs
+    /// through a shell.
+    NamedExec,
+    /// Named spawn-family import: `{spawn, spawnSync, execFile,
+    /// execFileSync, fork}` — the first argument is an executable, not a
+    /// shell string, so only dynamic or shell-literal arguments flag.
+    NamedSpawn,
 }
 
 #[derive(Debug)]
@@ -700,8 +811,9 @@ fn scan_javascript_exec_receivers(
     text: &str,
     non_code: &[(usize, usize)],
     line_starts: &[usize],
-    rule: &SastRule,
-    emitted_spans: &mut Vec<(usize, usize)>,
+    exec_rule: &SastRule,
+    spawn_rule: &SastRule,
+    emitted_spans: &mut Vec<(&'static str, usize, usize)>,
     builder: &mut FindingBuilder<'_>,
 ) {
     let mut aliases = Vec::new();
@@ -709,6 +821,7 @@ fn scan_javascript_exec_receivers(
     for captures in JAVASCRIPT_COMMONJS_NAMESPACE_REGEX
         .captures_iter(text)
         .chain(JAVASCRIPT_ESM_NAMESPACE_REGEX.captures_iter(text))
+        .chain(JAVASCRIPT_ESM_DEFAULT_REGEX.captures_iter(text))
     {
         let Some(alias) = captures.get(1) else {
             continue;
@@ -740,14 +853,34 @@ fn scan_javascript_exec_receivers(
         }
         collect_named_child_process_aliases(bindings.as_str(), bindings.start(), &mut aliases);
     }
+    for captures in JAVASCRIPT_MEMBER_REQUIRE_ALIAS_REGEX.captures_iter(text) {
+        let (Some(alias), Some(method), Some(declaration)) =
+            (captures.get(1), captures.get(2), captures.get(0))
+        else {
+            continue;
+        };
+        if offset_in_non_code_span(non_code, alias.start())
+            || !has_javascript_declaration_boundary(text, declaration.end())
+        {
+            continue;
+        }
+        let kind = match method.as_str() {
+            "exec" | "execSync" => JavascriptAliasKind::NamedExec,
+            _ => JavascriptAliasKind::NamedSpawn,
+        };
+        aliases.push(JavascriptAlias {
+            name: alias.as_str().to_owned(),
+            start: alias.start(),
+            kind,
+        });
+    }
     let model = JavascriptBindingModel::new(text, &tokens, &aliases);
     let mut finding = SastFindingContext {
-        rule,
+        rule: exec_rule,
         text,
         non_code,
         line_starts,
         emitted_spans,
-        deduplicate: true,
         builder,
     };
     for captures in JAVASCRIPT_MEMBER_EXEC_REGEX.captures_iter(text) {
@@ -793,22 +926,30 @@ fn scan_javascript_exec_receivers(
         let Some(callee) = captures.name("callee") else {
             continue;
         };
-        if javascript_member_access_before(&tokens, callee.start())
-            || !model.resolves_alias(
-                text,
-                callee.as_str(),
-                callee.start(),
-                JavascriptAliasKind::Named,
-            )
-        {
+        if javascript_member_access_before(&tokens, callee.start()) {
             continue;
         }
+        let resolves = |kind: JavascriptAliasKind| {
+            model.resolves_alias(text, callee.as_str(), callee.start(), kind)
+        };
         let start = callee.start();
-        emit_sast_finding(
-            &mut finding,
-            start,
-            callee.end() + text[callee.end()..].find('(').unwrap_or(0) + 1,
-        );
+        let end = callee.end() + text[callee.end()..].find('(').unwrap_or(0) + 1;
+        if resolves(JavascriptAliasKind::NamedExec) {
+            emit_sast_finding(&mut finding, start, end);
+        } else if resolves(JavascriptAliasKind::NamedSpawn) {
+            // spawn-family first arguments are executables, not shell
+            // strings: flag only dynamic arguments or literal shells.
+            let after = &text[end..];
+            let dynamic = match first_literal_argument(after) {
+                Some(literal) => is_shell_literal(literal),
+                None => !javascript_call_has_no_arguments(after),
+            };
+            if dynamic {
+                finding.rule = spawn_rule;
+                emit_sast_finding(&mut finding, start, end);
+                finding.rule = exec_rule;
+            }
+        }
     }
 }
 fn javascript_member_access_before(tokens: &[JavascriptToken<'_>], offset: usize) -> bool {
@@ -1707,13 +1848,28 @@ fn collect_named_child_process_aliases(
         } else {
             let local = binding.split('=').next().map(str::trim).unwrap_or(binding);
             let local_offset = binding_start + leading + binding.find(local).unwrap_or(0);
-            (binding, local, local_offset)
+            // Inline `type` qualifier (`import {type exec}`): the bound
+            // name follows the keyword.
+            match local.strip_prefix("type ") {
+                Some(name) => (name.trim(), name.trim(), local_offset + 5),
+                None => (binding, local, local_offset),
+            }
         };
-        if matches!(exported, "exec" | "execSync") && is_javascript_identifier(local) {
+        // `import type {exec}` / inline `type` qualifiers still bind the
+        // same names; strip the qualifier before matching the export.
+        let exported = exported.strip_prefix("type ").unwrap_or(exported).trim();
+        let kind = match exported {
+            "exec" | "execSync" => JavascriptAliasKind::NamedExec,
+            "spawn" | "spawnSync" | "execFile" | "execFileSync" | "fork" => {
+                JavascriptAliasKind::NamedSpawn
+            }
+            _ => continue,
+        };
+        if is_javascript_identifier(local) {
             aliases.push(JavascriptAlias {
                 name: local.to_owned(),
                 start: bindings_start + local_offset,
-                kind: JavascriptAliasKind::Named,
+                kind,
             });
         }
     }
@@ -1771,11 +1927,15 @@ fn javascript_call_has_no_arguments(after_open_paren: &str) -> bool {
     }
 }
 
-fn has_single_literal_argument(after_open_paren: &str) -> bool {
+/// Returns the content of a leading complete string literal argument when
+/// it is followed by `,` or `)` — i.e. the first call argument is a static
+/// literal rather than an identifier, interpolation, or concatenation.
+/// Interpolated template literals (`${`) are not literals.
+fn first_literal_argument(after_open_paren: &str) -> Option<&str> {
     let source = after_open_paren.trim_start();
     let mut chars = source.char_indices();
     let Some((_, quote @ ('\'' | '"' | '`'))) = chars.next() else {
-        return false;
+        return None;
     };
     let mut escaped = false;
     for (offset, character) in chars {
@@ -1788,15 +1948,42 @@ fn has_single_literal_argument(after_open_paren: &str) -> bool {
             continue;
         }
         if quote == '`' && character == '$' && source[offset..].starts_with("${") {
-            return false;
+            return None;
         }
         if character == quote {
+            let literal = &source[1..offset];
             return source[offset + character.len_utf8()..]
                 .trim_start()
-                .starts_with(')');
+                .starts_with([',', ')'])
+                .then_some(literal);
         }
     }
-    false
+    None
+}
+
+fn has_single_literal_argument(after_open_paren: &str) -> bool {
+    first_literal_argument(after_open_paren).is_some()
+}
+
+static SHELL_LITERAL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^(?:[A-Za-z]:)?(?:[\\/][A-Za-z0-9_. -]+)*[\\/]?(?:sh|bash|cmd|powershell|pwsh)(?:\.exe)?$"#)
+        .expect("constant shell literal regex")
+});
+
+/// Whether a literal first argument names a shell executable — spawning it
+/// is shell-equivalent even through the spawn family.
+fn is_shell_literal(literal: &str) -> bool {
+    SHELL_LITERAL_REGEX.is_match(literal.trim())
+}
+
+/// Whether the call is actually a method/getter/setter definition:
+/// `eval(x) {`, `get eval() {`, `set eval(v) {`. A bare `{` after the
+/// argument list is a definition body, not a call.
+fn javascript_call_is_method_definition(after_open_paren: &str) -> bool {
+    let arguments = call_argument_text(after_open_paren);
+    after_open_paren[arguments.len()..]
+        .trim_start()
+        .starts_with('{')
 }
 
 /// Whether the source begins with a complete string literal followed by a
@@ -1842,10 +2029,10 @@ fn starts_with_string_literal(after_open_paren: &str) -> bool {
     }
     false
 }
-
 static YAML_RESTRICTED_LOADER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:Loader\s*=|C?SafeLoader|BaseLoader)\b")
-        .expect("constant YAML restricted-loader regex")
+    // Only SafeLoader/BaseLoader (optionally C-prefixed) restrict the
+    // document; `Loader=UnsafeLoader`/`FullLoader` must not suppress.
+    Regex::new(r"\b(?:C?SafeLoader|BaseLoader)\b").expect("constant YAML restricted-loader regex")
 });
 
 /// Returns the argument text of a call given the source immediately after its
@@ -1908,6 +2095,286 @@ static PYTHON_NON_SECURITY_DIGEST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// as variables stay flagged because their value cannot be resolved statically.
 fn python_call_marks_non_security_digest(after_open_paren: &str) -> bool {
     PYTHON_NON_SECURITY_DIGEST_REGEX.is_match(call_argument_text(after_open_paren))
+}
+
+/// Whether the remaining `.arg(...)`/`.args(...)` chain after a Rust
+/// command-shell flag argument contains a non-literal (dynamic) argument.
+/// Walks the chain: `)` at depth 0 ends a call, `.name(` continues the
+/// chain, and any identifier/expression token inside an argument list marks
+/// the command as dynamic. String literals and macro names (`vec![…]`) are
+/// skipped.
+fn remaining_command_args_dynamic(after: &str) -> bool {
+    const MAX_SCAN: usize = 4096;
+    let bytes = after.as_bytes();
+    let mut index = 0_usize;
+    let mut depth = 0_usize;
+    let mut dynamic = false;
+    while index < bytes.len() && index < MAX_SCAN {
+        match bytes[index] {
+            b'"' | b'\'' => {
+                // Skip the string literal; unterminated input ends the scan.
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == quote {
+                        break;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'(' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' | b']' => {
+                if depth == 0 {
+                    // Call closed: continue the chain only on `.name(`.
+                    index += 1;
+                    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                        index += 1;
+                    }
+                    if bytes.get(index) == Some(&b'.') {
+                        index += 1;
+                        while index < bytes.len()
+                            && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                        {
+                            index += 1;
+                        }
+                        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                            index += 1;
+                        }
+                        if bytes.get(index) == Some(&b'(') {
+                            depth = 1;
+                            index += 1;
+                            continue;
+                        }
+                    }
+                    return dynamic;
+                }
+                depth -= 1;
+                index += 1;
+            }
+            b';' | b'\n' if depth == 0 => return dynamic,
+            _ => {
+                if depth > 0
+                    && (bytes[index].is_ascii_alphabetic() || bytes[index] == b'_')
+                    && (index == 0
+                        || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_'))
+                {
+                    // Identifier start inside an argument list: dynamic
+                    // unless it is a macro name (`vec!`, `format!`).
+                    let mut end = index;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                    {
+                        end += 1;
+                    }
+                    if bytes.get(end) != Some(&b'!') {
+                        dynamic = true;
+                    }
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+    dynamic
+}
+
+/// Whether the second `Process.Start` argument is dynamic: a literal that
+/// concatenates (`"/c " + x`), an interpolated string, or a non-literal
+/// expression. `matched` is the regex match (which may end inside the
+/// literal); `after` continues it.
+fn csharp_second_argument_dynamic(matched: &str, after: &str) -> bool {
+    let combined_start = matched
+        .rfind(',')
+        .map_or(after, |comma| &matched[comma + 1..]);
+    let source = if combined_start.len() == matched.len() {
+        after.trim_start()
+    } else {
+        combined_start.trim_start()
+    };
+    let mut chars = source.char_indices();
+    match chars.next() {
+        // Interpolated or verbatim-interpolated string: dynamic.
+        Some((_, '$' | '@')) => true,
+        Some((_, quote @ ('"' | '\''))) => {
+            let mut escaped = false;
+            for (offset, character) in chars {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if character == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if character == quote {
+                    // Literal closed: dynamic only when concatenated.
+                    return source[offset + character.len_utf8()..]
+                        .trim_start()
+                        .starts_with('+');
+                }
+            }
+            // Literal continues into `after`: scan it for the close.
+            let mut escaped = false;
+            for (offset, character) in after.char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if character == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if character == quote {
+                    return after[offset + character.len_utf8()..]
+                        .trim_start()
+                        .starts_with('+');
+                }
+            }
+            true
+        }
+        // Non-literal expression: dynamic.
+        Some(_) => true,
+        None => false,
+    }
+}
+
+static JAVA_OIS_DECLARATION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:ObjectInputStream|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*new\s+ObjectInputStream\s*\(",
+    )
+    .expect("constant ObjectInputStream declaration regex")
+});
+
+static JAVA_OIS_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*(?:readObject|readUnshared)\s*\(")
+        .expect("constant ObjectInputStream call regex")
+});
+
+/// `ois.readObject(...)` where `ois` was declared as an ObjectInputStream:
+/// the base regex only catches `new ObjectInputStream(...).readObject(` on
+/// one line, so declared receivers are matched here.
+fn scan_java_deserialization_receivers(
+    text: &str,
+    non_code: &[(usize, usize)],
+    line_starts: &[usize],
+    builder: &mut FindingBuilder<'_>,
+) {
+    let mut names: Vec<String> = Vec::new();
+    for captures in JAVA_OIS_DECLARATION_REGEX.captures_iter(text) {
+        if let Some(name) = captures.get(1)
+            && !offset_in_non_code_span(non_code, name.start())
+        {
+            names.push(name.as_str().to_owned());
+        }
+    }
+    if names.is_empty() {
+        return;
+    }
+    let Some(rule) = SAST_RULES.get("java").and_then(|rules| {
+        rules
+            .iter()
+            .find(|rule| rule.rule == "sast.java.unsafe-deserialization")
+    }) else {
+        return;
+    };
+    let mut emitted = Vec::new();
+    let mut finding = SastFindingContext {
+        rule,
+        text,
+        non_code,
+        line_starts,
+        emitted_spans: &mut emitted,
+        builder,
+    };
+    for captures in JAVA_OIS_CALL_REGEX.captures_iter(text) {
+        let Some(receiver) = captures.get(1) else {
+            continue;
+        };
+        if offset_in_non_code_span(non_code, receiver.start())
+            || !names.iter().any(|name| name == receiver.as_str())
+        {
+            continue;
+        }
+        emit_sast_finding(
+            &mut finding,
+            receiver.start(),
+            captures.get(0).unwrap().end(),
+        );
+    }
+}
+
+static CSHARP_DESERIALIZER_DECLARATION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:BinaryFormatter|SoapFormatter|LosFormatter|NetDataContractSerializer|ObjectStateFormatter|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*new\s+(?:BinaryFormatter|SoapFormatter|LosFormatter|NetDataContractSerializer|ObjectStateFormatter)\s*\(",
+    )
+    .expect("constant deserializer declaration regex")
+});
+
+static CSHARP_DESERIALIZE_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*Deserialize\s*\(")
+        .expect("constant Deserialize call regex")
+});
+
+/// `formatter.Deserialize(...)` where `formatter` was declared as an
+/// unsafe deserializer type — the base regex only catches same-line
+/// `new BinaryFormatter().Deserialize(` shapes.
+fn scan_csharp_deserialization_receivers(
+    text: &str,
+    non_code: &[(usize, usize)],
+    line_starts: &[usize],
+    builder: &mut FindingBuilder<'_>,
+) {
+    let mut names: Vec<String> = Vec::new();
+    for captures in CSHARP_DESERIALIZER_DECLARATION_REGEX.captures_iter(text) {
+        if let Some(name) = captures.get(1)
+            && !offset_in_non_code_span(non_code, name.start())
+        {
+            names.push(name.as_str().to_owned());
+        }
+    }
+    if names.is_empty() {
+        return;
+    }
+    let Some(rule) = SAST_RULES.get("cs").and_then(|rules| {
+        rules
+            .iter()
+            .find(|rule| rule.rule == "sast.csharp.unsafe-deserialization")
+    }) else {
+        return;
+    };
+    let mut emitted = Vec::new();
+    let mut finding = SastFindingContext {
+        rule,
+        text,
+        non_code,
+        line_starts,
+        emitted_spans: &mut emitted,
+        builder,
+    };
+    for captures in CSHARP_DESERIALIZE_CALL_REGEX.captures_iter(text) {
+        let Some(receiver) = captures.get(1) else {
+            continue;
+        };
+        if offset_in_non_code_span(non_code, receiver.start())
+            || !names.iter().any(|name| name == receiver.as_str())
+        {
+            continue;
+        }
+        emit_sast_finding(
+            &mut finding,
+            receiver.start(),
+            captures.get(0).unwrap().end(),
+        );
+    }
 }
 
 #[cfg(test)]

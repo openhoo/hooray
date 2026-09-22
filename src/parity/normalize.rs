@@ -182,15 +182,15 @@ struct VulnAccumulator {
 
 impl VulnAccumulator {
     // Severity accumulates as MAX rank across every finding sharing an
-    // advisory id. Xray's normalizer instead keeps the first-seen
-    // non-empty label per issue, so when a provider reports conflicting
-    // severities for one advisory the two sides can legitimately
-    // disagree on the label; that asymmetry is accepted because the
-    // scorecard compares vulnerability identity sets, not labels.
+    // advisory id. Xray's normalizer uses the same max-rank rule, so the
+    // two sides agree on the label even when a provider reports
+    // conflicting severities for one advisory.
     fn push(&mut self, finding: &Finding, purl: Option<String>) {
         let label = finding.severity.as_str().to_owned();
         let rank = severity_rank_of(&label);
-        if rank > self.severity_rank {
+        // `severity_label` starts empty; the first finding always assigns
+        // it so `Severity::Unknown` emits `"unknown"`, never `""`.
+        if self.severity_label.is_empty() || rank > self.severity_rank {
             self.severity_rank = rank;
             self.severity_label = label;
         }

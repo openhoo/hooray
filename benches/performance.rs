@@ -46,10 +46,16 @@ fn measure(mut operation: impl FnMut()) -> (u64, Duration) {
         operation();
     }
     let started = Instant::now();
+    // Always run at least one timed iteration: a single call slower than
+    // SAMPLE_TIME would otherwise leave `iterations` at 0 and report
+    // elapsed/0 = inf (or NaN) instead of a real sample.
     let mut iterations = 0_u64;
-    while started.elapsed() < SAMPLE_TIME {
+    loop {
         operation();
         iterations += 1;
+        if started.elapsed() >= SAMPLE_TIME {
+            break;
+        }
     }
     (iterations, started.elapsed())
 }
@@ -283,6 +289,7 @@ fn affected_ranges_fixture() -> Vec<OsvAffectedRange> {
         .map(|range| OsvAffectedRange {
             range_type: OsvRangeType::Semver,
             ecosystem: Some("cargo".into()),
+            versions: Vec::new(),
             events: (0..10)
                 .flat_map(|interval| {
                     let introduced = format!("{}.{}.0", range + 1, interval * 2);

@@ -15,6 +15,17 @@ use super::{
     StoreError, pagination, push_filter, push_filter_op,
 };
 
+/// Per-run summary row for bounded history listings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RunSummary {
+    pub run_id: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub scanner_version: Option<String>,
+    pub asset_id: String,
+    pub finding_count: i64,
+}
+
 impl Store {
     pub fn save_report(&mut self, report: &ScanReport) -> Result<(), StoreError> {
         reject_unredacted_secrets(&report.findings)?;
@@ -64,6 +75,35 @@ impl Store {
         self.query_history(&HistoryFilter::default(), limit, offset)
     }
 
+    /// Bounded run listing: returns per-run summary columns only, never
+    /// the full report JSON, so `GET /v1/runs?limit=1000` cannot force
+    /// multi-hundred-MB deserialization.
+    pub fn list_run_summaries(
+        &self,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<RunSummary>, StoreError> {
+        let (limit, offset) = pagination(limit, offset)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id,started_at,completed_at,scanner_version,asset_id,finding_count FROM scan_runs ORDER BY started_at DESC, run_id DESC LIMIT ? OFFSET ?",
+        )?;
+        let rows = statement.query_map(params![limit, offset], |row| {
+            Ok(RunSummary {
+                run_id: row.get(0)?,
+                started_at: row.get(1)?,
+                completed_at: row.get(2)?,
+                scanner_version: row.get(3)?,
+                asset_id: row.get(4)?,
+                finding_count: row.get(5)?,
+            })
+        })?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
     pub fn query_history(
         &self,
         filter: &HistoryFilter,
@@ -79,19 +119,26 @@ impl Store {
             "asset_id",
             filter.asset_id.as_deref(),
         );
+        // Range bounds are normalized to the same UTC-millis form stored by
+        // insert_run so lexical comparison stays consistent across mixed
+        // RFC 3339 precisions.
+        let started_from = filter.started_from.as_deref().map(normalize_started_at);
+        let started_through = filter.started_through.as_deref().map(normalize_started_at);
         push_filter_op(
             &mut sql,
             &mut values,
             "started_at",
             ">=",
-            filter.started_from.as_deref(),
+            started_from.as_deref().or(filter.started_from.as_deref()),
         );
         push_filter_op(
             &mut sql,
             &mut values,
             "started_at",
             "<=",
-            filter.started_through.as_deref(),
+            started_through
+                .as_deref()
+                .or(filter.started_through.as_deref()),
         );
         sql.push_str(" ORDER BY started_at DESC, run_id DESC LIMIT ? OFFSET ?");
         values.push(Value::Integer(limit));
@@ -252,13 +299,34 @@ impl Store {
     }
 
     pub fn delete_before(&mut self, timestamp: &str) -> Result<usize, StoreError> {
+        let timestamp = &normalize_started_at(timestamp);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted =
             transaction.execute("DELETE FROM scan_runs WHERE started_at < ?1", [timestamp])?;
-        transaction.execute("INSERT INTO retention_events(occurred_at,cutoff_at,deleted_runs,details_json) VALUES (?1,?1,?2,'{}')", params![timestamp, i64::try_from(deleted).unwrap_or(i64::MAX)])?;
-        transaction.execute("INSERT OR IGNORE INTO audit_events(event_id,occurred_at,actor,action,resource_type,resource_id,details_json) VALUES (?1,?2,'system','retention.delete','scan_run',?2,json_object('deleted_runs',?3))", params![format!("retention:{timestamp}:{deleted}"), timestamp, i64::try_from(deleted).unwrap_or(i64::MAX)])?;
+        // occurred_at records when the prune actually ran (not the cutoff),
+        // and the audit event_id carries a unique nonce so repeat prunes
+        // with identical results are not dedupe-swallowed.
+        let occurred_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let event_id = format!(
+            "retention:{}:{}:{}",
+            occurred_at,
+            timestamp,
+            crate::util::sha256_hex(format!("{occurred_at}:{timestamp}:{deleted}").as_bytes())
+        );
+        transaction.execute("INSERT INTO retention_events(occurred_at,cutoff_at,deleted_runs,details_json) VALUES (?1,?2,?3,'{}')", params![occurred_at, timestamp, i64::try_from(deleted).unwrap_or(i64::MAX)])?;
+        transaction.execute("INSERT INTO audit_events(event_id,occurred_at,actor,action,resource_type,resource_id,details_json) VALUES (?1,?2,'system','retention.delete','scan_run',?3,json_object('deleted_runs',?4))", params![event_id, occurred_at, timestamp, i64::try_from(deleted).unwrap_or(i64::MAX)])?;
+        // Audit and retention bookkeeping age out on the same cutoff so the
+        // tables themselves cannot grow unboundedly.
+        transaction.execute(
+            "DELETE FROM audit_events WHERE occurred_at < ?1",
+            [timestamp],
+        )?;
+        transaction.execute(
+            "DELETE FROM retention_events WHERE occurred_at < ?1",
+            [timestamp],
+        )?;
         transaction.commit()?;
         Ok(deleted)
     }
@@ -301,13 +369,30 @@ pub(super) fn insert_report(
     insert_policy_decisions(t, r)?;
     Ok(())
 }
+/// Normalizes an RFC 3339 timestamp to UTC with millisecond precision —
+/// the canonical stored form for `scan_runs.started_at`, so TEXT ordering
+/// and range comparisons stay consistent regardless of input precision or
+/// offset. Unparseable values pass through unchanged.
+fn normalize_started_at(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| {
+            time.with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
+        .unwrap_or_else(|_| value.to_owned())
+}
+
 fn insert_run(
     t: &Transaction<'_>,
     r: &ScanReport,
     json: &str,
     count: i64,
 ) -> Result<(), StoreError> {
-    t.execute("INSERT INTO scan_runs(run_id,schema_version,started_at,completed_at,scanner_version,asset_id,finding_count,report_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![r.run.id.as_str(),r.schema_version,r.run.started_at,r.run.completed_at,r.run.scanner_version,r.inventory.asset.id.as_str(),count,json])?;
+    // started_at is compared as TEXT for ordering, history ranges, and
+    // retention; normalize to UTC RFC 3339 so offset-bearing timestamps
+    // sort correctly. The report JSON keeps the original value.
+    let started_at = normalize_started_at(&r.run.started_at);
+    t.execute("INSERT INTO scan_runs(run_id,schema_version,started_at,completed_at,scanner_version,asset_id,finding_count,report_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![r.run.id.as_str(),r.schema_version,started_at,r.run.completed_at,r.run.scanner_version,r.inventory.asset.id.as_str(),count,json])?;
     Ok(())
 }
 fn insert_assets(t: &Transaction<'_>, r: &ScanReport) -> Result<(), StoreError> {
@@ -526,9 +611,9 @@ mod tests {
     fn pagination_history_and_audit_are_deterministic() {
         let mut s = Store::open_memory().unwrap();
         for (id, t) in [
-            ("r1", "2026-01-01Z"),
-            ("r2", "2026-01-02Z"),
-            ("r3", "2026-01-03Z"),
+            ("r1", "2026-01-01T00:00:00Z"),
+            ("r2", "2026-01-02T00:00:00Z"),
+            ("r3", "2026-01-03T00:00:00Z"),
         ] {
             s.save_report(&report(id, t, &[])).unwrap();
         }
@@ -540,7 +625,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["r2", "r1"]
         );
-        assert_eq!(s.delete_before("2026-01-03Z").unwrap(), 2);
+        assert_eq!(s.delete_before("2026-01-03T00:00:00Z").unwrap(), 2);
         let a = s.list_audit_events(10, 0).unwrap();
         assert_eq!(a[0].details["deleted_runs"], 2);
     }
@@ -596,11 +681,11 @@ mod tests {
         ));
         let mut first = Store::open(&path).unwrap();
         assert_eq!(first.latest_run().unwrap(), None);
-        let original = rich_report("run:file", "2026-01-01Z", "asset:file");
+        let original = rich_report("run:file", "2026-01-01T00:00:00Z", "asset:file");
         first.save_report(&original).unwrap();
 
         let mut duplicate = original.clone();
-        duplicate.run.started_at = "2027-01-01Z".into();
+        duplicate.run.started_at = "2027-01-01T00:00:00Z".into();
         duplicate.inventory.asset.name = "must-not-leak".into();
         assert!(matches!(
             first.save_report(&duplicate),
@@ -634,9 +719,9 @@ mod tests {
     #[test]
     fn every_history_finding_and_inventory_filter_is_applied() {
         let mut s = Store::open_memory().unwrap();
-        let rich = rich_report("run:rich", "2026-02-02Z", "asset:rich");
+        let rich = rich_report("run:rich", "2026-02-02T00:00:00Z", "asset:rich");
         s.save_report(&rich).unwrap();
-        s.save_report(&report("run:plain", "2026-01-01Z", &[]))
+        s.save_report(&report("run:plain", "2026-01-01T00:00:00Z", &[]))
             .unwrap();
 
         let histories = [
@@ -645,17 +730,17 @@ mod tests {
                 ..Default::default()
             },
             HistoryFilter {
-                started_from: Some("2026-02-01Z".into()),
+                started_from: Some("2026-02-01T00:00:00Z".into()),
                 ..Default::default()
             },
             HistoryFilter {
-                started_through: Some("2026-02-02Z".into()),
+                started_through: Some("2026-02-02T00:00:00Z".into()),
                 ..Default::default()
             },
             HistoryFilter {
                 asset_id: Some("asset:rich".into()),
-                started_from: Some("2026-02-02Z".into()),
-                started_through: Some("2026-02-02Z".into()),
+                started_from: Some("2026-02-02T00:00:00Z".into()),
+                started_through: Some("2026-02-02T00:00:00Z".into()),
             },
         ];
         for filter in histories {
@@ -679,8 +764,8 @@ mod tests {
         for mask in 0_u8..8 {
             let filter = HistoryFilter {
                 asset_id: (mask & 1 != 0).then(|| "asset:rich".into()),
-                started_from: (mask & 2 != 0).then(|| "2026-02-02Z".into()),
-                started_through: (mask & 4 != 0).then(|| "2026-02-02Z".into()),
+                started_from: (mask & 2 != 0).then(|| "2026-02-02T00:00:00Z".into()),
+                started_through: (mask & 4 != 0).then(|| "2026-02-02T00:00:00Z".into()),
             };
             let rows = s.query_history(&filter, 10, 0).unwrap();
             let expected = if mask & 3 == 0 { 2 } else { 1 };
@@ -826,11 +911,11 @@ mod tests {
     #[test]
     fn retention_cascades_normalized_rows_and_records_zero_deletions() {
         let mut s = Store::open_memory().unwrap();
-        s.save_report(&rich_report("old", "2026-01-01Z", "asset:old"))
+        s.save_report(&rich_report("old", "2026-01-01T00:00:00Z", "asset:old"))
             .unwrap();
-        s.save_report(&rich_report("new", "2026-03-01Z", "asset:new"))
+        s.save_report(&rich_report("new", "2026-03-01T00:00:00Z", "asset:new"))
             .unwrap();
-        assert_eq!(s.delete_before("2026-02-01Z").unwrap(), 1);
+        assert_eq!(s.delete_before("2026-02-01T00:00:00Z").unwrap(), 1);
 
         let counts: (i64, i64, i64) = s.connection.query_row(
             "SELECT (SELECT count(*) FROM scan_runs WHERE run_id='old'),(SELECT count(*) FROM scan_components WHERE run_id='old'),(SELECT count(*) FROM scan_findings WHERE run_id='old')",
@@ -850,14 +935,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             retention,
-            vec![(1, "2026-02-01Z".into()), (0, "2020".into())]
+            vec![(1, "2026-02-01T00:00:00.000Z".into()), (0, "2020".into())]
         );
         assert_eq!(s.list_audit_events(10, 0).unwrap().len(), 2);
     }
     #[test]
     fn malformed_stored_json_and_normalized_identifiers_are_reported() {
         let mut s = Store::open_memory().unwrap();
-        let r = rich_report("corrupt", "2026-01-01Z", "asset:corrupt");
+        let r = rich_report("corrupt", "2026-01-01T00:00:00Z", "asset:corrupt");
         s.save_report(&r).unwrap();
 
         s.connection
@@ -927,9 +1012,9 @@ mod tests {
         let mut s = Store::open_memory().unwrap();
         // Earlier started_at than the rejected row keeps DESC-order assertions
         // meaningful and proves supported rows remain readable.
-        let control = rich_report("run:supported:v1", "2025-12-31Z", "asset:v1");
+        let control = rich_report("run:supported:v1", "2025-12-31T00:00:00Z", "asset:v1");
         s.save_report(&control).unwrap();
-        let r = rich_report("legacy:v2", "2026-01-01Z", "asset:v2");
+        let r = rich_report("legacy:v2", "2026-01-01T00:00:00Z", "asset:v2");
         let mut fabricated = serde_json::to_value(&r).unwrap();
         fabricated["schema_version"] = serde_json::Value::String("2".into());
         s.connection
@@ -973,10 +1058,18 @@ mod tests {
         assert!(
             matches!(s.diff_runs(&missing, &missing), Err(StoreError::RunNotFound(id)) if id == "missing")
         );
-        s.save_report(&report("before", "t1", &["same", "resolved"]))
-            .unwrap();
-        s.save_report(&report("after", "t2", &["same", "introduced"]))
-            .unwrap();
+        s.save_report(&report(
+            "before",
+            "2026-01-01T00:00:00Z",
+            &["same", "resolved"],
+        ))
+        .unwrap();
+        s.save_report(&report(
+            "after",
+            "2026-01-02T00:00:00Z",
+            &["same", "introduced"],
+        ))
+        .unwrap();
         let diff = s
             .diff_runs(
                 &RunId::new("before").unwrap(),
@@ -991,7 +1084,7 @@ mod tests {
     #[test]
     fn secret_redaction_is_enforced() {
         let mut s = Store::open_memory().unwrap();
-        let mut r = report("secret", "t", &[]);
+        let mut r = report("secret", "2026-01-01T00:00:00Z", &[]);
         let mut f = finding("f");
         f.kind = FindingKind::Secret;
         f.evidence.insert(Evidence {
@@ -1011,7 +1104,7 @@ mod tests {
     #[test]
     fn sensitive_free_form_values_are_redacted_before_persistence() {
         let mut store = Store::open_memory().unwrap();
-        let mut report = rich_report("run:redacted", "2026-01-01Z", "asset:redacted");
+        let mut report = rich_report("run:redacted", "2026-01-01T00:00:00Z", "asset:redacted");
         report
             .run
             .metadata

@@ -24,3 +24,104 @@ rules:
       minimum_severity: high
       confidence:
         - high
+exceptions:
+  # Dogfood self-scan: our own SAST rule tables, test vectors, and internal
+  # SQL/test helpers trip the new detectors. Each entry is pinned exactly.
+  - id: dogfood-secret-test-vectors
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    compensating_controls:
+      - Findings pinned by SHA-256 fingerprint; any new secret still denies
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "13e70cb3d9f638791a0705ba328f5437ba075ab0079cfbfebd66b3110f009d3f"
+  - id: dogfood-secret-test-vectors-2
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "313b967dcddce2797c3f98c4c4bd5925f5433fea18ca7a3de6d40bbdab786de5"
+  - id: dogfood-secret-test-vectors-3
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "3b00bb62672c0c1a5c48003726d291b3e1e200833981a79206e0cbb6aed2235a"
+  - id: dogfood-secret-test-vectors-4
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "413e75e5d35807ff522bdeb10971066bbbfcab4389a378084f2b8883ace96a5e"
+  - id: dogfood-secret-test-vectors-5
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "4e03e3ca23b2217ab71b4e1fab38c8ab0a3cfe5cb4ccffd69643d88c79790b8b"
+  - id: dogfood-secret-test-vectors-6
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "883bdf83da2cf59abcf64a193c39be1e2aabbe2b598371165a2681dfdbd2474e"
+  - id: dogfood-secret-test-vectors-7
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "8dadf52ad1140535c69da179ebed92d6153851b8e3f2cba0e2fa125ed7650e8b"
+  - id: dogfood-secret-test-vectors-8
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "a105004243247ec5b431ee9abcf7a35133980a2055a4da222047781798150914"
+  - id: dogfood-secret-test-vectors-9
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "dc44b9a335db619180977e108e093a342c6e509ac84641eefa99b68d6b72892c"
+  - id: dogfood-secret-test-vectors-10
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "e9c1833fbbd42537dd4902f821d28eea3b6856c11c6bc546baf1a6d4514e9a29"
+  - id: dogfood-secret-test-vectors-11
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "f55dd7b029cdd07c5dc12de22e25657ac9b1ccdd818c741645aeb8bfc25d9632"
+  - id: dogfood-secret-test-vectors-12
+    owner: hooray-maintainers
+    reason: High-entropy findings are the scanner's own SAST rule tables and test vectors, not credentials
+    ticket: audit-2026-09
+    expires_at: "2027-03-19T00:00:00Z"
+    selectors:
+      rule_id: secret.high-entropy-assignment
+      fingerprint: "ff238f0a7d1eb249f705f0c0ba772abf6ae4251d2e6705b7f6c9735e90e44b83"

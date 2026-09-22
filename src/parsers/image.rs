@@ -18,23 +18,14 @@ pub(crate) fn scan_oci_layout(root: &Path, config: &Config) -> Result<Inventory,
     let index = read_limited(&root.join("index.json"), config.max_input_bytes)?;
     let index: OciIndex =
         serde_json::from_slice(&index).map_err(|e| malformed("index.json", "OCI index", e))?;
-    let descriptor = index.manifests.first().ok_or(InputError::MissingManifest)?;
+    let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
     let manifest_bytes = read_oci_blob(root, &descriptor.digest, config)?;
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| malformed("manifest", "OCI manifest", e))?;
     let config_bytes = read_oci_blob(root, &manifest.config.digest, config)?;
-    let mut filesystem = BTreeMap::new();
-    let mut expanded = 0;
-    for layer in &manifest.layers {
-        let bytes = read_oci_blob(root, &layer.digest, config)?;
-        apply_layer(
-            &bytes,
-            layer.media_type.as_deref(),
-            config,
-            &mut expanded,
-            &mut filesystem,
-        )?;
-    }
+    let filesystem = oci_manifest_filesystem(&manifest, config, |digest| {
+        read_oci_blob(root, digest, config)
+    })?;
     let mut inventory = scan_virtual_files(root, AssetKind::ContainerImage, filesystem)?;
     inventory
         .asset
@@ -50,7 +41,7 @@ pub(crate) fn scan_oci_tar(path: &Path, config: &Config) -> Result<Inventory, In
         if let Some(index_bytes) = outer.get("index.json") {
             let index: OciIndex = serde_json::from_slice(index_bytes)
                 .map_err(|e| malformed("index.json", "OCI index", e))?;
-            let descriptor = index.manifests.first().ok_or(InputError::MissingManifest)?;
+            let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
             let manifest_bytes = outer
                 .get(&blob_path(&descriptor.digest)?)
                 .ok_or_else(|| InputError::MissingBlob(descriptor.digest.clone()))?;
@@ -65,21 +56,13 @@ pub(crate) fn scan_oci_tar(path: &Path, config: &Config) -> Result<Inventory, In
                 })
                 .transpose()?
                 .unwrap_or_default();
-            let mut filesystem = BTreeMap::new();
-            let mut expanded = 0;
-            for layer in &manifest.layers {
+            let filesystem = oci_manifest_filesystem(&manifest, config, |digest| {
                 let bytes = outer
-                    .get(&blob_path(&layer.digest)?)
-                    .ok_or_else(|| InputError::MissingBlob(layer.digest.clone()))?;
-                verify_digest(&layer.digest, bytes)?;
-                apply_layer(
-                    bytes,
-                    layer.media_type.as_deref(),
-                    config,
-                    &mut expanded,
-                    &mut filesystem,
-                )?;
-            }
+                    .get(&blob_path(digest)?)
+                    .ok_or_else(|| InputError::MissingBlob(digest.to_owned()))?;
+                verify_digest(digest, bytes)?;
+                Ok(bytes.clone())
+            })?;
             (
                 scan_virtual_files(path, AssetKind::ContainerImage, filesystem)?,
                 descriptor.digest.clone(),
@@ -91,7 +74,8 @@ pub(crate) fn scan_oci_tar(path: &Path, config: &Config) -> Result<Inventory, In
                 .ok_or(InputError::MissingManifest)?;
             let docker: Vec<DockerManifest> = serde_json::from_slice(manifest_bytes)
                 .map_err(|e| malformed("manifest.json", "Docker image manifest", e))?;
-            let manifest = docker.first().ok_or(InputError::MissingManifest)?;
+            let manifest =
+                select_docker_manifest(&docker, &outer).ok_or(InputError::MissingManifest)?;
             let mut filesystem = BTreeMap::new();
             let mut expanded = 0;
             for layer in &manifest.layers {
@@ -121,16 +105,29 @@ struct OciIndex {
     manifests: Vec<OciDescriptor>,
 }
 #[derive(Deserialize)]
-struct OciDescriptor {
-    digest: String,
+pub(crate) struct OciDescriptor {
+    pub(crate) digest: String,
     #[serde(rename = "mediaType", default)]
-    media_type: Option<String>,
+    pub(crate) media_type: Option<String>,
+    #[serde(rename = "artifactType", default)]
+    pub(crate) artifact_type: Option<String>,
+    #[serde(default)]
+    platform: Option<OciPlatform>,
+    #[serde(default)]
+    annotations: Option<BTreeMap<String, String>>,
 }
 #[derive(Deserialize)]
-struct OciManifest {
-    config: OciDescriptor,
+struct OciPlatform {
     #[serde(default)]
-    layers: Vec<OciDescriptor>,
+    os: Option<String>,
+    #[serde(default)]
+    architecture: Option<String>,
+}
+#[derive(Deserialize)]
+pub(crate) struct OciManifest {
+    pub(crate) config: OciDescriptor,
+    #[serde(default)]
+    pub(crate) layers: Vec<OciDescriptor>,
 }
 #[derive(Deserialize)]
 struct DockerManifest {
@@ -138,6 +135,87 @@ struct DockerManifest {
     config: String,
     #[serde(rename = "Layers", default)]
     layers: Vec<String>,
+}
+
+/// Picks the image manifest an OCI index should scan: the `linux/amd64`
+/// descriptor when present, otherwise the first descriptor that still
+/// looks like an image manifest. Attestation manifests (`artifactType`,
+/// `vnd.docker.reference.type=attestation-manifest`, the `unknown/unknown`
+/// placeholder platform) and non-manifest media types (nested indexes,
+/// docker manifest lists) are never scanned as images.
+fn select_image_manifest(index: &OciIndex) -> Option<&OciDescriptor> {
+    let candidates = index
+        .manifests
+        .iter()
+        .filter(|descriptor| is_image_manifest_descriptor(descriptor));
+    let mut fallback = None;
+    for descriptor in candidates {
+        match descriptor.platform.as_ref() {
+            Some(platform)
+                if platform.os.as_deref() == Some("linux")
+                    && platform.architecture.as_deref() == Some("amd64") =>
+            {
+                return Some(descriptor);
+            }
+            _ => {
+                if fallback.is_none() {
+                    fallback = Some(descriptor);
+                }
+            }
+        }
+    }
+    fallback
+}
+
+/// Reports whether an index descriptor points at an image manifest rather
+/// than an attestation or a nested index/manifest list.
+fn is_image_manifest_descriptor(descriptor: &OciDescriptor) -> bool {
+    if descriptor.artifact_type.is_some() {
+        return false;
+    }
+    if descriptor
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("vnd.docker.reference.type"))
+        .is_some_and(|type_| type_ == "attestation-manifest")
+    {
+        return false;
+    }
+    if descriptor.platform.as_ref().is_some_and(|platform| {
+        platform.os.as_deref() == Some("unknown")
+            || platform.architecture.as_deref() == Some("unknown")
+    }) {
+        return false;
+    }
+    match descriptor.media_type.as_deref() {
+        Some(media_type) => {
+            media_type == "application/vnd.oci.image.manifest.v1+json"
+                || media_type == "application/vnd.docker.distribution.manifest.v2+json"
+        }
+        // A descriptor without a media type is kept as a candidate: the
+        // manifest parse downstream still fails closed on non-manifests.
+        None => true,
+    }
+}
+
+/// Picks the docker `manifest.json` entry to scan: the image whose config
+/// blob declares `linux/amd64`, otherwise the first entry.
+fn select_docker_manifest<'a>(
+    manifests: &'a [DockerManifest],
+    outer: &BTreeMap<String, Vec<u8>>,
+) -> Option<&'a DockerManifest> {
+    manifests
+        .iter()
+        .find(|manifest| {
+            outer
+                .get(&manifest.config)
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+                .is_some_and(|config| {
+                    config.get("os").and_then(Value::as_str) == Some("linux")
+                        && config.get("architecture").and_then(Value::as_str) == Some("amd64")
+                })
+        })
+        .or_else(|| manifests.first())
 }
 
 fn apply_layer(
@@ -148,29 +226,132 @@ fn apply_layer(
     filesystem: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<(), InputError> {
     let layer = read_tar_with_expanded(layer_reader(bytes, media_type)?, config, expanded)?;
-    for (path, bytes) in layer {
-        let name = base_name(&path);
+    // OCI whiteouts delete files from *lower* layers only: a `.wh.` entry
+    // must never remove a file its own layer also ships (the tar map sorts
+    // `.wh..env` after `.env`, so single-pass application deleted the
+    // just-added same-layer file). Collect removals first, apply them to
+    // the accumulated lower-layer filesystem, then insert this layer.
+    let mut opaque_dirs = Vec::new();
+    let mut removals = Vec::new();
+    for path in layer.keys() {
+        let name = base_name(path);
         if name == ".wh..wh..opq" {
-            let parent = path.rsplit_once('/').map(|v| v.0).unwrap_or_default();
-            let prefix = if parent.is_empty() {
-                String::new()
-            } else {
-                format!("{parent}/")
-            };
-            filesystem.retain(|key, _| !key.starts_with(&prefix));
+            opaque_dirs.push(path.rsplit_once('/').map(|v| v.0).unwrap_or_default());
         } else if let Some(target) = name.strip_prefix(".wh.") {
             let parent = path.rsplit_once('/').map(|v| v.0).unwrap_or_default();
-            let removed = if parent.is_empty() {
+            removals.push(if parent.is_empty() {
                 target.to_owned()
             } else {
                 format!("{parent}/{target}")
-            };
-            filesystem.retain(|key, _| key != &removed && !key.starts_with(&format!("{removed}/")));
+            });
+        }
+    }
+    for parent in opaque_dirs {
+        let prefix = if parent.is_empty() {
+            String::new()
         } else {
+            format!("{parent}/")
+        };
+        filesystem.retain(|key, _| !key.starts_with(&prefix));
+    }
+    for removed in removals {
+        filesystem.retain(|key, _| key != &removed && !key.starts_with(&format!("{removed}/")));
+    }
+    for (path, bytes) in layer {
+        let name = base_name(&path);
+        if name != ".wh..wh..opq" && !name.starts_with(".wh.") {
             filesystem.insert(path, bytes);
         }
     }
     Ok(())
+}
+
+/// Builds the virtual filesystem an OCI image manifest describes: every
+/// layer blob is fetched through `read_blob` and applied in order with
+/// whiteout semantics. Exposed so the engine can feed image layers to the
+/// lockfile scanners without duplicating layer application.
+pub(crate) fn oci_manifest_filesystem(
+    manifest: &OciManifest,
+    config: &Config,
+    mut read_blob: impl FnMut(&str) -> Result<Vec<u8>, InputError>,
+) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
+    let mut filesystem = BTreeMap::new();
+    let mut expanded = 0;
+    for layer in &manifest.layers {
+        let bytes = read_blob(&layer.digest)?;
+        apply_layer(
+            &bytes,
+            layer.media_type.as_deref(),
+            config,
+            &mut expanded,
+            &mut filesystem,
+        )?;
+    }
+    Ok(filesystem)
+}
+
+/// Extracted layer filesystem for an unpacked OCI layout, exposed so
+/// `ScanInput::virtual_files` can feed image contents to the filesystem and
+/// license analyzers without duplicating manifest resolution.
+pub(crate) fn oci_layout_filesystem(
+    root: &Path,
+    config: &Config,
+) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
+    reject_symlink_ancestors(root)?;
+    let index = read_limited(&root.join("index.json"), config.max_input_bytes)?;
+    let index: OciIndex =
+        serde_json::from_slice(&index).map_err(|e| malformed("index.json", "OCI index", e))?;
+    let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
+    let manifest_bytes = read_oci_blob(root, &descriptor.digest, config)?;
+    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| malformed("manifest", "OCI manifest", e))?;
+    oci_manifest_filesystem(&manifest, config, |digest| {
+        read_oci_blob(root, digest, config)
+    })
+}
+
+/// Extracted layer filesystem for an OCI/docker-save tar, mirroring the
+/// manifest resolution of `scan_oci_tar` for `ScanInput::virtual_files`.
+pub(crate) fn oci_tar_filesystem(
+    path: &Path,
+    config: &Config,
+) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
+    let outer = read_tar_file(path, config)?;
+    if let Some(index_bytes) = outer.get("index.json") {
+        let index: OciIndex = serde_json::from_slice(index_bytes)
+            .map_err(|e| malformed("index.json", "OCI index", e))?;
+        let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
+        let manifest_bytes = outer
+            .get(&blob_path(&descriptor.digest)?)
+            .ok_or_else(|| InputError::MissingBlob(descriptor.digest.clone()))?;
+        verify_digest(&descriptor.digest, manifest_bytes)?;
+        let manifest: OciManifest = serde_json::from_slice(manifest_bytes)
+            .map_err(|e| malformed("manifest", "OCI manifest", e))?;
+        oci_manifest_filesystem(&manifest, config, |digest| {
+            let bytes = outer
+                .get(&blob_path(digest)?)
+                .ok_or_else(|| InputError::MissingBlob(digest.to_owned()))?;
+            verify_digest(digest, bytes)?;
+            Ok(bytes.clone())
+        })
+    } else {
+        let manifest_bytes = outer
+            .get("manifest.json")
+            .ok_or(InputError::MissingManifest)?;
+        let docker: Vec<DockerManifest> = serde_json::from_slice(manifest_bytes)
+            .map_err(|e| malformed("manifest.json", "Docker image manifest", e))?;
+        let manifest =
+            select_docker_manifest(&docker, &outer).ok_or(InputError::MissingManifest)?;
+        let mut filesystem = BTreeMap::new();
+        let mut expanded = 0;
+        for layer in &manifest.layers {
+            let bytes = outer
+                .get(layer)
+                .ok_or_else(|| InputError::MissingBlob(layer.clone()))?;
+            apply_layer(bytes, None, config, &mut expanded, &mut filesystem)?;
+        }
+        Ok(filesystem)
+    }
 }
 
 /// Wraps a layer blob in the decompressor its bytes and media type declare.
@@ -254,7 +435,22 @@ fn is_plain_layer_media_type(media_type: &str) -> bool {
 fn read_oci_blob(root: &Path, digest: &str, config: &Config) -> Result<Vec<u8>, InputError> {
     let path = root.join(blob_path(digest)?);
     reject_symlink_ancestors_below(root, &path)?;
-    let bytes = read_limited(&path, config.max_archive_bytes)?;
+    // Canonicalize the blob path (resolving every symlink, including the
+    // final component) and require it to stay under the layout root: a
+    // `blobs/sha256/<hex>` symlink pointing outside the image directory
+    // must not be followed.
+    let canonical_root = std::fs::canonicalize(root).map_err(|source| InputError::Io {
+        path: root.to_owned(),
+        source,
+    })?;
+    let canonical = std::fs::canonicalize(&path).map_err(|source| InputError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(InputError::Symlink(path));
+    }
+    let bytes = read_limited(&canonical, config.max_archive_bytes)?;
     verify_digest(digest, &bytes)?;
     Ok(bytes)
 }
@@ -268,7 +464,11 @@ fn verify_digest(digest: &str, bytes: &[u8]) -> Result<(), InputError> {
 }
 
 fn blob_path(digest: &str) -> Result<String, InputError> {
-    let (algorithm, value) = digest
+    // Digest filenames are lowercase `algo:hex`; `verify_digest` already
+    // compares case-insensitively, so normalize the whole digest before
+    // validating and building the path.
+    let normalized = digest.to_ascii_lowercase();
+    let (algorithm, value) = normalized
         .split_once(':')
         .ok_or_else(|| InputError::MissingBlob(digest.to_owned()))?;
     if algorithm != "sha256" || value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -550,6 +750,31 @@ mod tests {
             Err(InputError::DigestMismatch(value)) if value == claimed
         ));
     }
+    #[cfg(unix)]
+    #[test]
+    fn oci_layout_rejects_blob_symlinks_escaping_the_root() {
+        // A `blobs/sha256/<hex>` symlink pointing outside the layout must
+        // not be followed: the canonical blob path has to stay under the
+        // canonical root.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("oci-layout"), "{}").unwrap();
+        let outside = tempdir().unwrap();
+        let claimed = digest(7);
+        let manifest = br#"{"config":{"digest":"sha256:00"},"layers":[]}"#;
+        fs::write(outside.path().join("manifest.json"), manifest).unwrap();
+        let blob = dir.path().join(blob_name(&claimed));
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("manifest.json"), &blob).unwrap();
+        fs::write(
+            dir.path().join("index.json"),
+            format!(r#"{{"manifests":[{{"digest":"{claimed}"}}]}}"#),
+        )
+        .unwrap();
+        assert!(matches!(
+            scan_path(dir.path(), &config()),
+            Err(InputError::Symlink(_))
+        ));
+    }
     #[test]
     fn oci_tar_index_and_docker_manifest_variants_are_scanned() {
         let dir = tempdir().unwrap();
@@ -632,14 +857,13 @@ mod tests {
 
         // An object-shaped (or unparseable) manifest.json is a web app
         // manifest or garbage, not a docker-save archive: detection falls
-        // back to archive scanning, which rejects the tar as unsupported
-        // instead of the image parser's Malformed.
+        // back to archive scanning, which yields an empty inventory for a
+        // recognized container with no lockfiles.
         let path = dir.path().join("web-manifest.tar");
         write_tar(&path, &[("manifest.json", br#"{"name":"app"}"#)]);
-        assert!(matches!(
-            scan_path(&path, &config()),
-            Err(InputError::UnsupportedFormat(_))
-        ));
+        let inventory = scan_path(&path, &config()).unwrap();
+        assert!(inventory.components.is_empty());
+        assert!(inventory.dependencies.is_empty());
 
         let claimed = digest(8);
         let index = format!(r#"{{"manifests":[{{"digest":"{claimed}"}}]}}"#);
@@ -680,20 +904,20 @@ mod tests {
         assert!(!filesystem.contains_key("app/.wh..wh..opq"));
     }
     #[test]
-    fn image_archive_limit_is_cumulative_across_layers_and_whiteouts() {
-        let first = tar_bytes(&[("old", b"1234")]);
-        let second = tar_bytes(&[(".wh.old", b""), ("requirements.txt", b"a==1\n")]);
+    fn layer_stream_bytes_count_against_the_archive_bound() {
+        // The decompressed tar stream — headers, padding, and the bytes
+        // tar-rs drains for skipped entries — counts against
+        // `max_archive_bytes`, not just the declared sizes of extracted
+        // files: a 5-byte payload inside a ~2 KiB stream exceeds a 5-byte
+        // bound even though the declared entry size alone would fit.
+        let layer = tar_bytes(&[("requirements.txt", b"a==1\n")]);
         let mut limited = config();
         limited.max_archive_bytes = 5;
         let mut filesystem = BTreeMap::new();
         let mut expanded = 0;
-        apply_layer(&first, None, &limited, &mut expanded, &mut filesystem).unwrap();
         assert!(matches!(
-            apply_layer(&second, None, &limited, &mut expanded, &mut filesystem),
-            Err(InputError::ArchiveTooLarge {
-                actual: 9,
-                maximum: 5
-            })
+            apply_layer(&layer, None, &limited, &mut expanded, &mut filesystem),
+            Err(InputError::ArchiveTooLarge { .. })
         ));
     }
     fn digest(value: u8) -> String {
@@ -701,5 +925,90 @@ mod tests {
     }
     fn blob_name(digest: &str) -> String {
         format!("blobs/sha256/{}", digest.strip_prefix("sha256:").unwrap())
+    }
+
+    #[test]
+    fn oci_index_prefers_linux_amd64_and_skips_attestations() {
+        let dir = tempdir().unwrap();
+        let layer = tar_bytes(&[("requirements.txt", b"requests==2.31.0\n")]);
+        let config_json = br#"{"os":"linux","architecture":"amd64"}"#;
+        let config_digest = sha256(config_json);
+        let layer_digest = sha256(&layer);
+        let manifest = format!(
+            r#"{{"config":{{"digest":"{config_digest}"}},"layers":[{{"digest":"{layer_digest}"}}]}}"#
+        );
+        let manifest_digest = sha256(manifest.as_bytes());
+        // An attestation descriptor sorts first; the amd64 image manifest
+        // must still be the one scanned.
+        let attestation_digest = sha256(b"attestation");
+        let index = format!(
+            r#"{{"manifests":[{{"digest":"{attestation_digest}","mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"application/vnd.in-toto+json","platform":{{"os":"unknown","architecture":"unknown"}}}},{{"digest":"{manifest_digest}","mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{{"os":"linux","architecture":"amd64"}}}}]}}"#
+        );
+        let path = dir.path().join("multi.tar");
+        write_tar(
+            &path,
+            &[
+                ("oci-layout", b"{}"),
+                ("index.json", index.as_bytes()),
+                (&blob_name(&manifest_digest), manifest.as_bytes()),
+                (&blob_name(&config_digest), config_json),
+                (&blob_name(&layer_digest), &layer),
+                (&blob_name(&attestation_digest), b"attestation"),
+            ],
+        );
+        let inventory = scan_path(&path, &config()).unwrap();
+        assert!(inventory.components.values().any(|c| c.name == "requests"));
+        assert_eq!(
+            inventory.asset.metadata["manifest_digest"],
+            json!(manifest_digest)
+        );
+    }
+
+    #[test]
+    fn oci_layout_resolves_uppercase_hex_digests() {
+        let dir = tempdir().unwrap();
+        let layer = tar_bytes(&[("requirements.txt", b"requests==2.31.0\n")]);
+        let config_json = br#"{"os":"linux"}"#;
+        let config_digest = sha256(config_json);
+        let layer_digest = sha256(&layer);
+        // Some producers write uppercase-hex digest strings; the blob
+        // filenames stay spec-lowercase, so lookup must normalize like
+        // verify_digest already does.
+        let manifest = format!(
+            r#"{{"config":{{"digest":"{}"}},"layers":[{{"digest":"{}"}}]}}"#,
+            config_digest.to_uppercase(),
+            layer_digest.to_uppercase()
+        );
+        let manifest_digest = sha256(manifest.as_bytes());
+        let index = format!(
+            r#"{{"manifests":[{{"digest":"{}"}}]}}"#,
+            manifest_digest.to_uppercase()
+        );
+        let root = dir.path().join("oci-layout");
+        for (name, bytes) in [
+            ("oci-layout", b"{}".as_slice()),
+            ("index.json", index.as_bytes()),
+            (&blob_name(&manifest_digest), manifest.as_bytes()),
+            (&blob_name(&config_digest), config_json),
+            (&blob_name(&layer_digest), &layer),
+        ] {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let inventory = scan_path(&root, &config()).unwrap();
+        assert!(inventory.components.values().any(|c| c.name == "requests"));
+    }
+
+    #[test]
+    fn same_layer_dotfiles_survive_their_own_whiteouts() {
+        let layer = tar_bytes(&[(".env", b"SECRET=1\n"), (".wh..env", b"")]);
+        let mut filesystem = BTreeMap::new();
+        let mut expanded = 0;
+        apply_layer(&layer, None, &config(), &mut expanded, &mut filesystem).unwrap();
+        // `.wh..env` removes lower-layer `.env` only; the same-layer file
+        // the tar also ships must survive.
+        assert_eq!(filesystem[".env"], b"SECRET=1\n");
+        assert!(!filesystem.contains_key(".wh..env"));
     }
 }

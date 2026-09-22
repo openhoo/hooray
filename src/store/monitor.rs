@@ -89,6 +89,33 @@ where
     Ok(out)
 }
 
+/// Registration/write-path invariants shared by `MonitorTarget::new`,
+/// `upsert_monitor_target`, and `add_monitor_target`: non-blank id within
+/// the 256-byte cap, non-blank source within the 4096-byte cap, and an
+/// interval inside the scheduler's 1..=86400-second backoff bound.
+fn validate_monitor_target_fields(
+    target_id: &str,
+    source: &str,
+    interval_seconds: u64,
+) -> Result<(), StoreError> {
+    if target_id.trim().is_empty() || target_id.len() > 256 {
+        return Err(StoreError::InvalidMonitorData(
+            "monitor target id must be 1..=256 bytes".into(),
+        ));
+    }
+    if source.trim().is_empty() || source.len() > 4096 {
+        return Err(StoreError::InvalidMonitorData(
+            "monitor target source must be 1..=4096 bytes".into(),
+        ));
+    }
+    if interval_seconds == 0 || interval_seconds > 86_400 {
+        return Err(StoreError::InvalidMonitorData(
+            "monitor interval must be 1..=86400 seconds".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Builds a fresh registration target that is immediately due.
 ///
 /// Enforces the registration-time invariant for identifiers and stamps
@@ -101,11 +128,7 @@ impl MonitorTarget {
         interval_seconds: u64,
         now: i64,
     ) -> Result<Self, StoreError> {
-        if target_id.trim().is_empty() {
-            return Err(StoreError::InvalidMonitorData(
-                "monitor target id must not be blank".into(),
-            ));
-        }
+        validate_monitor_target_fields(&target_id, &source, interval_seconds)?;
         let now = encode_time(now);
         Ok(Self {
             target_id,
@@ -124,6 +147,10 @@ impl MonitorTarget {
 
 impl Store {
     pub fn upsert_monitor_target(&mut self, target: &MonitorTarget) -> Result<(), StoreError> {
+        // Store-level writes enforce the same invariants the CLI validates:
+        // an out-of-contract row would fail MonitorTarget::validate() every
+        // monitor cycle and be perpetually rescheduled.
+        validate_monitor_target_fields(&target.target_id, &target.source, target.interval_seconds)?;
         let enc = encode_monitor_target(target)?;
         self.connection.execute("INSERT INTO monitor_targets(target_id,source,interval_seconds,next_due_at,source_fingerprint,inventory_json,advisory_digest,policy_digest,finding_ids_json,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(target_id) DO UPDATE SET source=excluded.source,interval_seconds=excluded.interval_seconds,next_due_at=excluded.next_due_at,source_fingerprint=excluded.source_fingerprint,inventory_json=excluded.inventory_json,advisory_digest=excluded.advisory_digest,policy_digest=excluded.policy_digest,finding_ids_json=excluded.finding_ids_json,updated_at=excluded.updated_at",params![target.target_id,target.source,enc.interval_seconds,target.next_due_at,target.source_fingerprint,enc.inventory_json,target.advisory_digest,target.policy_digest,enc.findings_json,target.updated_at])?;
         Ok(())
@@ -149,11 +176,20 @@ impl Store {
         let rows = s.query_map(params![through, limit, offset], read_monitor_target)?;
         collect_sql_rows(rows)
     }
-    pub fn update_monitor_target(&mut self, target: &MonitorTarget) -> Result<bool, StoreError> {
+    /// Compare-and-swap update: only writes when the stored row still
+    /// carries `expected_updated_at`, so racing monitors cannot silently
+    /// overwrite each other's finding state (and a removed target is not
+    /// resurrected). Returns false on conflict.
+    pub fn update_monitor_target(
+        &mut self,
+        target: &MonitorTarget,
+        expected_updated_at: &str,
+    ) -> Result<bool, StoreError> {
         let enc = encode_monitor_target(target)?;
-        Ok(self.connection.execute("UPDATE monitor_targets SET source=?2,interval_seconds=?3,next_due_at=?4,source_fingerprint=?5,inventory_json=?6,advisory_digest=?7,policy_digest=?8,finding_ids_json=?9,updated_at=?10 WHERE target_id=?1",params![target.target_id,target.source,enc.interval_seconds,target.next_due_at,target.source_fingerprint,enc.inventory_json,target.advisory_digest,target.policy_digest,enc.findings_json,target.updated_at])?==1)
+        Ok(self.connection.execute("UPDATE monitor_targets SET source=?2,interval_seconds=?3,next_due_at=?4,source_fingerprint=?5,inventory_json=?6,advisory_digest=?7,policy_digest=?8,finding_ids_json=?9,updated_at=?10 WHERE target_id=?1 AND updated_at=?11",params![target.target_id,target.source,enc.interval_seconds,target.next_due_at,target.source_fingerprint,enc.inventory_json,target.advisory_digest,target.policy_digest,enc.findings_json,target.updated_at,expected_updated_at])?==1)
     }
     pub fn add_monitor_target(&mut self, target: &MonitorTarget) -> Result<(), StoreError> {
+        validate_monitor_target_fields(&target.target_id, &target.source, target.interval_seconds)?;
         if target.target_id.trim().is_empty() {
             return Err(StoreError::InvalidMonitorData(
                 "monitor target id must not be blank".into(),
@@ -219,7 +255,10 @@ impl Store {
     pub fn append_monitor_event(&mut self, event: &MonitorEvent) -> Result<bool, StoreError> {
         let payload = serde_json::to_string(&event.payload)?;
         let attempts = i64::try_from(event.attempts).map_err(|_| StoreError::VersionOverflow)?;
-        Ok(self.connection.execute("INSERT OR IGNORE INTO monitor_events(event_id,target_id,dedupe_key,kind,payload_json,created_at,attempts,next_attempt_at,delivered_at,dead_lettered_at,last_error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![event.event_id,event.target_id,event.dedupe_key,event.kind,payload,event.created_at,attempts,event.next_attempt_at,event.delivered_at,event.dead_lettered_at,event.last_error])?==1)
+        // ON CONFLICT(dedupe_key) scopes the ignore to the intended dedupe
+        // hit; FK/CHECK violations (deleted target, terminal-state misuse)
+        // surface as errors instead of silently dropping the alert.
+        Ok(self.connection.execute("INSERT INTO monitor_events(event_id,target_id,dedupe_key,kind,payload_json,created_at,attempts,next_attempt_at,delivered_at,dead_lettered_at,last_error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(dedupe_key) DO NOTHING",params![event.event_id,event.target_id,event.dedupe_key,event.kind,payload,event.created_at,attempts,event.next_attempt_at,event.delivered_at,event.dead_lettered_at,event.last_error])?==1)
     }
     /// Claims up to `limit` due events for delivery, leasing them until
     /// `lease_until`.
@@ -263,7 +302,10 @@ impl Store {
         // returned - exactly-once across connections.
         let placeholders = vec!["?"; event_ids.len()].join(",");
         let mut statement = transaction.prepare(&format!(
-            "UPDATE monitor_events SET next_attempt_at=?1 WHERE event_id IN ({placeholders}) AND coalesce(next_attempt_at,created_at)<=?{due} AND delivered_at IS NULL AND dead_lettered_at IS NULL RETURNING event_id,target_id,dedupe_key,kind,payload_json,created_at,attempts,next_attempt_at,delivered_at,dead_lettered_at,last_error",
+            // attempts is incremented in the claim itself: a worker that
+            // crashes after claiming but before saving the result still
+            // counts toward max_attempts and eventually dead-letters.
+            "UPDATE monitor_events SET next_attempt_at=?1, attempts=attempts+1 WHERE event_id IN ({placeholders}) AND coalesce(next_attempt_at,created_at)<=?{due} AND delivered_at IS NULL AND dead_lettered_at IS NULL RETURNING event_id,target_id,dedupe_key,kind,payload_json,created_at,attempts,next_attempt_at,delivered_at,dead_lettered_at,last_error",
             due = event_ids.len() + 2,
         ))?;
         let rows = statement.query_map(
@@ -338,7 +380,13 @@ impl Store {
         Ok(self.connection.execute("UPDATE monitor_events SET target_id=?2,dedupe_key=?3,kind=?4,payload_json=?5,created_at=?6,attempts=?7,next_attempt_at=?8,delivered_at=?9,dead_lettered_at=?10,last_error=?11 WHERE event_id=?1 AND (?9 IS NOT NULL OR delivered_at IS NULL) AND (?10 IS NOT NULL OR dead_lettered_at IS NULL)",params![e.event_id,e.target_id,e.dedupe_key,e.kind,payload,e.created_at,attempts,e.next_attempt_at,e.delivered_at,e.dead_lettered_at,e.last_error])?==1)
     }
     pub fn prune_monitor_before(&mut self, timestamp: &str) -> Result<usize, StoreError> {
-        Ok(self.connection.execute("DELETE FROM monitor_events WHERE created_at<?1 AND (delivered_at IS NOT NULL OR dead_lettered_at IS NOT NULL)",[timestamp])?)
+        // Retention keys on the terminal time (delivery or dead-letter),
+        // not creation: an old event that dead-letters today must survive
+        // for inspection instead of vanishing in the same cycle.
+        Ok(self.connection.execute(
+            "DELETE FROM monitor_events WHERE coalesce(dead_lettered_at, delivered_at) < ?1",
+            [timestamp],
+        )?)
     }
 }
 
@@ -350,7 +398,7 @@ mod tests {
     #[test]
     fn monitor_roundtrip_dedupe_and_order() {
         let mut s = Store::open_memory().unwrap();
-        for (id, due) in [("b", "2026-01-02Z"), ("a", "2026-01-02Z")] {
+        for (id, due) in [("b", "2026-01-02T00:00:00Z"), ("a", "2026-01-02T00:00:00Z")] {
             s.upsert_monitor_target(&MonitorTarget {
                 target_id: id.into(),
                 source: "repo".into(),
@@ -361,12 +409,12 @@ mod tests {
                 advisory_digest: None,
                 policy_digest: None,
                 finding_ids: vec![],
-                updated_at: "2026-01-01Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
             })
             .unwrap();
         }
         assert_eq!(
-            s.list_due_monitor_targets("2026-01-02Z", 10, 0)
+            s.list_due_monitor_targets("2026-01-02T00:00:00Z", 10, 0)
                 .unwrap()
                 .iter()
                 .map(|x| x.target_id.as_str())
@@ -379,7 +427,7 @@ mod tests {
             dedupe_key: "d1".into(),
             kind: "changed".into(),
             payload: serde_json::json!({"x":1}),
-            created_at: "2026-01-01Z".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
             attempts: 0,
             next_attempt_at: None,
             delivered_at: None,
@@ -403,10 +451,10 @@ mod tests {
         let path = directory.path().join("claims.db");
         let mut setup = Store::open(&path).unwrap();
         setup
-            .upsert_monitor_target(&target("target", "2026-01-01Z"))
+            .upsert_monitor_target(&target("target", "2026-01-01T00:00:00Z"))
             .unwrap();
         setup
-            .append_monitor_event(&event("event", "target", Some("2026-01-01Z")))
+            .append_monitor_event(&event("event", "target", Some("2026-01-01T00:00:00Z")))
             .unwrap();
         drop(setup);
 
@@ -419,7 +467,7 @@ mod tests {
                     let mut store = Store::open(path).unwrap();
                     barrier.wait();
                     store
-                        .claim_monitor_events("2026-01-01Z", "2026-01-02Z", 1)
+                        .claim_monitor_events("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", 1)
                         .unwrap()
                         .len()
                 })
@@ -438,30 +486,30 @@ mod tests {
     #[test]
     fn stale_expired_lease_write_back_cannot_erase_newer_delivery() {
         let mut s = Store::open_memory().unwrap();
-        s.upsert_monitor_target(&target("target", "2026-01-01Z"))
+        s.upsert_monitor_target(&target("target", "2026-01-01T00:00:00Z"))
             .unwrap();
-        s.append_monitor_event(&event("event", "target", Some("2026-01-01Z")))
+        s.append_monitor_event(&event("event", "target", Some("2026-01-01T00:00:00Z")))
             .unwrap();
         // Worker A claims the event with a lease that expires before it finishes.
         let claimed_a = s
-            .claim_monitor_events("2026-01-01Z", "2026-01-02Z", 1)
+            .claim_monitor_events("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", 1)
             .unwrap();
         assert_eq!(claimed_a.len(), 1);
         // After that lease expires, worker B re-claims and records delivery.
         let claimed_b = s
-            .claim_monitor_events("2026-01-03Z", "2026-01-04Z", 1)
+            .claim_monitor_events("2026-01-03T00:00:00Z", "2026-01-04T00:00:00Z", 1)
             .unwrap();
         assert_eq!(claimed_b.len(), 1);
         let mut delivered = claimed_b[0].clone();
-        delivered.delivered_at = Some("2026-01-03Z".into());
-        delivered.next_attempt_at = Some("2026-01-03Z".into());
+        delivered.delivered_at = Some("2026-01-03T00:00:00Z".into());
+        delivered.next_attempt_at = Some("2026-01-03T00:00:00Z".into());
         assert!(s.update_monitor_event(&delivered).unwrap());
         // Stale worker A writes back its pre-delivery snapshot: this must not
         // erase the newer delivery record or reschedule duplicate delivery.
         let mut stale = claimed_a[0].clone();
         stale.attempts = 1;
         stale.last_error = Some("temporary".into());
-        stale.next_attempt_at = Some("2026-01-05Z".into());
+        stale.next_attempt_at = Some("2026-01-05T00:00:00Z".into());
         assert!(!s.update_monitor_event(&stale).unwrap());
         let events = s
             .list_monitor_events(
@@ -474,8 +522,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].delivered_at.as_deref(), Some("2026-01-03Z"));
-        assert_eq!(events[0].attempts, 0);
+        assert_eq!(
+            events[0].delivered_at.as_deref(),
+            Some("2026-01-03T00:00:00Z")
+        );
+        // Each claim increments attempts so crash-after-claim still counts
+        // toward max_attempts; two claims (A, then B) leave attempts at 2.
+        assert_eq!(events[0].attempts, 2);
         assert_eq!(events[0].last_error, None);
     }
 
@@ -484,25 +537,31 @@ mod tests {
         let mut s = Store::open_memory().unwrap();
         assert_eq!(s.get_monitor_target("missing").unwrap(), None);
         assert_eq!(s.get_monitor_cursor("missing").unwrap(), None);
-        assert!(!s.update_monitor_target(&target("missing", "t")).unwrap());
+        assert!(
+            !s.update_monitor_target(&target("missing", "t"), "2026-01-01T00:00:00Z")
+                .unwrap()
+        );
         assert!(
             !s.update_monitor_event(&event("missing", "missing", None))
                 .unwrap()
         );
 
-        let mut t = target("target", "2026-01-03Z");
+        let mut t = target("target", "2026-01-03T00:00:00Z");
         s.upsert_monitor_target(&t).unwrap();
         t.source = "updated".into();
-        t.next_due_at = "2026-01-02Z".into();
-        assert!(s.update_monitor_target(&t).unwrap());
+        t.next_due_at = "2026-01-02T00:00:00Z".into();
+        // CAS: a stale expected updated_at conflicts; the observed one writes.
+        assert!(!s.update_monitor_target(&t, "1999-01-01Z").unwrap());
+        assert!(s.update_monitor_target(&t, "2026-01-01T00:00:00Z").unwrap());
         assert_eq!(s.get_monitor_target("target").unwrap(), Some(t.clone()));
         assert!(
-            s.list_due_monitor_targets("2026-01-01Z", 10, 0)
+            s.list_due_monitor_targets("2026-01-01T00:00:00Z", 10, 0)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            s.list_due_monitor_targets("2026-01-02Z", 10, 0).unwrap()[0],
+            s.list_due_monitor_targets("2026-01-02T00:00:00Z", 10, 0)
+                .unwrap()[0],
             t
         );
 
@@ -520,11 +579,11 @@ mod tests {
         s.set_monitor_cursor(&cursor).unwrap();
         assert_eq!(s.get_monitor_cursor("osv").unwrap(), Some(cursor));
 
-        let pending = event("pending", "target", Some("2026-01-02Z"));
+        let pending = event("pending", "target", Some("2026-01-02T00:00:00Z"));
         let mut delivered = event("delivered", "target", None);
-        delivered.delivered_at = Some("2026-01-03Z".into());
+        delivered.delivered_at = Some("2026-01-03T00:00:00Z".into());
         let mut dead = event("dead", "target", None);
-        dead.dead_lettered_at = Some("2026-01-03Z".into());
+        dead.dead_lettered_at = Some("2026-01-03T00:00:00Z".into());
         for e in [&pending, &delivered, &dead] {
             assert!(s.append_monitor_event(e).unwrap());
         }
@@ -540,7 +599,7 @@ mod tests {
             s.list_monitor_events(
                 &MonitorEventFilter {
                     target_id: Some("target".into()),
-                    due_through: Some("2026-01-02Z".into()),
+                    due_through: Some("2026-01-02T00:00:00Z".into()),
                     include_delivered: true,
                     include_dead_lettered: true
                 },
@@ -605,7 +664,7 @@ mod tests {
                 .attempts,
             2
         );
-        assert_eq!(s.prune_monitor_before("2026-02-01Z").unwrap(), 2);
+        assert_eq!(s.prune_monitor_before("2026-02-01T00:00:00Z").unwrap(), 2);
         assert_eq!(
             s.list_monitor_events(
                 &MonitorEventFilter {
@@ -626,9 +685,9 @@ mod tests {
     fn add_monitor_target_inserts_and_lists_in_deterministic_order() {
         let mut s = Store::open_memory().unwrap();
         assert!(s.list_monitor_targets(10, 0).unwrap().is_empty());
-        s.add_monitor_target(&target("zeta", "2026-01-01Z"))
+        s.add_monitor_target(&target("zeta", "2026-01-01T00:00:00Z"))
             .unwrap();
-        s.add_monitor_target(&target("alpha", "2026-01-02Z"))
+        s.add_monitor_target(&target("alpha", "2026-01-02T00:00:00Z"))
             .unwrap();
         assert_eq!(
             s.list_monitor_targets(10, 0)
@@ -648,10 +707,10 @@ mod tests {
     #[test]
     fn duplicate_add_monitor_target_fails_cleanly() {
         let mut s = Store::open_memory().unwrap();
-        s.add_monitor_target(&target("target", "2026-01-01Z"))
+        s.add_monitor_target(&target("target", "2026-01-01T00:00:00Z"))
             .unwrap();
         assert!(matches!(
-            s.add_monitor_target(&target("target", "2026-01-02Z")),
+            s.add_monitor_target(&target("target", "2026-01-02T00:00:00Z")),
             Err(StoreError::MonitorTargetExists { target_id }) if target_id == "target"
         ));
     }
@@ -659,7 +718,7 @@ mod tests {
     #[test]
     fn add_monitor_target_rejects_invalid_registrations() {
         let mut s = Store::open_memory().unwrap();
-        let mut invalid = target(" ", "2026-01-01Z");
+        let mut invalid = target(" ", "2026-01-01T00:00:00Z");
         assert!(matches!(
             s.add_monitor_target(&invalid),
             Err(StoreError::InvalidMonitorData(_))
@@ -683,7 +742,7 @@ mod tests {
     fn monitor_target_new_rejects_blank_id_and_stamps_registration_times() {
         assert!(matches!(
             MonitorTarget::new("   ".into(), "repo".into(), 60, 1_700_000_000),
-            Err(StoreError::InvalidMonitorData(msg)) if msg.contains("id must not be blank")
+            Err(StoreError::InvalidMonitorData(msg)) if msg.contains("256 bytes")
         ));
         let encoded = format!("{:020}", 1_700_000_000_u64 ^ (1_u64 << 63));
         let target = MonitorTarget::new("alpha".into(), "repo".into(), 60, 1_700_000_000).unwrap();
@@ -698,7 +757,7 @@ mod tests {
     fn remove_monitor_target_reports_presence_then_absence_and_cascades_events() {
         let mut s = Store::open_memory().unwrap();
         assert!(!s.remove_monitor_target("target").unwrap());
-        s.add_monitor_target(&target("target", "2026-01-02Z"))
+        s.add_monitor_target(&target("target", "2026-01-02T00:00:00Z"))
             .unwrap();
         s.append_monitor_event(&event("pending", "target", None))
             .unwrap();
@@ -727,7 +786,7 @@ mod tests {
         t.interval_seconds = u64::MAX;
         assert!(matches!(
             s.upsert_monitor_target(&t),
-            Err(StoreError::VersionOverflow)
+            Err(StoreError::InvalidMonitorData(_))
         ));
         assert_eq!(s.get_monitor_target("overflow").unwrap(), None);
         let mut e = event("overflow", "overflow", None);
