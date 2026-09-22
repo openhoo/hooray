@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use serde::Deserialize;
 use serde_yaml::Value as Yaml;
 
 use super::npm::npm_scope;
-use super::{LockComponents, resolve_lock_component, split_descriptor, yaml_doc};
-use crate::input::{InputError, InventoryBuilder, entry_bound, malformed_msg, utf8};
+use super::{LockComponents, resolve_lock_component, split_descriptor};
+use crate::input::{
+    InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8,
+    yaml_expansion_within_budget,
+};
 use crate::model::Scope;
 
 /// A resolved package identity: `(name, version)` with pnpm peer suffixes and
@@ -19,7 +23,7 @@ pub(crate) fn parse_pnpm_lock(
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let doc: Yaml = yaml_doc(utf8(bytes, path, "pnpm-lock.yaml")?, path, "pnpm-lock.yaml")?;
+    let doc = pnpm_lock_doc(utf8(bytes, path, "pnpm-lock.yaml")?, path)?;
     let packages = doc.get("packages").and_then(Yaml::as_mapping);
     let snapshots = doc.get("snapshots").and_then(Yaml::as_mapping);
     let importers = doc.get("importers").and_then(Yaml::as_mapping);
@@ -144,6 +148,48 @@ pub(crate) fn parse_pnpm_lock(
         out.edge(from, &to, scope, *optional);
     }
     Ok(())
+}
+
+/// Parses a `pnpm-lock.yaml` stream into one merged top-level mapping. pnpm 12
+/// writes lockfileVersion 9 files as multiple YAML documents — `importers` in
+/// the first, `settings`/`packages`/`snapshots` in the second — so every
+/// document is deserialized and its top-level mapping unioned (nested mappings
+/// merge recursively; scalar/array values keep the first document's). Empty
+/// documents contribute nothing; malformed YAML in any document fails closed.
+fn pnpm_lock_doc(text: &str, path: &str) -> Result<Yaml, InputError> {
+    if !yaml_expansion_within_budget(text) {
+        return Err(malformed_msg(
+            path,
+            "pnpm-lock.yaml",
+            "YAML alias expansion exceeds the materialized-size budget",
+        ));
+    }
+    let mut merged = serde_yaml::Mapping::new();
+    for document in serde_yaml::Deserializer::from_str(text) {
+        let doc = Yaml::deserialize(document).map_err(|e| malformed(path, "pnpm-lock.yaml", e))?;
+        let Some(mapping) = doc.as_mapping() else {
+            continue;
+        };
+        merge_yaml_mappings(&mut merged, mapping);
+    }
+    Ok(Yaml::Mapping(merged))
+}
+
+/// Unions `source` into `target`: mapping values merge recursively so sections
+/// split across documents (`packages`, `snapshots`, `importers`) accumulate
+/// instead of overwriting; other values keep the first document's.
+fn merge_yaml_mappings(target: &mut serde_yaml::Mapping, source: &serde_yaml::Mapping) {
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (Some(Yaml::Mapping(existing)), Yaml::Mapping(incoming)) => {
+                merge_yaml_mappings(existing, incoming);
+            }
+            (Some(_), _) => {}
+            (None, _) => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 /// Queues a package or snapshot entry's `dependencies`/`optionalDependencies`
@@ -664,5 +710,172 @@ mod tests {
         assert!(inventory.dependencies.iter().any(|e| {
             e.from == component("plugin").identity && e.to == component("host").identity
         }));
+    }
+
+    #[test]
+    fn pnpm_multi_document_lockfile_merges_all_documents() {
+        // pnpm 12 writes lockfileVersion 9 as two YAML documents: `importers`
+        // in the first, `settings`/`packages`/`snapshots` in the second.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            concat!(
+                "---\n",
+                "lockfileVersion: '9.0'\n",
+                "\n",
+                "importers:\n",
+                "  .:\n",
+                "    dependencies:\n",
+                "      lodash:\n",
+                "        specifier: ^4.17.21\n",
+                "        version: 4.17.21\n",
+                "    devDependencies:\n",
+                "      typescript:\n",
+                "        specifier: ^5.0.0\n",
+                "        version: 5.2.2\n",
+                "\n",
+                "---\n",
+                "lockfileVersion: '9.0'\n",
+                "\n",
+                "settings:\n",
+                "  autoInstallPeers: true\n",
+                "\n",
+                "packages:\n",
+                "\n",
+                "  lodash@4.17.21:\n",
+                "    resolution: {integrity: sha512-x}\n",
+                "\n",
+                "  typescript@5.2.2:\n",
+                "    resolution: {integrity: sha512-y}\n",
+                "\n",
+                "snapshots:\n",
+                "\n",
+                "  lodash@4.17.21: {}\n",
+                "\n",
+                "  typescript@5.2.2: {}\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let scope_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.scope)
+        };
+        // Packages and snapshots from the second document produce components;
+        // importer scopes from the first document still classify them.
+        assert_eq!(scope_of("lodash"), Some(Scope::Runtime));
+        assert_eq!(scope_of("typescript"), Some(Scope::Development));
+    }
+
+    #[test]
+    fn pnpm_multi_document_matches_single_document_inventory() {
+        // Splitting one v9 lockfile into two documents must not change the
+        // inventory: union semantics reproduce the single-document result.
+        let sections = concat!(
+            "lockfileVersion: '9.0'\n",
+            "\n",
+            "importers:\n",
+            "  .:\n",
+            "    dependencies:\n",
+            "      lodash:\n",
+            "        specifier: ^4.17.21\n",
+            "        version: 4.17.21\n",
+            "\n",
+            "packages:\n",
+            "\n",
+            "  lodash@4.17.21:\n",
+            "    resolution: {integrity: sha512-x}\n",
+            "\n",
+            "snapshots:\n",
+            "\n",
+            "  lodash@4.17.21: {}\n",
+        );
+        let single = tempdir().unwrap();
+        fs::write(single.path().join("pnpm-lock.yaml"), sections).unwrap();
+        let split = tempdir().unwrap();
+        fs::write(
+            split.path().join("pnpm-lock.yaml"),
+            sections.replacen("packages:", "---\nlockfileVersion: '9.0'\n\npackages:", 1),
+        )
+        .unwrap();
+        let single = scan_path(single.path(), &config()).unwrap();
+        let split = scan_path(split.path(), &config()).unwrap();
+        let identities = |inventory: &crate::model::Inventory| {
+            inventory
+                .components
+                .values()
+                .map(|c| (c.name.clone(), c.version.clone(), c.scope))
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(identities(&single), identities(&split));
+    }
+
+    #[test]
+    fn pnpm_multi_document_skips_empty_documents() {
+        // A bare `---` document marker yields an empty document; it is skipped,
+        // not treated as malformed.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            concat!(
+                "---\n",
+                "lockfileVersion: '9.0'\n",
+                "\n",
+                "importers:\n",
+                "  .:\n",
+                "    dependencies:\n",
+                "      lodash:\n",
+                "        specifier: ^4.17.21\n",
+                "        version: 4.17.21\n",
+                "\n",
+                "---\n",
+                "\n",
+                "---\n",
+                "packages:\n",
+                "\n",
+                "  lodash@4.17.21:\n",
+                "    resolution: {integrity: sha512-x}\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        assert!(
+            inventory
+                .components
+                .values()
+                .any(|c| c.name == "lodash" && c.version == "4.17.21")
+        );
+    }
+
+    #[test]
+    fn pnpm_multi_document_malformed_document_fails_closed() {
+        // A syntax error in any document still aborts the scan as malformed.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            concat!(
+                "---\n",
+                "lockfileVersion: '9.0'\n",
+                "\n",
+                "importers:\n",
+                "  .:\n",
+                "    dependencies:\n",
+                "      lodash:\n",
+                "        specifier: ^4.17.21\n",
+                "        version: 4.17.21\n",
+                "\n",
+                "---\n",
+                "packages:\n",
+                "  lodash@4.17.21: [unclosed\n",
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            scan_path(dir.path(), &config()),
+            Err(InputError::Malformed { .. })
+        ));
     }
 }
