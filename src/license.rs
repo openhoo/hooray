@@ -252,14 +252,73 @@ fn classify_declared_license(license: &License) -> ClassifiedLicense {
                 spdx_valid: true,
             }
         }
-        None => ClassifiedLicense {
-            rule: DeclaredRule::Unknown,
-            severity: Severity::Medium,
-            confidence: Confidence::High,
-            summary: "License metadata does not contain an SPDX expression".into(),
-            spdx_valid: false,
+        None => match license.name.as_deref().and_then(common_license_name_id) {
+            Some(spdx_id) => ClassifiedLicense {
+                rule: DeclaredRule::Detected,
+                severity: Severity::Low,
+                confidence: Confidence::Medium,
+                summary: format!(
+                    "License name maps to SPDX identifier {spdx_id}: {}",
+                    license.name.as_deref().unwrap_or_default()
+                ),
+                spdx_valid: true,
+            },
+            None => ClassifiedLicense {
+                rule: DeclaredRule::Unknown,
+                severity: Severity::Medium,
+                confidence: Confidence::High,
+                summary: "License metadata does not contain an SPDX expression".into(),
+                spdx_valid: false,
+            },
         },
     }
+}
+
+/// Maps common non-canonical manifest license names to their SPDX
+/// identifiers. Matching is case-insensitive and ignores punctuation and
+/// the words "license"/"the"/"v", so "MIT License", "Apache 2.0", and
+/// "GPLv3" all resolve. Only unambiguous names map; vague values like
+/// "BSD" or "GPL" stay unknown rather than guessing a variant.
+fn common_license_name_id(name: &str) -> Option<&'static str> {
+    let normalized: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|word| !matches!(*word, "license" | "licence" | "the" | "v" | "version"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(match normalized.as_str() {
+        "mit" => "MIT",
+        "apache 2 0" | "apache 2" | "apache" => "Apache-2.0",
+        "apache 1 1" => "Apache-1.1",
+        "bsd 2" | "bsd 2 clause" | "bsd simplified" | "freebsd" => "BSD-2-Clause",
+        "bsd 3" | "bsd 3 clause" | "bsd new" | "bsd revised" => "BSD-3-Clause",
+        "isc" => "ISC",
+        "gpl 2" | "gpl2" | "gplv2" | "gnu gpl 2" => "GPL-2.0-only",
+        "gpl 3" | "gpl3" | "gplv3" | "gnu gpl 3" => "GPL-3.0-only",
+        "lgpl 2 1" | "lgpl2 1" | "lgplv2 1" => "LGPL-2.1-only",
+        "lgpl 3" | "lgpl3" | "lgplv3" => "LGPL-3.0-only",
+        "agpl 3" | "agpl3" | "agplv3" => "AGPL-3.0-only",
+        "mpl 2" | "mpl 2 0" | "mpl2" | "mozilla public 2" => "MPL-2.0",
+        "epl 2" | "epl 2 0" | "eclipse public 2" => "EPL-2.0",
+        "epl 1" | "epl 1 0" | "eclipse public 1" => "EPL-1.0",
+        "unlicense" | "unlicensed" => "Unlicense",
+        "cc0" | "cc0 1 0" | "cc0 universal" => "CC0-1.0",
+        "cc by 4" | "cc by 4 0" | "creative commons attribution 4" => "CC-BY-4.0",
+        "zlib" => "Zlib",
+        "bsl" | "bsl 1" | "bsl 1 0" | "boost" | "boost software" => "BSL-1.0",
+        "wtfpl" => "WTFPL",
+        "python 2" | "python 2 0" | "psf" | "psf 2" => "PSF-2.0",
+        _ => return None,
+    })
 }
 
 fn asset_component(inventory: &Inventory) -> Option<&crate::model::Component> {
@@ -275,8 +334,22 @@ fn asset_component(inventory: &Inventory) -> Option<&crate::model::Component> {
                 .iter()
                 .any(|edge| edge.to == component.identity)
     });
-    let candidate = candidates.next()?;
-    candidates.next().is_none().then_some(candidate)
+    if let Some(candidate) = candidates.next()
+        && candidates.next().is_none()
+    {
+        return Some(candidate);
+    }
+    // Name/version mismatch (renamed package, workspace root): fall back to
+    // the unique component with no incoming dependency edges — the root of
+    // the graph — so a detected root LICENSE still attributes correctly.
+    let mut roots = inventory.components.values().filter(|component| {
+        !inventory
+            .dependencies
+            .iter()
+            .any(|edge| edge.to == component.identity)
+    });
+    let candidate = roots.next()?;
+    roots.next().is_none().then_some(candidate)
 }
 
 #[derive(Debug)]
@@ -314,6 +387,12 @@ impl Detection {
 
 struct LicenseSignature {
     needles: &'static [&'static str],
+    /// When set, needles are matched only against the normalized text
+    /// before this marker. The canonical GPL "How to Apply These Terms"
+    /// appendix contains the or-later grant phrase verbatim, so an
+    /// unmodified COPYING file must not classify as or-later; a real
+    /// or-later grant lives in the license body or a source header.
+    scope_before: Option<&'static str>,
     expression: Option<&'static str>,
     name: &'static str,
     confidence: Confidence,
@@ -322,37 +401,45 @@ struct LicenseSignature {
 
 /// Probe order is precedence: the first row whose needles all occur in the
 /// whitespace-normalized text wins. Near-duplicates (GPL or-later before
-/// only, BSD-3 before BSD-2) must stay above their weaker siblings, and
-/// LGPL-3.0-only must stay above both GPL-3.0 rows: the canonical LGPL-3.0
-/// text incorporates the terms and conditions of version 3 of the GNU
-/// General Public License, so it contains the plain GPL needle pair and an
-/// earlier GPL probe would misread it as GPL. Pure GPL texts never contain
-/// the "gnu lesser general public license" title needle, so this earlier
-/// LGPL row cannot steal them.
+/// only, BSD-3 before BSD-2) must stay above their weaker siblings, and the
+/// LGPL/AGPL rows must stay above the plain GPL rows of the same version:
+/// the canonical LGPL and AGPL texts incorporate the terms and conditions
+/// of the corresponding GNU General Public License, so they contain the
+/// plain GPL needle pair and an earlier GPL probe would misread them as
+/// GPL. Pure GPL texts never contain the "gnu lesser/affero general public
+/// license" title needles, so the earlier rows cannot steal them.
 const SIGNATURES: &[LicenseSignature] = &[
     LicenseSignature {
         needles: &[
             "permission is hereby granted, free of charge, to any person obtaining a copy",
-            "the software is provided \"as is\"",
+            "the software is provided",
+            "as is",
         ],
+        scope_before: None,
         expression: Some("MIT"),
         name: "MIT License",
         confidence: Confidence::High,
         matched: "MIT canonical clauses",
     },
     LicenseSignature {
-        needles: &[
-            "apache license",
-            "version 2.0, january 2004",
-            "http://www.apache.org/licenses/",
-        ],
+        needles: &["apache license", "version 2.0, january 2004"],
+        scope_before: None,
         expression: Some("Apache-2.0"),
         name: "Apache License 2.0",
         confidence: Confidence::High,
-        matched: "Apache-2.0 title and canonical URL",
+        matched: "Apache-2.0 title",
+    },
+    LicenseSignature {
+        needles: &["gnu affero general public license", "version 3"],
+        scope_before: None,
+        expression: Some("AGPL-3.0-only"),
+        name: "GNU AGPL v3",
+        confidence: Confidence::Medium,
+        matched: "AGPL v3 title",
     },
     LicenseSignature {
         needles: &["gnu lesser general public license", "version 3"],
+        scope_before: None,
         expression: Some("LGPL-3.0-only"),
         name: "GNU LGPL v3",
         confidence: Confidence::Medium,
@@ -360,10 +447,31 @@ const SIGNATURES: &[LicenseSignature] = &[
     },
     LicenseSignature {
         needles: &[
+            "gnu lesser general public license",
+            "version 2.1",
+            "either version 2.1 of the license, or (at your option) any later version",
+        ],
+        scope_before: Some("how to apply these terms"),
+        expression: Some("LGPL-2.1-or-later"),
+        name: "GNU LGPL v2.1 or later",
+        confidence: Confidence::High,
+        matched: "LGPL-2.1-or-later grant",
+    },
+    LicenseSignature {
+        needles: &["gnu lesser general public license", "version 2.1"],
+        scope_before: None,
+        expression: Some("LGPL-2.1-only"),
+        name: "GNU LGPL v2.1",
+        confidence: Confidence::Medium,
+        matched: "LGPL v2.1 title",
+    },
+    LicenseSignature {
+        needles: &[
             "gnu general public license",
             "version 3",
             "either version 3 of the license, or (at your option) any later version",
         ],
+        scope_before: Some("how to apply these terms"),
         expression: Some("GPL-3.0-or-later"),
         name: "GNU GPL v3 or later",
         confidence: Confidence::High,
@@ -371,23 +479,70 @@ const SIGNATURES: &[LicenseSignature] = &[
     },
     LicenseSignature {
         needles: &["gnu general public license", "version 3"],
+        scope_before: None,
         expression: Some("GPL-3.0-only"),
         name: "GNU GPL v3",
         confidence: Confidence::Medium,
         matched: "GPL v3 title",
     },
     LicenseSignature {
+        needles: &[
+            "gnu general public license",
+            "version 2",
+            "either version 2 of the license, or (at your option) any later version",
+        ],
+        scope_before: Some("how to apply these terms"),
+        expression: Some("GPL-2.0-or-later"),
+        name: "GNU GPL v2 or later",
+        confidence: Confidence::High,
+        matched: "GPL-2.0-or-later grant",
+    },
+    LicenseSignature {
+        needles: &["gnu general public license", "version 2"],
+        scope_before: None,
+        expression: Some("GPL-2.0-only"),
+        name: "GNU GPL v2",
+        confidence: Confidence::Medium,
+        matched: "GPL v2 title",
+    },
+    LicenseSignature {
         needles: &["mozilla public license version 2.0"],
+        scope_before: None,
         expression: Some("MPL-2.0"),
         name: "Mozilla Public License 2.0",
         confidence: Confidence::High,
         matched: "MPL-2.0 title",
     },
     LicenseSignature {
+        needles: &["eclipse public license", "v 2.0"],
+        scope_before: None,
+        expression: Some("EPL-2.0"),
+        name: "Eclipse Public License 2.0",
+        confidence: Confidence::High,
+        matched: "EPL-2.0 title",
+    },
+    LicenseSignature {
+        needles: &["attribution 4.0 international", "creative commons"],
+        scope_before: None,
+        expression: Some("CC-BY-4.0"),
+        name: "Creative Commons Attribution 4.0",
+        confidence: Confidence::High,
+        matched: "CC-BY-4.0 title",
+    },
+    LicenseSignature {
+        needles: &["cc0 1.0 universal", "public domain dedication"],
+        scope_before: None,
+        expression: Some("CC0-1.0"),
+        name: "CC0 1.0 Universal",
+        confidence: Confidence::High,
+        matched: "CC0-1.0 title",
+    },
+    LicenseSignature {
         needles: &[
             "redistribution and use in source and binary forms",
             "neither the name",
         ],
+        scope_before: None,
         expression: Some("BSD-3-Clause"),
         name: "BSD 3-Clause License",
         confidence: Confidence::Medium,
@@ -395,6 +550,7 @@ const SIGNATURES: &[LicenseSignature] = &[
     },
     LicenseSignature {
         needles: &["redistribution and use in source and binary forms"],
+        scope_before: None,
         expression: Some("BSD-2-Clause"),
         name: "BSD 2-Clause License",
         confidence: Confidence::Medium,
@@ -405,6 +561,7 @@ const SIGNATURES: &[LicenseSignature] = &[
             "isc license",
             "permission to use, copy, modify, and/or distribute this software for any purpose",
         ],
+        scope_before: None,
         expression: Some("ISC"),
         name: "ISC License",
         confidence: Confidence::High,
@@ -412,6 +569,7 @@ const SIGNATURES: &[LicenseSignature] = &[
     },
     LicenseSignature {
         needles: &["boost software license - version 1.0"],
+        scope_before: None,
         expression: Some("BSL-1.0"),
         name: "Boost Software License 1.0",
         confidence: Confidence::High,
@@ -419,9 +577,21 @@ const SIGNATURES: &[LicenseSignature] = &[
     },
     LicenseSignature {
         needles: &[
+            "the origin of this software must not be misrepresented",
+            "altered source versions must be plainly marked as such",
+        ],
+        scope_before: None,
+        expression: Some("Zlib"),
+        name: "zlib License",
+        confidence: Confidence::High,
+        matched: "zlib canonical clauses",
+    },
+    LicenseSignature {
+        needles: &[
             "the unlicense",
             "this is free and unencumbered software released into the public domain",
         ],
+        scope_before: None,
         expression: Some("Unlicense"),
         name: "The Unlicense",
         confidence: Confidence::High,
@@ -437,10 +607,14 @@ fn detect_license_text(path: &str, bytes: &[u8]) -> Detection {
         .collect::<Vec<_>>()
         .join(" ");
     let mut candidates = SIGNATURES.iter().filter(|signature| {
+        let scope = signature
+            .scope_before
+            .and_then(|marker| normalized.find(marker).map(|end| &normalized[..end]))
+            .unwrap_or(&normalized);
         signature
             .needles
             .iter()
-            .all(|needle| normalized.contains(needle))
+            .all(|needle| scope.contains(needle))
     });
     let Some(signature) = candidates.next() else {
         return Detection {
@@ -481,6 +655,68 @@ fn detect_license_text(path: &str, bytes: &[u8]) -> Detection {
         matched: signature.matched,
         additional_matched,
     }
+}
+
+fn collect_license_files(
+    root: &Path,
+    maximum: u64,
+) -> Result<Vec<(String, Vec<u8>)>, LicenseError> {
+    let metadata = fs::symlink_metadata(root).map_err(|source| match source.kind() {
+        io::ErrorKind::NotFound => LicenseError::NotFound(root.to_owned()),
+        _ => LicenseError::Io {
+            path: root.to_owned(),
+            source,
+        },
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(LicenseError::Symlink(root.to_owned()));
+    }
+    // Canonicalize the root itself: library callers may pass `.` or
+    // `./dir`, which are legitimate roots, not symlinks. Walking the
+    // canonical path keeps strip_prefix consistent with the walk root.
+    let root = &fs::canonicalize(root).map_err(|source| LicenseError::Io {
+        path: root.to_owned(),
+        source,
+    })?;
+    let mut files = Vec::new();
+    for entry in repository_walk(root, false, None) {
+        let entry = entry.map_err(|error| LicenseError::Io {
+            path: root.to_owned(),
+            source: io::Error::other(error),
+        })?;
+        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            // The repository walk does not follow links. Skip nested links, including
+            // license-shaped names, so their external targets cannot be
+            // attributed to this asset and unrelated tooling links do not
+            // make an otherwise safe repository unscannable.
+            continue;
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|_| LicenseError::PathTraversal(entry.path().to_owned()))?;
+        let normalized = normalize_relative(relative)?;
+        if !is_license_name(&normalized) && !is_notice_name(&normalized) {
+            continue;
+        }
+        // A single oversized, vanished, or unreadable license file must not
+        // abort the whole analysis: it is skipped like a non-license file.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.len() > maximum {
+            continue;
+        }
+        let Ok(bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        files.push((normalized, bytes));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
 }
 
 fn declared_evidence(
@@ -562,86 +798,35 @@ fn finding(
     }
 }
 
-fn collect_license_files(
-    root: &Path,
-    maximum: u64,
-) -> Result<Vec<(String, Vec<u8>)>, LicenseError> {
-    let metadata = fs::symlink_metadata(root).map_err(|source| match source.kind() {
-        io::ErrorKind::NotFound => LicenseError::NotFound(root.to_owned()),
-        _ => LicenseError::Io {
-            path: root.to_owned(),
-            source,
-        },
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(LicenseError::Symlink(root.to_owned()));
-    }
-    let canonical = fs::canonicalize(root).map_err(|source| LicenseError::Io {
-        path: root.to_owned(),
-        source,
-    })?;
-    if canonical != root {
-        return Err(LicenseError::Symlink(root.to_owned()));
-    }
-    let mut files = Vec::new();
-    for entry in repository_walk(root, false, None) {
-        let entry = entry.map_err(|error| LicenseError::Io {
-            path: root.to_owned(),
-            source: io::Error::other(error),
-        })?;
-        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
-            // The repository walk does not follow links. Skip nested links, including
-            // license-shaped names, so their external targets cannot be
-            // attributed to this asset and unrelated tooling links do not
-            // make an otherwise safe repository unscannable.
-            continue;
-        }
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let relative = entry
-            .path()
-            .strip_prefix(root)
-            .map_err(|_| LicenseError::PathTraversal(entry.path().to_owned()))?;
-        let normalized = normalize_relative(relative)?;
-        if !is_license_name(&normalized) && !is_notice_name(&normalized) {
-            continue;
-        }
-        let length = entry
-            .metadata()
-            .map_err(|error| LicenseError::Io {
-                path: entry.path().to_owned(),
-                source: io::Error::other(error),
-            })?
-            .len();
-        if length > maximum {
-            return Err(LicenseError::FileTooLarge {
-                path: entry.path().to_owned(),
-                maximum,
-            });
-        }
-        let bytes = fs::read(entry.path()).map_err(|source| LicenseError::Io {
-            path: entry.path().to_owned(),
-            source,
-        })?;
-        files.push((normalized, bytes));
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
-}
-
 fn normalize_relative(path: &Path) -> Result<String, LicenseError> {
     crate::input::normalize_relative(path).map_err(|_| LicenseError::PathTraversal(path.to_owned()))
 }
 
+/// Matches license-shaped file names: LICENSE/LICENCE/COPYING/COPYRIGHT
+/// stems, names containing LICENSE/UNLICENSE anywhere (MIT-LICENSE.txt,
+/// UNLICENSE), and any file inside a LICENSES/ or LICENCES/ directory
+/// (REUSE convention).
 fn is_license_name(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_uppercase();
-    ["LICENSE", "LICENCE", "COPYING"].iter().any(|stem| {
+    if name.contains("LICENSE") || name.contains("LICENCE") || name.contains("UNLICENSE") {
+        return true;
+    }
+    if ["COPYING", "COPYRIGHT"].iter().any(|stem| {
         name.len() >= stem.len()
             && name.starts_with(stem)
             && (name.len() == stem.len()
                 || matches!(name.as_bytes()[stem.len()], b'.' | b'_' | b'-'))
-    })
+    }) {
+        return true;
+    }
+    // REUSE-style license directories: LICENSES/MIT.txt, licences/...
+    match path.rsplit_once('/') {
+        Some((dir, _)) => dir.split('/').any(|component| {
+            let dir = component.to_ascii_uppercase();
+            dir == "LICENSES" || dir == "LICENCES"
+        }),
+        None => false,
+    }
 }
 
 fn is_notice_name(path: &str) -> bool {
@@ -851,13 +1036,17 @@ mod tests {
     }
 
     #[test]
-    fn enforces_license_file_size_limit() {
+    fn skips_oversized_license_files_instead_of_aborting() {
+        // #227: one oversized license file must not abort the analysis —
+        // it is skipped while other files are still collected.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("LICENSE"), "oversized").unwrap();
-        assert!(matches!(
-            collect_license_files(dir.path(), 2),
-            Err(LicenseError::FileTooLarge { .. })
-        ));
+        fs::write(dir.path().join("COPYING"), "ok").unwrap();
+        let files = collect_license_files(dir.path(), 5).unwrap();
+        assert_eq!(
+            files.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec!["COPYING"]
+        );
     }
 
     #[cfg(unix)]
@@ -1009,15 +1198,12 @@ mod tests {
         fs::write(dir.path().join("THIRD-PARTY-NOTICES.txt"), b"third").unwrap();
         fs::write(dir.path().join("LICENSE.txt"), b"1234").unwrap();
         fs::write(dir.path().join("NOTICEBOARD"), b"ignored").unwrap();
-        let files = collect_license_files(dir.path(), 4).unwrap_err();
-        assert!(matches!(
-            files,
-            LicenseError::FileTooLarge { maximum: 4, .. }
-        ));
-        fs::remove_file(dir.path().join("THIRD-PARTY-NOTICES.txt")).unwrap();
+        // #227: oversized files are skipped, not fatal — the 5-byte
+        // THIRD-PARTY-NOTICES.txt is dropped while 4-byte files are kept.
         let files = collect_license_files(dir.path(), 4).unwrap();
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|(_, bytes)| bytes.len() == 4));
+        assert!(files.iter().all(|(p, _)| p != "THIRD-PARTY-NOTICES.txt"));
     }
 
     #[test]
@@ -1044,17 +1230,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reports_unreadable_license_files_as_io_errors() {
+    fn skips_unreadable_license_files_instead_of_aborting() {
+        // #227: one unreadable license file must not abort the analysis.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
         let path = dir.path().join("LICENSE");
         fs::write(&path, b"secret").unwrap();
+        fs::write(dir.path().join("COPYING"), b"ok").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         let result = collect_license_files(dir.path(), 1024);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(result, Err(LicenseError::Io { path: actual, .. }) if actual == path));
+        let files = result.unwrap();
+        assert_eq!(
+            files.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec!["COPYING"]
+        );
     }
-
     #[cfg(unix)]
     #[test]
     fn rejects_non_utf8_license_paths() {
@@ -1159,14 +1350,15 @@ mod tests {
     }
 
     #[test]
-    fn lgpl21_grant_does_not_match_lgpl3_or_gpl3_needles() {
+    fn lgpl21_grant_detects_lgpl21_or_later_not_gpl3() {
+        // #222: LGPL-2.1 texts now classify; the or-later grant phrase in a
+        // header (no "how to apply" appendix) selects the or-later row.
         let detection = detect_license_text(
             "COPYING.lesser",
             b"Copyright (C) 1991 Free Software Foundation, Inc.\nThis library is free software; you can redistribute it and/or modify it under the terms of the GNU Lesser General Public License as published by the Free Software Foundation; either version 2.1 of the License, or (at your option) any later version.".as_slice(),
         );
-        assert_eq!(detection.expression, None);
-        assert!(detection.name.is_some());
-        assert_eq!(detection.confidence, Confidence::Low);
+        assert_eq!(detection.expression.as_deref(), Some("LGPL-2.1-or-later"));
+        assert_eq!(detection.confidence, Confidence::High);
     }
 
     #[test]
@@ -1216,6 +1408,130 @@ mod tests {
                 .properties["matched_detectors"],
             "MIT canonical clauses, LGPL v3 title, GPL v3 title"
         );
+    }
+
+    #[test]
+    fn stock_gpl3_text_with_howto_appendix_is_only_not_or_later() {
+        // #221: the canonical GPL-3 COPYING file carries the or-later grant
+        // phrase inside the "How to Apply These Terms" appendix — that must
+        // not flip the classification to or-later.
+        let detection = detect_license_text(
+            "COPYING",
+            b"GNU GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007\nTERMS AND CONDITIONS\n...\nHow to Apply These Terms to Your New Programs\n<one line to give the program's name and a brief idea of what it does.>\nThis program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.".as_slice(),
+        );
+        assert_eq!(detection.expression.as_deref(), Some("GPL-3.0-only"));
+    }
+
+    #[test]
+    fn gpl3_or_later_grant_outside_appendix_is_detected() {
+        // A real or-later grant in the license body/header still classifies.
+        let detection = detect_license_text(
+            "COPYING",
+            b"GNU GENERAL PUBLIC LICENSE\nVersion 3\nThis program is free software: you can redistribute it under the terms of the GNU General Public License, either version 3 of the License, or (at your option) any later version.\nHow to Apply These Terms to Your New Programs\n...".as_slice(),
+        );
+        assert_eq!(detection.expression.as_deref(), Some("GPL-3.0-or-later"));
+    }
+
+    #[test]
+    fn apache_https_and_urlless_variants_detect() {
+        // #223: the URL needle is gone — https or stripped URLs still match.
+        for body in [
+            "Apache License\nVersion 2.0, January 2004\nhttps://www.apache.org/licenses/\nTERMS",
+            "Apache License\nVersion 2.0, January 2004\nTERMS AND CONDITIONS",
+        ] {
+            let detection = detect_license_text("LICENSE", body.as_bytes());
+            assert_eq!(
+                detection.expression.as_deref(),
+                Some("Apache-2.0"),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn mit_unquoted_and_single_quoted_as_is_detect() {
+        // #224: unquoted / single-quoted AS IS variants classify.
+        for body in [
+            "MIT License\nPermission is hereby granted, free of charge, to any person obtaining a copy\nTHE SOFTWARE IS PROVIDED AS IS, WITHOUT WARRANTY",
+            "MIT License\nPermission is hereby granted, free of charge, to any person obtaining a copy\nThe software is provided 'as is', without warranty",
+        ] {
+            let detection = detect_license_text("LICENSE", body.as_bytes());
+            assert_eq!(detection.expression.as_deref(), Some("MIT"), "{body}");
+        }
+    }
+
+    #[test]
+    fn gpl2_agpl_epl_cc_zlib_texts_classify() {
+        // #222: previously-missing signature rows.
+        let cases: &[(&[u8], &str)] = &[
+            (b"GNU GENERAL PUBLIC LICENSE\nVersion 2, June 1991\nTERMS AND CONDITIONS", "GPL-2.0-only"),
+            (b"GNU AFFERO GENERAL PUBLIC LICENSE\nVersion 3, 19 November 2007\nTERMS AND CONDITIONS", "AGPL-3.0-only"),
+            (b"Eclipse Public License - v 2.0\nTHE ACCOMPANYING PROGRAM IS PROVIDED UNDER THE TERMS", "EPL-2.0"),
+            (b"Creative Commons Attribution 4.0 International Public License\nBy exercising the Licensed Rights", "CC-BY-4.0"),
+            (b"CC0 1.0 Universal\nPublic Domain Dedication\nthe person who associated a work", "CC0-1.0"),
+            (b"zlib license\nThe origin of this software must not be misrepresented; altered source versions must be plainly marked as such", "Zlib"),
+        ];
+        for (body, expected) in cases {
+            let detection = detect_license_text("LICENSE", body);
+            assert_eq!(
+                detection.expression.as_deref(),
+                Some(*expected),
+                "{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn reuse_dirs_and_variant_license_names_are_collected() {
+        // #225: LICENSES/ dirs, UNLICENSE, MIT-LICENSE, COPYRIGHT.
+        for path in [
+            "LICENSES/MIT.txt",
+            "licences/Apache-2.0.txt",
+            "UNLICENSE",
+            "MIT-LICENSE.txt",
+            "COPYRIGHT",
+            "docs/LICENSE.md",
+        ] {
+            assert!(is_license_name(path), "{path}");
+        }
+        for path in [
+            "src/main.rs",
+            "README.md",
+            "NOTICEBOARD",
+            "mylicenses/x.txt",
+        ] {
+            assert!(!is_license_name(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn common_license_names_map_to_spdx_ids() {
+        // #226: non-canonical manifest names resolve instead of unknown.
+        for (name, expected) in [
+            ("MIT License", "MIT"),
+            ("Apache 2.0", "Apache-2.0"),
+            ("apache license 2.0", "Apache-2.0"),
+            ("GPLv3", "GPL-3.0-only"),
+            ("BSD 3-Clause", "BSD-3-Clause"),
+            ("The Unlicense", "Unlicense"),
+        ] {
+            assert_eq!(common_license_name_id(name), Some(expected), "{name}");
+        }
+        assert_eq!(common_license_name_id("Some Custom EULA"), None);
+    }
+
+    #[test]
+    fn non_canonical_root_dot_is_accepted() {
+        // #228: a `.` root is legitimate — canonicalize before comparing.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("LICENSE"), "x").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let result = collect_license_files(Path::new("."), 1024);
+        std::env::set_current_dir(cwd).unwrap();
+        let files = result.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "LICENSE");
     }
 
     #[test]

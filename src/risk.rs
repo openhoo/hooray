@@ -71,9 +71,12 @@ impl RiskScorer {
 }
 
 fn severity_points(severity: Severity) -> i32 {
+    // Unknown ranks between Low and Medium, matching the neutral-middle
+    // convention used by confidence, scope, and directness: an unscored
+    // finding must not sort below a confirmed-low one.
     match severity {
-        Severity::Unknown => 1_000,
         Severity::Low => 1_250,
+        Severity::Unknown => 1_750,
         Severity::Medium => 2_250,
         Severity::High => 3_250,
         Severity::Critical => 4_250,
@@ -209,10 +212,13 @@ impl OperationalRiskAnalyzer {
             let metadata = EvidenceProperties::new(evidence);
             // Directness mirrors the engine scoring pass: graph depth 1 is
             // direct; roots and isolated components stay unknown.
+            // A graph built from a different inventory (API misuse) yields
+            // no classification; treat the component as unknown-directness
+            // instead of panicking.
             let kind = input
                 .graph
                 .classify(&component.identity)
-                .expect("operational risk graph is built from the analyzed inventory");
+                .unwrap_or(DependencyKind::Disconnected);
             let direct = match kind {
                 DependencyKind::Direct => Some(true),
                 DependencyKind::Transitive => Some(false),
@@ -440,6 +446,7 @@ mod tests {
         let mut previous = 0;
         for severity in [
             Severity::Low,
+            Severity::Unknown,
             Severity::Medium,
             Severity::High,
             Severity::Critical,

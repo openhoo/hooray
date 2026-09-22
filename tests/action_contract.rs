@@ -24,9 +24,16 @@ mod unix {
     fn status_for_output(output: &str) -> Option<i32> {
         let directory = tempfile::tempdir().expect("action fixture directory");
         let script = directory.path().join("scan.sh");
-        std::fs::write(&script, scan_script()).expect("write action scan script");
-        Command::new("bash")
-            .arg(script)
+        // Shebang + direct exec: run the composite step under its declared
+        // shell without a dynamic `bash <script>` invocation.
+        std::fs::write(&script, format!("#!/usr/bin/env bash\n{}", scan_script()))
+            .expect("write action scan script");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&script, permissions).expect("mark script executable");
+        Command::new(&script)
             .current_dir(directory.path())
             .env("INPUT_CONFIG", "")
             .env("INPUT_EXECUTABLE", "unused")

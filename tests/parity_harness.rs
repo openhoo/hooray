@@ -1,11 +1,12 @@
 //! End-to-end tests for the JFrog Xray parity record–replay harness.
 //!
-//! The sibling-owned corpus (`tests/fixtures/parity/corpus`) and recordings
-//! (`tests/fixtures/parity/recordings`) may be absent or empty while that
-//! work lands concurrently. Tier 1 skips with an explicit message when the
-//! manifest is missing, and the whole tier-2 section skips when no
-//! recordings exist, so this suite passes today and enforces everything
-//! once both land.
+//! The corpus (`tests/fixtures/parity/corpus`) and the recordings
+//! directory (`tests/fixtures/parity/recordings`) are committed fixtures:
+//! the ungated canary below proves the manifest exists, parses, and
+//! declares cases, so the feature-gated tiers hard-fail on missing
+//! fixtures instead of silently skipping. Tier 2 still skips when no
+//! `*.recording.json` files exist — recordings are operator-captured
+//! artifacts that land separately from the corpus.
 //!
 //! Gating structure: the tier tests consume harness types that only exist
 //! behind the `parity` feature, so they are individually `#[cfg]`-gated.
@@ -118,10 +119,11 @@ async fn normalized_case_scan(case_id: &str, kind: &str, case_path: &Path) -> Ca
     normalize::normalize_hooray(&report, case_id, "offline").expect("normalization succeeds")
 }
 
-/// Ungated canary: the corpus fixtures are committed, so the manifest must
-/// always exist, parse, and declare at least one case. Kills the
-/// vacuous-skip risk of the feature-gated tiers silently passing when the
-/// fixtures go missing.
+/// Ungated canary: the corpus and recordings fixtures are committed, so
+/// the manifest must always exist, parse, and declare at least one case,
+/// and the recordings directory must always exist. Kills the vacuous-skip
+/// risk of the feature-gated tiers silently passing when the fixtures go
+/// missing.
 #[test]
 fn parity_fixtures_are_committed() {
     let manifest_path = corpus_dir().join("manifest.json");
@@ -138,28 +140,60 @@ fn parity_fixtures_are_committed() {
         .and_then(|cases| cases.as_array())
         .expect("corpus manifest has a cases array");
     assert!(!cases.is_empty(), "corpus manifest declares no cases");
+
+    let recordings = repo_root().join("tests/fixtures/parity/recordings");
+    assert!(
+        recordings.is_dir(),
+        "recordings directory missing at {} — committed fixture deleted?",
+        recordings.display()
+    );
 }
 
 #[cfg(feature = "parity")]
 #[tokio::test]
 async fn tier1_corpus_and_normalization() {
+    // The ungated canary already proves the manifest exists and declares
+    // cases; a missing or empty manifest must fail here, never skip.
     let manifest_path = corpus_dir().join("manifest.json");
-    if !manifest_path.is_file() {
-        eprintln!(
-            "tier-1 skipped: corpus manifest not found at {}",
-            manifest_path.display()
-        );
-        return;
-    }
     let text = std::fs::read_to_string(&manifest_path).expect("read corpus manifest");
-    let manifest: corpus::CorpusManifest =
-        serde_json::from_str(&text).expect("parse corpus manifest");
-    if manifest.cases.is_empty() {
-        eprintln!("tier-1 skipped: corpus manifest contains no cases");
-        return;
-    }
+    let manifest = corpus::CorpusManifest::parse(&text).expect("parse corpus manifest");
+    assert!(
+        !manifest.cases.is_empty(),
+        "corpus manifest declares no cases"
+    );
+
+    // Coverage is bidirectional: every declared case must exist on disk
+    // (asserted per case below) and every directory under the corpus root
+    // must be declared — an undeclared directory would never be scanned,
+    // a silent coverage gap.
+    let declared: BTreeSet<&str> = manifest
+        .cases
+        .iter()
+        .map(|case| case.case_id.as_str())
+        .collect();
+    let mut undeclared: Vec<String> = std::fs::read_dir(corpus_dir())
+        .expect("list corpus directory")
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| !declared.contains(name.as_str()))
+        .collect();
+    undeclared.sort();
+    assert!(
+        undeclared.is_empty(),
+        "corpus directories missing from manifest.json: {undeclared:?}"
+    );
 
     for case in &manifest.cases {
+        // A case with no expectations asserts nothing: it would scan and
+        // pass vacuously, weakening the corpus contract.
+        assert!(
+            !case.expected_ecosystems.is_empty()
+                || case.min_components > 0
+                || case.directness_comparable,
+            "tier-1 {}: case declares no expectations",
+            case.case_id
+        );
         let case_path = corpus_dir().join(&case.case_id);
         assert!(
             case_path.exists(),
@@ -216,10 +250,11 @@ async fn tier1_corpus_and_normalization() {
 #[tokio::test]
 async fn license_case_detects_signatures_with_portable_paths() {
     let case_path = corpus_dir().join("license-files-project");
-    if !case_path.is_dir() {
-        eprintln!("skipped: license-files-project case not present");
-        return;
-    }
+    assert!(
+        case_path.is_dir(),
+        "license-files-project case missing at {} — committed fixture deleted?",
+        case_path.display()
+    );
     let canonical =
         normalized_case_scan("license-files-project", "project-directory", &case_path).await;
 
@@ -249,13 +284,11 @@ async fn license_case_detects_signatures_with_portable_paths() {
 #[tokio::test]
 async fn tier2_scorecard_and_drift() {
     let recordings = recordings_dir();
-    if !recordings.is_dir() {
-        eprintln!(
-            "tier-2 skipped: recordings directory not found at {}",
-            recordings.display()
-        );
-        return;
-    }
+    assert!(
+        recordings.is_dir(),
+        "recordings directory missing at {} — committed fixture deleted?",
+        recordings.display()
+    );
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&recordings)
         .expect("list recordings")
         .filter_map(std::result::Result::ok)
@@ -279,11 +312,19 @@ async fn tier2_scorecard_and_drift() {
     // classifies exactly like tier-1 and `record` do.
     let manifest_path = corpus_dir().join("manifest.json");
     let manifest_text = std::fs::read_to_string(&manifest_path).expect("read corpus manifest");
-    let manifest: corpus::CorpusManifest =
-        serde_json::from_str(&manifest_text).expect("parse corpus manifest");
+    let manifest = corpus::CorpusManifest::parse(&manifest_text).expect("parse corpus manifest");
+    // One recording per case: a duplicate would double-process the case
+    // and leave the fixture set ambiguous about which capture is current.
+    let mut seen_case_ids = BTreeSet::new();
 
     for path in paths {
         let recording = Recording::load(&path).expect("recording loads and validates");
+        assert!(
+            seen_case_ids.insert(recording.case_id.clone()),
+            "tier-2 {}: duplicate recording at {}",
+            recording.case_id,
+            path.display()
+        );
 
         // Scorecard computation must always succeed on a valid recording.
         let card = compare::scorecard(&recording.hooray, &recording.xray);
