@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1 (2026-09-22)
+
+### Bug Fixes
+
+- **parsers:** resolve pnpm workspace deps against ancestor lockfile (#340) (55b25be)
+
 ## 0.9.0 (2026-09-22)
 
 ### Features
