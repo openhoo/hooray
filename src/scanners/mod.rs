@@ -15,6 +15,7 @@ use thiserror::Error;
 use zip::ZipArchive;
 
 use crate::filesystem::repository_walk;
+use crate::input::yaml_expansion_within_budget;
 use crate::model::{
     Applicability, ApplicabilityStatus, AssetId, Confidence, Evidence, Finding, FindingKind,
     FindingStatus, Location, Position, Remediation, Risk, RuleId, Severity, stable_finding_id,
@@ -31,13 +32,6 @@ use sast::scan_sast;
 use sast::yaml_call_specifies_loader;
 use service_config::scan_service_config;
 
-const SECRET_ALLOWLIST_MARKERS: &[&str] = &[
-    "hooray:allow-secret",
-    "pragma: allowlist secret",
-    "gitleaks:allow",
-    "nosec",
-];
-const MAX_TEXT_LINE_BYTES: usize = 64 * 1024;
 const ARCHIVE_RATIO_LIMIT: u64 = 100;
 const ARCHIVE_ENTRY_SIZE_LIMIT: u64 = 512 * 1024 * 1024;
 const PARALLEL_MIN_FILES: usize = 32;
@@ -160,14 +154,20 @@ pub fn scan_path(
     }
 
     let mut paths = Vec::new();
+    let mut walk_skipped = 0_usize;
     if metadata.is_file() || (metadata.file_type().is_symlink() && config.follow_symlinks) {
         paths.push(root.to_owned());
     } else if metadata.is_dir() {
         for entry in repository_walk(root, config.follow_symlinks, Some(config.max_depth)) {
-            let entry = entry.map_err(|source| ScanError::Walk {
-                path: root.to_owned(),
-                source,
-            })?;
+            // A single unreadable directory entry must not abort the scan:
+            // it degrades to a skipped file like an unreadable regular file.
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    walk_skipped += 1;
+                    continue;
+                }
+            };
             if entry.file_type().is_some_and(|kind| kind.is_file()) {
                 paths.push(entry.into_path());
                 if paths.len() > config.max_files {
@@ -181,7 +181,10 @@ pub fn scan_path(
     }
     paths.sort();
 
-    let mut output = ScanOutput::default();
+    let mut output = ScanOutput {
+        skipped_files: walk_skipped,
+        ..ScanOutput::default()
+    };
     let mut admitted = Vec::new();
     let mut admitted_bytes = 0_u64;
     for path in paths {
@@ -195,9 +198,14 @@ pub fn scan_path(
             output.skipped_files += 1;
             continue;
         }
-        let Some(bytes) = read_path_bounded(&path, limit, config.follow_symlinks)? else {
-            output.skipped_files += 1;
-            continue;
+        // Oversized, vanished, or unreadable files count as skipped rather
+        // than failing the whole scan.
+        let bytes = match read_path_bounded(&path, limit, config.follow_symlinks) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(_) => {
+                output.skipped_files += 1;
+                continue;
+            }
         };
         let display_path = path
             .strip_prefix(root)
@@ -421,15 +429,19 @@ impl<'a> FindingBuilder<'a> {
             cwe,
         } = spec;
         let start = Position { line, column };
-        let location_id = stable_location_id(self.ctx.asset_id, self.path, Some(start))
-            .expect("scanner paths are non-empty");
-        self.locations.insert(Location {
-            id: location_id.clone(),
-            asset_id: self.ctx.asset_id.clone(),
-            path: self.path.to_owned(),
-            start: Some(start),
-            end: None,
-        });
+        // An empty path (only reachable through the `analyze_bytes` library
+        // entry point) cannot form a location id; the finding still reports
+        // without a location instead of panicking.
+        let location_id = stable_location_id(self.ctx.asset_id, self.path, Some(start)).ok();
+        if let Some(location_id) = &location_id {
+            self.locations.insert(Location {
+                id: location_id.clone(),
+                asset_id: self.ctx.asset_id.clone(),
+                path: self.path.to_owned(),
+                start: Some(start),
+                end: None,
+            });
+        }
         let rule_id = RuleId::new(rule).expect("rule IDs are constants");
         let mut evidence_references = references
             .iter()
@@ -443,7 +455,7 @@ impl<'a> FindingBuilder<'a> {
         }
         let evidence = Evidence {
             description,
-            locations: BTreeSet::from([location_id.clone()]),
+            locations: location_id.iter().cloned().collect(),
             references: evidence_references,
             properties,
             redacted,
@@ -456,12 +468,12 @@ impl<'a> FindingBuilder<'a> {
             Severity::Unknown => 0,
         };
         self.findings.push(Finding {
-            id: stable_finding_id(kind, &rule_id, None, Some(&location_id)),
+            id: stable_finding_id(kind, &rule_id, None, location_id.as_ref()),
             kind,
             rule_id,
             advisory_id: None,
             component_id: None,
-            location_id: Some(location_id),
+            location_id,
             aliases: cwe.into_iter().map(str::to_owned).collect(),
             summary: Some(summary.to_owned()),
             details: Some(details.to_owned()),
@@ -500,7 +512,10 @@ impl<'a> FindingBuilder<'a> {
 }
 
 fn decode_text(bytes: &[u8]) -> Option<&str> {
-    if bytes.iter().take(8192).any(|byte| *byte == 0) {
+    // A NUL anywhere marks binary content; scanning the whole buffer is a
+    // single linear pass and keeps the gate consistent for files whose
+    // binary payload starts past any prefix window.
+    if bytes.contains(&0) {
         return None;
     }
     std::str::from_utf8(bytes).ok()
@@ -517,31 +532,31 @@ static SECRET_RULES: LazyLock<Vec<SecretRule>> = LazyLock::new(|| {
     [
         (
             "secret.aws-access-key",
-            r"\bAKIA[0-9A-Z]{16}\b",
+            r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b",
             "AWS access key ID",
             Severity::High,
         ),
         (
             "secret.github-token",
-            r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b",
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b",
             "GitHub token",
             Severity::Critical,
         ),
         (
             "secret.gitlab-token",
-            r"\bglpat-[A-Za-z0-9_-]{20,}\b",
-            "GitLab personal access token",
+            r"\b(?:glpat|glrt|gldt|glft|glagent|glcbt|glptt|glsoat|glff|gloas)-[A-Za-z0-9_-]{20,}\b",
+            "GitLab token",
             Severity::Critical,
         ),
         (
             "secret.slack-token",
-            r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b",
+            r"\b(?:xox[baprs]|xapp|xoxe(?:\.xoxp)?|xoxc|xoxd)-[A-Za-z0-9-]{20,}\b",
             "Slack token",
             Severity::Critical,
         ),
         (
             "secret.private-key",
-            r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----",
+            r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----",
             "private key",
             Severity::Critical,
         ),
@@ -567,9 +582,12 @@ static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // the separator-delimited prefix/suffix segments accept compound names
     // (SECRET_KEY, DB_PASSWORD, API_SECRET) without lookarounds, which the
     // regex crate does not support. Unseparated words like "tokenize" or
-    // "tokens" still do not match.
+    // "tokens" still do not match; concatenated names like "secretkey" do.
+    // Values may be double-quoted, single-quoted, or unquoted (`.env` and
+    // shell exports); each quoted alternative permits the other quote kind
+    // inside the value.
     Regex::new(
-        r#"(?i)\b((?:[a-z0-9]+[_-])?(?:api[_-]?key|secret|token|password|passwd|client[_-]?secret)(?:[_-][a-z0-9]+)*)\b\s*["']?\s*[:=]\s*["']([^"']{12,256})["']"#,
+        r#"(?i)\b((?:[a-z0-9]+[_-])?(?:api[_-]?key|secret[_-]?key|client[_-]?secret|secret|token|password|passwd)(?:[_-][a-z0-9]+)*)\b\s*["']?\s*[:=]\s*(?:"([^"]{12,256})"|'([^']{12,256})'|([^\s"']{12,256}))"#,
     )
     .expect("constant assignment regex")
 });
@@ -595,8 +613,15 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
         BTreeSet::new()
     };
     let line_starts = line_starts(text);
+    // PEM END markers are indexed once per file so a marker-heavy file stays
+    // linear: each BEGIN match binary-searches this table instead of scanning
+    // to EOF for a terminator that may not exist.
+    let mut pem_end_offsets: Option<Vec<usize>> = None;
     for (line_index, line) in text.lines().enumerate() {
-        if line.len() > MAX_TEXT_LINE_BYTES || allowlisted(line) {
+        // Long lines (minified bundles, single-line dumps) are scanned like
+        // any other: every rule is a linear-time regex with bounded captures,
+        // so skipping them would silently hide leaked credentials.
+        if allowlisted(line) {
             continue;
         }
         let line_offset = line_starts[line_index];
@@ -608,7 +633,13 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
                 // plausible base64 body (placeholders, redactions, truncated
                 // markers) are not secrets at all.
                 let value = if secret_rule.rule == "secret.private-key" {
-                    let Some(block) = pem_block(text, line_offset + matched.start()) else {
+                    let end_offsets = pem_end_offsets.get_or_insert_with(|| {
+                        text.match_indices("-----END ")
+                            .map(|(offset, _)| offset)
+                            .collect()
+                    });
+                    let Some(block) = pem_block(text, line_offset + matched.start(), end_offsets)
+                    else {
                         continue;
                     };
                     block
@@ -635,7 +666,11 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
         }
         for captures in SECRET_ASSIGNMENT_REGEX.captures_iter(line) {
             let assignment = captures.get(0).expect("capture exists");
-            let value = captures.get(2).expect("capture exists");
+            let value = captures
+                .get(2)
+                .or_else(|| captures.get(3))
+                .or_else(|| captures.get(4))
+                .expect("value capture exists");
             if assignment.start() > 0
                 && line.as_bytes()[assignment.start() - 1] == b':'
                 && package_script_values.contains(value.as_str())
@@ -654,6 +689,8 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
             if looks_self_referential(&name, value.as_str())
                 || looks_placeholder(value.as_str())
                 || looks_like_noncredential_assignment(value.as_str())
+                || (name_suggests_reference(&name)
+                    && looks_like_namespaced_reference(value.as_str()))
                 || entropy < f64::from(builder.ctx.config.secret_entropy_threshold_milli)
             {
                 continue;
@@ -675,15 +712,32 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
 /// starting at `begin_offset`, but only when the body between the markers is
 /// plausible base64 key material. Placeholder bodies (`<REDACTED…>`, `…`,
 /// `XXXX`, empty) and marker-only fragments return `None` so they never
-/// produce a finding.
-fn pem_block(text: &str, begin_offset: usize) -> Option<Cow<'_, str>> {
+/// produce a finding. `end_offsets` is the pre-indexed table of every
+/// `-----END ` occurrence in `text`; the first entry at or after the body
+/// start is the only candidate terminator, so malformed marker runs cannot
+/// force a scan to EOF.
+fn pem_block<'a>(
+    text: &'a str,
+    begin_offset: usize,
+    end_offsets: &[usize],
+) -> Option<Cow<'a, str>> {
+    const PEM_LABEL_MAX_BYTES: usize = 128;
     let block = text.get(begin_offset..)?;
     let label_start = "-----BEGIN ".len();
-    let label_end = label_start + block.get(label_start..)?.find("-----")?;
+    let label_end = label_start
+        + block
+            .get(label_start..(label_start + PEM_LABEL_MAX_BYTES).min(block.len()))?
+            .find("-----")?;
     let body_start = label_end + 5;
-    let end_start = body_start + block[body_start..].find("-----END ")?;
-    let end_label_start = end_start + "-----END ".len();
-    let end_label_end = end_label_start + block[end_label_start..].find("-----")?;
+    let end_start = *end_offsets.get(end_offsets.partition_point(|offset| *offset < body_start))?;
+    if end_start < body_start {
+        return None;
+    }
+    let end_label_start = end_start.checked_sub(begin_offset)? + "-----END ".len();
+    let end_label_end = end_label_start
+        + block
+            .get(end_label_start..(end_label_start + PEM_LABEL_MAX_BYTES).min(block.len()))?
+            .find("-----")?;
     if block[label_start..label_end] != block[end_label_start..end_label_end] {
         return None;
     }
@@ -708,7 +762,7 @@ fn pem_block(text: &str, begin_offset: usize) -> Option<Cow<'_, str>> {
     } else {
         Cow::Borrowed(block)
     };
-    let body_end = normalized.len() - (block.len() - end_start);
+    let body_end = normalized.len() - (block.len() - (end_start - begin_offset));
     let body = &normalized[body_start..body_end];
     if !(body.starts_with('\n') || body.starts_with("\r\n")) {
         return None;
@@ -718,12 +772,39 @@ fn pem_block(text: &str, begin_offset: usize) -> Option<Cow<'_, str>> {
 
 /// A PEM body is plausible key material when it is a run of base64 characters
 /// (whitespace between wrapped lines allowed) long and diverse enough to be a
-/// real key rather than a placeholder like `XXXX…` or `AAAA…`.
+/// real key rather than a placeholder like `XXXX…` or `AAAA…`. Legacy
+/// encrypted PEMs prepend `Proc-Type:`/`DEK-Info:` header lines before the
+/// base64 body (RFC 1421); a leading run of `Name: value` header lines is
+/// stripped before the base64 check so real encrypted keys are not rejected.
 fn plausible_pem_body(body: &str) -> bool {
+    let mut rest = body;
+    loop {
+        if rest.is_empty() {
+            break;
+        }
+        let line = rest.split('\n').next().unwrap_or("");
+        let trimmed = line.trim_end_matches(['\r', ' ', '\t']);
+        if trimmed.is_empty() {
+            rest = &rest[line.len()..];
+            rest = rest.strip_prefix('\n').unwrap_or(rest);
+            continue;
+        }
+        let is_header = trimmed.split_once(':').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+        if !is_header {
+            break;
+        }
+        rest = &rest[line.len()..];
+        rest = rest.strip_prefix('\n').unwrap_or(rest);
+    }
     let mut length = 0;
     let mut alphabet = [false; 128];
     let mut distinct = 0;
-    for byte in body.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+    for byte in rest.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
         if !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')) {
             return false;
         }
@@ -771,7 +852,7 @@ fn add_secret(builder: &mut FindingBuilder<'_>, rule: &str, site: SecretSite<'_>
         severity,
         confidence: Confidence::High,
         description: format!("Redacted {label}; safe metadata recorded for correlation and triage."),
-        references: &["https://owasp.org/www-project-top-10-for-large-language-model-applications/"],
+        references: &["https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"],
         properties,
         redacted: true,
         remediation: "Revoke and rotate the credential, remove it from source and history, and load its replacement from an approved secret manager.",
@@ -779,11 +860,18 @@ fn add_secret(builder: &mut FindingBuilder<'_>, rule: &str, site: SecretSite<'_>
     });
 }
 
+static SECRET_ALLOWLIST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    // `nosec` must appear as a standalone marker (word boundary on both
+    // sides, digits allowed for rule ids like `nosec B602`); a credential
+    // value that merely contains the substring must not suppress itself.
+    Regex::new(
+        r"(?i)(?:hooray:allow-secret|pragma: allowlist secret|gitleaks:allow|(?:^|[^A-Za-z0-9_])nosec(?:[^A-Za-z]|$))",
+    )
+    .expect("constant secret allowlist regex")
+});
+
 fn allowlisted(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    SECRET_ALLOWLIST_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
+    SECRET_ALLOWLIST_REGEX.is_match(line)
 }
 
 fn looks_placeholder(value: &str) -> bool {
@@ -805,7 +893,6 @@ fn looks_placeholder(value: &str) -> bool {
     .any(|marker| lower.contains(marker))
         || value.chars().collect::<BTreeSet<_>>().len() < 5
         || looks_sequential_or_repeated(value)
-        || looks_like_namespaced_reference(value)
         || looks_like_pattern(value)
 }
 
@@ -861,7 +948,10 @@ fn looks_sequential_or_repeated(value: &str) -> bool {
 
 /// Detects Kubernetes `namespace/name` object references such as
 /// `default/other-demo-secret`: two RFC 1123-style labels joined by a single
-/// slash. These are pointers to a secret object, not secret material.
+/// slash. These are pointers to a secret object, not secret material. The
+/// shape alone is ambiguous (`admin/panel123` is a real credential), so it
+/// only suppresses when `name_suggests_reference` marks the assignment key
+/// as a reference-style field.
 fn looks_like_namespaced_reference(value: &str) -> bool {
     let mut parts = value.split('/');
     let (Some(namespace), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
@@ -883,12 +973,25 @@ fn looks_like_namespaced_reference(value: &str) -> bool {
     })
 }
 
+/// Whether an assignment key names a reference rather than the credential
+/// itself (`secret_name`, `token_ref`, `password_name`): only then may a
+/// `namespace/name` value be treated as an object pointer.
+fn name_suggests_reference(name: &str) -> bool {
+    let normalized = name.replace('-', "_");
+    normalized.ends_with("_name") || normalized.ends_with("_ref")
+}
+
 /// Detects values that merely restate the assignment key as vocabulary, such
 /// as the Android autofill hint `'password': 'current-password'` or
-/// `token = "api_token"`. The value must be a pure lowercase word list
-/// (hyphen/underscore separated) that contains the normalized key, so real
-/// secrets that happen to contain the key name plus entropy still flag.
+/// `token = "api_token"`. An exact restatement always suppresses; a longer
+/// value suppresses only when every word belongs to credential vocabulary —
+/// `token_value` or `secret-key` carry real (if weak) credential material
+/// and must flag.
 fn looks_self_referential(name: &str, value: &str) -> bool {
+    const CREDENTIAL_VOCABULARY: &[&str] = &[
+        "api", "auth", "current", "new", "old", "pass", "passwd", "password", "secret", "token",
+        "user",
+    ];
     if !value
         .bytes()
         .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'-' | b'_'))
@@ -897,11 +1000,17 @@ fn looks_self_referential(name: &str, value: &str) -> bool {
     }
     let normalized_name = name.replace(['-', '_'], "");
     let normalized_value = value.replace(['-', '_'], "");
-    !normalized_name.is_empty()
-        && (normalized_value == normalized_name
-            || (normalized_value.len() > normalized_name.len()
-                && (normalized_value.starts_with(&normalized_name)
-                    || normalized_value.ends_with(&normalized_name))))
+    if normalized_name.is_empty() {
+        return false;
+    }
+    if normalized_value == normalized_name {
+        return true;
+    }
+    normalized_value.len() > normalized_name.len()
+        && normalized_value.contains(&normalized_name)
+        && value
+            .split(['-', '_'])
+            .all(|word| CREDENTIAL_VOCABULARY.contains(&word))
 }
 
 /// Detects values that are pattern definitions rather than credential text:
@@ -1016,29 +1125,211 @@ fn scan_iac(path: &str, text: &str, builder: &mut FindingBuilder<'_>) {
     if extension == "tf" {
         scan_terraform(text, builder);
     }
-    if name == "dockerfile" || name.starts_with("dockerfile.") {
+    // Terraform JSON (`.tf.json`) is HCL's JSON dialect: it needs the
+    // Terraform checks, not the Kubernetes/CloudFormation structured scan.
+    if name.ends_with(".tf.json") {
+        scan_terraform_json(text, builder);
+    }
+    // `Dockerfile`, `Dockerfile.*`, `*.dockerfile`, and Podman's
+    // `Containerfile*` all carry Dockerfile syntax.
+    if name == "dockerfile"
+        || name.starts_with("dockerfile.")
+        || name.ends_with(".dockerfile")
+        || name == "containerfile"
+        || name.starts_with("containerfile.")
+    {
         scan_dockerfile(text, builder);
     }
-    if matches!(extension.as_str(), "yaml" | "yml" | "json") {
+    if matches!(extension.as_str(), "yaml" | "yml" | "json") && !name.ends_with(".tf.json") {
         scan_structured_iac(text, &extension, builder);
     }
 }
 
 static TERRAFORM_PUBLIC_CIDR_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    // Singular and plural CIDR attributes (aws_route's
+    // destination_cidr_block, security-group cidr_blocks/ipv6_cidr_blocks),
+    // quoted or bare scalars, and list elements. `[^\]=]*` keeps the match
+    // inside one attribute value across wrapped lists.
     Regex::new(
-        r#"(?m)^\s*(cidr_blocks|ipv6_cidr_blocks)\s*=\s*\[[^\]]*["'](?:0\.0\.0\.0/0|::/0)["']"#,
+        r#"(?m)^[ \t]*(?:destination_)?(?:ipv6_)?cidr_blocks?\s*=\s*(?:[^\]=]*["'\s,\[]|\s*)(?:0\.0\.0\.0/0|::/0)\b"#,
     )
     .expect("constant Terraform public CIDR regex")
 });
 
 static TERRAFORM_UNENCRYPTED_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*(encrypted|storage_encrypted)\s*=\s*false\b")
+    Regex::new(r"(?m)^[ \t]*(encrypted|storage_encrypted)\s*=\s*false\b")
         .expect("constant Terraform encryption regex")
 });
 
+/// Sorted `(byte offset, suppressed)` breakpoints marking where Terraform
+/// text enters or leaves an `egress { … }` block, a `resource` block carrying
+/// `type = "egress"`, or a heredoc body. A match is suppressed when the last
+/// breakpoint at or before its start reports `true`, so single-line blocks
+/// are handled at byte precision rather than by line.
+fn terraform_suppression_breaks(text: &str) -> Vec<(usize, bool)> {
+    enum Frame {
+        /// A block whose label is not egress-related.
+        Other,
+        /// An `egress { … }` block (including `dynamic "egress"`).
+        Egress,
+        /// A `resource "…" "…"` block; suppressed once `type = "egress"`
+        /// appears at its top level.
+        Resource { egress: bool },
+    }
+    fn suppressed(stack: &[Frame]) -> bool {
+        stack.iter().any(|frame| match frame {
+            Frame::Egress => true,
+            Frame::Resource { egress } => *egress,
+            Frame::Other => false,
+        })
+    }
+    let mut breaks = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut heredoc_terminator: Option<String> = None;
+    let starts = line_starts(text);
+    for (index, line) in text.lines().enumerate() {
+        let offset = starts[index];
+        if let Some(terminator) = &heredoc_terminator {
+            breaks.push((offset, true));
+            if line.trim() == terminator.as_str() {
+                heredoc_terminator = None;
+            }
+            continue;
+        }
+        // Truncate at the first comment opener outside quotes so commented
+        // braces and attributes cannot corrupt block tracking or match.
+        let mut code_end = line.len();
+        let mut quote = false;
+        for (at, byte) in line.bytes().enumerate() {
+            if byte == b'"' {
+                quote = !quote;
+            } else if !quote
+                && (byte == b'#' || (byte == b'/' && line.as_bytes().get(at + 1) == Some(&b'/')))
+            {
+                code_end = at;
+                break;
+            }
+        }
+        let code = &line[..code_end];
+        if let Some(marker) = code.find("<<").and_then(|at| {
+            let rest = code[at + 2..].trim_start_matches('-').trim_start();
+            let end = rest
+                .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .unwrap_or(rest.len());
+            (end > 0).then(|| rest[..end].to_owned())
+        }) {
+            heredoc_terminator = Some(marker);
+        }
+        // Walk the line in byte order: block opens/closes (outside string
+        // literals) update the frame stack, and a `type = "egress"`
+        // attribute flips the innermost resource frame. The block label is
+        // the first identifier of the statement segment ending at the
+        // brace, so `resource "aws_security_group" "x" {` reads `resource`.
+        let mut quoted_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut quote_start = 0_usize;
+        let mut quote = false;
+        let mut escaped = false;
+        for (at, byte) in code.bytes().enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' if quote => escaped = true,
+                b'"' => {
+                    if quote {
+                        quoted_ranges.push((quote_start, at + 1));
+                    } else {
+                        quote_start = at;
+                    }
+                    quote = !quote;
+                }
+                _ => {}
+            }
+        }
+        let in_string = |at: usize| {
+            quoted_ranges
+                .iter()
+                .any(|(start, end)| *start <= at && at < *end)
+        };
+        let mut events: Vec<(usize, u8)> = TERRAFORM_EGRESS_TYPE_REGEX
+            .find_iter(code)
+            .filter(|matched| !in_string(matched.start()))
+            .map(|matched| (matched.start(), b't'))
+            .collect();
+        let mut segment_start = 0_usize;
+        let mut quote = false;
+        let mut escaped = false;
+        for (at, byte) in code.bytes().enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' if quote => escaped = true,
+                b'"' => quote = !quote,
+                b'{' | b'}' if !quote => events.push((at, byte)),
+                _ => {}
+            }
+        }
+        events.sort_by_key(|(at, _)| *at);
+        for (at, byte) in events {
+            match byte {
+                b'{' => {
+                    let segment = &code[segment_start..at];
+                    let label = segment
+                        .split(|character: char| {
+                            !(character.is_ascii_alphanumeric() || character == '_')
+                        })
+                        .find(|word| !word.is_empty())
+                        .unwrap_or("");
+                    stack.push(match label {
+                        "egress" => Frame::Egress,
+                        "resource" => Frame::Resource { egress: false },
+                        "dynamic" if segment.contains("\"egress\"") => Frame::Egress,
+                        _ => Frame::Other,
+                    });
+                    breaks.push((offset + at + 1, suppressed(&stack)));
+                }
+                b'}' => {
+                    stack.pop();
+                    segment_start = at + 1;
+                    breaks.push((offset + at + 1, suppressed(&stack)));
+                }
+                // A top-level `type = "egress"` attribute marks its
+                // enclosing resource (aws_security_group_rule) as an
+                // outbound rule.
+                _ => {
+                    if matches!(stack.last(), Some(Frame::Resource { egress: false })) {
+                        if let Some(Frame::Resource { egress }) = stack.last_mut() {
+                            *egress = true;
+                        }
+                        breaks.push((offset + at, true));
+                    }
+                }
+            }
+        }
+        breaks.push((offset + line.len() + 1, suppressed(&stack)));
+    }
+    breaks
+}
+
+static TERRAFORM_EGRESS_TYPE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\btype\s*=\s*["']?egress["']?\b"#).expect("constant Terraform egress type regex")
+});
+
+fn terraform_position_suppressed(breaks: &[(usize, bool)], position: usize) -> bool {
+    let index = breaks.partition_point(|(offset, _)| *offset <= position);
+    index > 0 && breaks[index - 1].1
+}
+
 fn scan_terraform(text: &str, builder: &mut FindingBuilder<'_>) {
     let line_starts = line_starts(text);
+    let breaks = terraform_suppression_breaks(text);
     for matched in TERRAFORM_PUBLIC_CIDR_REGEX.find_iter(text) {
+        if terraform_position_suppressed(&breaks, matched.start()) {
+            continue;
+        }
         let (line, column) = indexed_line_column(&line_starts, matched.start());
         builder.add(FindingSpec { kind: FindingKind::Iac, rule: "iac.terraform.public-ingress", line, column, summary: "Unrestricted Terraform network CIDR", details: "A Terraform network rule explicitly permits the entire IPv4 or IPv6 Internet.", severity: Severity::High, confidence: Confidence::High, description: "Concrete cidr_blocks assignment contains 0.0.0.0/0 or ::/0.".to_owned(), references: &["https://developer.hashicorp.com/terraform/language"], properties: BTreeMap::new(), redacted: false, remediation: "Restrict ingress to the smallest required CIDR ranges and ports.", cwe: Some("CWE-284") });
     }
@@ -1060,6 +1351,113 @@ fn scan_terraform(text: &str, builder: &mut FindingBuilder<'_>) {
             remediation: "Enable provider-managed or customer-managed encryption for data at rest.",
             cwe: Some("CWE-311"),
         });
+    }
+}
+
+/// Terraform JSON dialect (`.tf.json`): the same two checks evaluated on the
+/// parsed document so JSON quoting cannot hide open CIDRs or disabled
+/// encryption. `egress` objects and `type = "egress"` resources are skipped
+/// like their HCL counterparts.
+fn scan_terraform_json(text: &str, builder: &mut FindingBuilder<'_>) {
+    let parse_text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(parse_text) else {
+        return;
+    };
+    let line_starts = line_starts(text);
+    let index = yaml_path_index(parse_text);
+    let location = DocumentLocation {
+        text,
+        document_offset: text.len() - parse_text.len(),
+        index: index.as_ref(),
+        line_starts: &line_starts,
+    };
+    scan_terraform_json_value(&document, "", false, &location, builder);
+}
+
+fn scan_terraform_json_value(
+    value: &serde_json::Value,
+    path: &str,
+    in_egress: bool,
+    location: &DocumentLocation<'_>,
+    builder: &mut FindingBuilder<'_>,
+) {
+    let object = match value {
+        serde_json::Value::Object(object) => object,
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                scan_terraform_json_value(
+                    item,
+                    &format!("{path}/{index}"),
+                    in_egress,
+                    location,
+                    builder,
+                );
+            }
+            return;
+        }
+        _ => return,
+    };
+    let egress_here = in_egress
+        || object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("egress"));
+    for (key, field) in object {
+        let field_path = format!("{path}/{}", pointer_escape(key));
+        let key_lower = key.to_ascii_lowercase();
+        if matches!(key_lower.as_str(), "egress" | "dynamic") {
+            scan_terraform_json_value(field, &field_path, true, location, builder);
+            continue;
+        }
+        let is_cidr_attribute =
+            key_lower.ends_with("cidr_block") || key_lower.ends_with("cidr_blocks");
+        if is_cidr_attribute && !egress_here && terraform_json_has_open_cidr(field) {
+            add_structured_iac(
+                builder,
+                location,
+                StructuredIacRule {
+                    path: &field_path,
+                    anchor: "",
+                    needle: "0.0.0.0/0",
+                    rule: "iac.terraform.public-ingress",
+                    summary: "Unrestricted Terraform network CIDR",
+                    severity: Severity::High,
+                    remediation: "Restrict ingress to the smallest required CIDR ranges and ports.",
+                    cwe: "CWE-284",
+                    references: &["https://developer.hashicorp.com/terraform/language"],
+                },
+            );
+        }
+        if matches!(key_lower.as_str(), "encrypted" | "storage_encrypted")
+            && field.as_bool() == Some(false)
+        {
+            add_structured_iac(
+                builder,
+                location,
+                StructuredIacRule {
+                    path: &field_path,
+                    anchor: "",
+                    needle: "false",
+                    rule: "iac.terraform.encryption-disabled",
+                    summary: "Terraform storage encryption disabled",
+                    severity: Severity::High,
+                    remediation: "Enable provider-managed or customer-managed encryption for data at rest.",
+                    cwe: "CWE-311",
+                    references: &["https://developer.hashicorp.com/terraform/language"],
+                },
+            );
+        }
+        scan_terraform_json_value(field, &field_path, egress_here, location, builder);
+    }
+}
+
+fn terraform_json_has_open_cidr(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            matches!(text.trim(), "0.0.0.0/0" | "::/0")
+        }
+        serde_json::Value::Array(items) => items.iter().any(terraform_json_has_open_cidr),
+        _ => false,
     }
 }
 
@@ -1097,30 +1495,38 @@ fn secret_variable_name(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase().replace('-', "_");
     matches!(
         normalized.as_str(),
-        "password" | "passwd" | "token" | "secret" | "apikey" | "api_key"
+        "password" | "passwd" | "pass" | "pwd" | "token" | "secret" | "apikey" | "api_key"
     ) || normalized.ends_with("_password")
         || normalized.ends_with("_passwd")
+        || normalized.ends_with("_pass")
+        || normalized.ends_with("_pwd")
         || normalized.ends_with("_token")
         || normalized.ends_with("_secret")
         || normalized.ends_with("_secret_key")
         || normalized.ends_with("_api_key")
+        || normalized.ends_with("_apikey")
         || normalized.ends_with("_access_key")
+        || normalized.starts_with("credential")
 }
 
-/// Redacts userinfo credentials (`scheme://user:password@host`) from a line
-/// before it is rendered as IaC evidence; scheme, host, and path stay intact
-/// for triage. Only this finding embeds arbitrary remote URLs, so the scrub
-/// is scoped here rather than applied to every rendered directive line.
+/// Redacts credentials from URLs in a line before it is rendered as IaC
+/// evidence: userinfo (`scheme://user:password@host`) and every non-empty
+/// query-string value (`?token=…`, `&sig=…`). Scheme, host, path, and query
+/// keys stay intact for triage. Only this finding embeds arbitrary remote
+/// URLs, so the scrub is scoped here rather than applied to every rendered
+/// directive line.
 fn redact_url_credentials(line: &str) -> String {
     let mut redacted = String::with_capacity(line.len());
     let mut searched_up_to = 0;
     while let Some(separator) = line[searched_up_to..].find("://") {
         let scheme_end = searched_up_to + separator + 3;
         redacted.push_str(&line[searched_up_to..scheme_end]);
-        let authority_end = line[scheme_end..]
-            .find('/')
+        let url_end = line[scheme_end..]
+            .find(char::is_whitespace)
             .map_or(line.len(), |position| scheme_end + position);
-        let authority = &line[scheme_end..authority_end];
+        let url = &line[scheme_end..url_end];
+        let authority_end = url.find(['/', '?', '#']).unwrap_or(url.len());
+        let authority = &url[..authority_end];
         match authority.rsplit_once('@') {
             Some((_, host)) => {
                 redacted.push_str("[REDACTED]@");
@@ -1128,19 +1534,54 @@ fn redact_url_credentials(line: &str) -> String {
             }
             None => redacted.push_str(authority),
         }
-        searched_up_to = authority_end;
+        let rest = &url[authority_end..];
+        let fragment_at = rest.find('#').unwrap_or(rest.len());
+        let (before_fragment, fragment) = rest.split_at(fragment_at);
+        let (path, query) = match before_fragment.find('?') {
+            Some(at) => (&before_fragment[..at], &before_fragment[at + 1..]),
+            None => (before_fragment, ""),
+        };
+        redacted.push_str(path);
+        if before_fragment.contains('?') {
+            redacted.push('?');
+            for (index, pair) in query.split('&').enumerate() {
+                if index > 0 {
+                    redacted.push('&');
+                }
+                match pair.split_once('=') {
+                    Some((key, value)) if !value.is_empty() => {
+                        redacted.push_str(key);
+                        redacted.push_str("=[REDACTED]");
+                    }
+                    _ => redacted.push_str(pair),
+                }
+            }
+        }
+        redacted.push_str(fragment);
+        searched_up_to = url_end;
     }
     redacted.push_str(&line[searched_up_to..]);
     redacted
 }
 
 fn scan_dockerfile(text: &str, builder: &mut FindingBuilder<'_>) {
+    let mut seen_from = false;
     let mut final_stage_line = 1;
     let mut final_user: Option<(u32, String)> = None;
     for (index, line) in docker_logical_lines(text) {
         let trimmed = line.trim();
+        // `ONBUILD <instruction>` wraps another directive; strip the trigger
+        // prefix so ENV/ARG/ADD/USER dispatch sees the wrapped instruction.
         let upper = trimmed.to_ascii_uppercase();
+        let (trimmed, upper) = match upper.strip_prefix("ONBUILD ") {
+            Some(rest) => {
+                let skip = upper.len() - rest.len();
+                (&trimmed[skip..], rest)
+            }
+            None => (trimmed, upper.as_str()),
+        };
         if upper.starts_with("FROM ") {
+            seen_from = true;
             final_stage_line = index;
             final_user = None;
         } else if upper.starts_with("USER ") {
@@ -1152,14 +1593,16 @@ fn scan_dockerfile(text: &str, builder: &mut FindingBuilder<'_>) {
             builder.add(FindingSpec { kind: FindingKind::Iac, rule: "iac.dockerfile.remote-add", line: index, column: 1, summary: "Dockerfile ADD fetches a remote URL", details: "Remote ADD makes provenance and cache behavior harder to control.", severity: Severity::Medium, confidence: Confidence::High, description: redact_url_credentials(trimmed), references: &["https://docs.docker.com/reference/dockerfile/#add"], properties: BTreeMap::new(), redacted: false, remediation: "Fetch with a pinned, checksum-verified build step, then COPY the verified artifact.", cwe: Some("CWE-494") });
         }
         if (upper.starts_with("ENV ") || upper.starts_with("ARG "))
-            && docker_declares_secret(trimmed, &upper)
+            && docker_declares_secret(trimmed, upper)
         {
             builder.add(FindingSpec { kind: FindingKind::Iac, rule: "iac.dockerfile.secret-in-build-arg", line: index, column: 1, summary: "Docker build instruction declares a secret", details: "ENV and ARG values can persist in image configuration or build history.", severity: Severity::High, confidence: Confidence::High, description: "Secret-like variable name in ENV/ARG; value omitted.".to_owned(), references: &["https://docs.docker.com/build/building/secrets/"], properties: BTreeMap::new(), redacted: true, remediation: "Use BuildKit secret mounts and ensure credentials never enter image layers or metadata.", cwe: Some("CWE-522") });
         }
     }
-    let final_user_is_root = final_user
-        .as_ref()
-        .is_none_or(|(_, user)| docker_user_is_root(user));
+    // A file without any FROM is a fragment, not a stage: no root-user verdict.
+    let final_user_is_root = seen_from
+        && final_user
+            .as_ref()
+            .is_none_or(|(_, user)| docker_user_is_root(user));
     if final_user_is_root {
         let line = final_user
             .as_ref()
@@ -1235,7 +1678,7 @@ fn scan_structured_iac(text: &str, extension: &str, builder: &mut FindingBuilder
                             // text anchoring for JSONC documents.
                             let location = DocumentLocation {
                                 text,
-                                document_offset: 0,
+                                document_offset: bom_len,
                                 index: None,
                                 line_starts: &line_starts,
                             };
@@ -1252,9 +1695,16 @@ fn scan_structured_iac(text: &str, extension: &str, builder: &mut FindingBuilder
     }
     let mut dropped_documents = 0_usize;
     for (document_text, document_offset) in split_yaml_documents(parse_text) {
-        let parsed = serde_yaml::from_str::<serde_yaml::Value>(&document_text)
-            .ok()
-            .and_then(|value| serde_json::to_value(value).ok());
+        // serde_yaml deep-copies anchored subtrees per alias, so expansion
+        // is quadratic in input size; over-budget documents are rejected
+        // before that memory is allocated, like any unparseable document.
+        let parsed = if yaml_expansion_within_budget(&document_text) {
+            serde_yaml::from_str::<serde_yaml::Value>(&document_text)
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok())
+        } else {
+            None
+        };
         match parsed {
             Some(document) => {
                 let index = yaml_path_index(&document_text);
@@ -1286,11 +1736,26 @@ fn split_yaml_documents(text: &str) -> Vec<(String, usize)> {
     let mut current_offset = 0_usize;
     let mut offset = 0_usize;
     for line in text.split_inclusive('\n') {
-        if line.trim_end() == "---" {
+        // A document marker is `---` or `...` followed by end-of-line or
+        // whitespace (which covers `--- # comment`); `---foo` is content.
+        // Content after `---` on the same line belongs to the new document.
+        let marker = line
+            .strip_prefix("---")
+            .or_else(|| line.strip_prefix("..."));
+        if let Some(rest) = marker
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
             if !current.trim().is_empty() {
                 documents.push((std::mem::take(&mut current), current_offset));
             }
-            offset += line.len();
+            let content = if line.starts_with("---") { rest } else { "" };
+            if content.trim().is_empty() {
+                offset += line.len();
+            } else {
+                current_offset = offset + (line.len() - rest.len());
+                current.push_str(rest);
+                offset += line.len();
+            }
             continue;
         }
         if current.is_empty() {
@@ -1312,14 +1777,14 @@ struct DocumentLocation<'a> {
     text: &'a str,
     /// Byte offset of this document's text within `text`.
     document_offset: usize,
-    /// JSON-pointer path → byte offset within the document text; `None` when
-    /// positions could not be tracked (e.g. JSONC-sanitized input).
     index: Option<&'a BTreeMap<String, usize>>,
     line_starts: &'a [usize],
 }
 
-/// Scans one parsed YAML/JSON document for Kubernetes and CloudFormation
-/// findings.
+/// Scans one parsed YAML/JSON document for Kubernetes, CloudFormation,
+/// Docker Compose, and GitHub Actions findings. Each family gates on the
+/// document's shape, not the filename, so manifests under arbitrary names
+/// are still covered.
 fn scan_structured_document(
     document: &serde_json::Value,
     location: &DocumentLocation<'_>,
@@ -1330,6 +1795,16 @@ fn scan_structured_document(
     }
     if document.get("AWSTemplateFormatVersion").is_some() || document.get("Resources").is_some() {
         scan_cloudformation_value(document, "", location, builder);
+    }
+    if is_compose_document(document) {
+        scan_compose_value(document, location, builder);
+    }
+    // `on` is the workflow trigger key; `true` is accepted as well because
+    // YAML 1.1 tooling emits the unquoted `on` key as the boolean `true`.
+    if document.get("jobs").is_some()
+        && (document.get("on").is_some() || document.get("true").is_some())
+    {
+        scan_github_actions_value(document, location, builder);
     }
 }
 
@@ -1540,6 +2015,7 @@ struct StructuredIacRule<'a> {
     severity: Severity,
     remediation: &'a str,
     cwe: &'a str,
+    references: &'a [&'a str],
 }
 
 /// Boolean-field predicates supported by the table-driven Kubernetes checks.
@@ -1571,6 +2047,7 @@ const KUBERNETES_POD_SPEC_CHECKS: &[KubernetesIacCheck] = &[KubernetesIacCheck {
         severity: Severity::High,
         remediation: "Disable hostNetwork unless the workload has a documented, unavoidable requirement.",
         cwe: "CWE-250",
+        references: &["https://kubernetes.io/docs/concepts/security/"],
     },
 }];
 
@@ -1587,6 +2064,7 @@ const KUBERNETES_SECURITY_CONTEXT_CHECKS: &[KubernetesIacCheck] = &[
             severity: Severity::Critical,
             remediation: "Remove privileged mode and grant only narrowly required capabilities.",
             cwe: "CWE-250",
+            references: &["https://kubernetes.io/docs/concepts/security/"],
         },
     },
     KubernetesIacCheck {
@@ -1601,6 +2079,7 @@ const KUBERNETES_SECURITY_CONTEXT_CHECKS: &[KubernetesIacCheck] = &[
             severity: Severity::High,
             remediation: "Set securityContext.allowPrivilegeEscalation to false.",
             cwe: "CWE-269",
+            references: &["https://kubernetes.io/docs/concepts/security/"],
         },
     },
 ];
@@ -1616,9 +2095,15 @@ fn scan_kubernetes_value(
     location: &DocumentLocation<'_>,
     builder: &mut FindingBuilder<'_>,
 ) {
-    // `kind: List` wraps whole objects in `items`; recurse so each item is
-    // scanned with its own path prefix instead of being invisible.
-    if value.get("kind").and_then(serde_json::Value::as_str) == Some("List") {
+    // `kind: List` and typed lists (`DeploymentList`, `PodList` — emitted by
+    // API clients and GitOps exports) wrap whole objects in `items`; recurse
+    // so each item is scanned with its own path prefix instead of being
+    // invisible.
+    if value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind.ends_with("List"))
+    {
         if let Some(items) = value.get("items").and_then(serde_json::Value::as_array) {
             for (index, item) in items.iter().enumerate() {
                 scan_kubernetes_value(item, &format!("{path}/items/{index}"), location, builder);
@@ -1664,10 +2149,14 @@ fn scan_kubernetes_value(
                     builder,
                 );
                 // hostPort binds a container port onto the node interface
-                // (trivy KSV-0024); any declared hostPort is flagged.
+                // (trivy KSV-0024); Kubernetes treats hostPort: 0 as unset,
+                // so only a nonzero value is flagged.
                 if let Some(ports) = container.get("ports").and_then(serde_json::Value::as_array) {
                     for (port_index, port) in ports.iter().enumerate() {
-                        if port.get("hostPort").is_some() {
+                        if port
+                            .get("hostPort")
+                            .is_some_and(|value| value.as_i64() != Some(0))
+                        {
                             add_structured_iac(
                                 builder,
                                 location,
@@ -1680,6 +2169,7 @@ fn scan_kubernetes_value(
                                     severity: Severity::Medium,
                                     remediation: "Remove hostPort and expose the workload through a Service instead of the node interface.",
                                     cwe: "CWE-668",
+                                    references: &["https://kubernetes.io/docs/concepts/security/"],
                                 },
                             );
                         }
@@ -1760,44 +2250,623 @@ fn scan_cloudformation_value(
         let properties = resource
             .get("Properties")
             .unwrap_or(&serde_json::Value::Null);
-        if resource_type == "AWS::S3::Bucket"
-            && properties.get("PublicAccessBlockConfiguration").is_none()
+        if resource_type == "AWS::S3::Bucket" {
+            // Flag when the block is absent, and when it is present but any
+            // of the four controls is concretely false. Intrinsic values
+            // ({Ref: …}, !If[…]) are unknown, not permissive.
+            let permissive = match properties.get("PublicAccessBlockConfiguration") {
+                None => true,
+                Some(block) => [
+                    "BlockPublicAcls",
+                    "BlockPublicPolicy",
+                    "IgnorePublicAcls",
+                    "RestrictPublicBuckets",
+                ]
+                .iter()
+                .any(|field| block.get(*field).and_then(serde_json::Value::as_bool) == Some(false)),
+            };
+            if permissive {
+                add_structured_iac(
+                    builder,
+                    location,
+                    StructuredIacRule {
+                        path: &format!("{resource_path}/Type"),
+                        anchor: logical_id,
+                        needle: "AWS::S3::Bucket",
+                        rule: "iac.cloudformation.s3-public-access-block",
+                        summary: "CloudFormation S3 bucket lacks public access blocking",
+                        severity: Severity::High,
+                        remediation: "Configure all four PublicAccessBlockConfiguration controls as true.",
+                        cwe: "CWE-284",
+                        references: &[
+                            "https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/",
+                        ],
+                    },
+                );
+            }
+        }
+        if resource_type == "AWS::RDS::DBInstance" {
+            // Only a concrete boolean decides: absent or false is flagged,
+            // intrinsic values ({Ref: …}, !If[…]) are unknown and skipped.
+            let unencrypted = match properties.get("StorageEncrypted") {
+                None => true,
+                Some(value) => value.as_bool() == Some(false),
+            };
+            if unencrypted {
+                add_structured_iac(
+                    builder,
+                    location,
+                    StructuredIacRule {
+                        path: &format!("{resource_path}/Properties/StorageEncrypted"),
+                        anchor: logical_id,
+                        needle: "StorageEncrypted",
+                        rule: "iac.cloudformation.rds-encryption",
+                        summary: "CloudFormation RDS storage encryption is not enabled",
+                        severity: Severity::High,
+                        remediation: "Set StorageEncrypted to true and select an approved KMS key where required.",
+                        cwe: "CWE-311",
+                        references: &[
+                            "https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/",
+                        ],
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// A document is treated as a Compose file when `services` is a mapping and
+/// at least one service declares `image` or `build` — the fields every
+/// runnable Compose service needs. Compose-like service maps in other
+/// formats (e.g. Helm values) still describe container deployments, so the
+/// checks remain meaningful there.
+fn is_compose_document(document: &serde_json::Value) -> bool {
+    document
+        .get("services")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|services| {
+            services
+                .values()
+                .any(|service| service.get("image").is_some() || service.get("build").is_some())
+        })
+}
+
+/// Scalar-field predicates supported by the table-driven Compose checks.
+enum ComposeIacPredicate {
+    /// Fires only when the field is present and set to true.
+    IsTrue,
+    /// Fires when the field's string value equals one of the listed values.
+    EqualsAny(&'static [&'static str]),
+}
+
+/// One table row: the service field to inspect, when the check fires, and
+/// the finding to emit.
+struct ComposeIacCheck {
+    field: &'static str,
+    predicate: ComposeIacPredicate,
+    rule: StructuredIacRule<'static>,
+}
+
+const COMPOSE_SERVICE_CHECKS: &[ComposeIacCheck] = &[
+    ComposeIacCheck {
+        field: "privileged",
+        predicate: ComposeIacPredicate::IsTrue,
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "privileged",
+            rule: "iac.compose.privileged",
+            summary: "Compose service runs in privileged mode",
+            severity: Severity::Critical,
+            remediation: "Remove privileged mode and grant only narrowly required capabilities.",
+            cwe: "CWE-250",
+            references: &["https://docs.docker.com/reference/compose-file/services/#privileged"],
+        },
+    },
+    ComposeIacCheck {
+        field: "network_mode",
+        predicate: ComposeIacPredicate::EqualsAny(&["host"]),
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "network_mode",
+            rule: "iac.compose.host-network",
+            summary: "Compose service shares the host network namespace",
+            severity: Severity::High,
+            remediation: "Use a Compose network and publish only the required ports.",
+            cwe: "CWE-668",
+            references: &["https://docs.docker.com/reference/compose-file/services/#network_mode"],
+        },
+    },
+    ComposeIacCheck {
+        field: "pid",
+        predicate: ComposeIacPredicate::EqualsAny(&["host"]),
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "pid",
+            rule: "iac.compose.host-pid",
+            summary: "Compose service shares the host PID namespace",
+            severity: Severity::High,
+            remediation: "Remove pid: host; containers should not see or signal host processes.",
+            cwe: "CWE-668",
+            references: &["https://docs.docker.com/reference/compose-file/services/#pid"],
+        },
+    },
+    ComposeIacCheck {
+        field: "ipc",
+        predicate: ComposeIacPredicate::EqualsAny(&["host"]),
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "ipc",
+            rule: "iac.compose.host-ipc",
+            summary: "Compose service shares the host IPC namespace",
+            severity: Severity::Medium,
+            remediation: "Remove ipc: host; sharing host IPC exposes shared memory and semaphores.",
+            cwe: "CWE-668",
+            references: &["https://docs.docker.com/reference/compose-file/services/#ipc"],
+        },
+    },
+    ComposeIacCheck {
+        field: "cgroup",
+        predicate: ComposeIacPredicate::EqualsAny(&["host"]),
+        rule: StructuredIacRule {
+            path: "",
+            anchor: "",
+            needle: "cgroup",
+            rule: "iac.compose.host-cgroup",
+            summary: "Compose service runs in the host cgroup namespace",
+            severity: Severity::Medium,
+            remediation: "Remove cgroup: host; the host cgroup namespace exposes resource controls.",
+            cwe: "CWE-668",
+            references: &["https://docs.docker.com/reference/compose-file/services/#cgroup"],
+        },
+    },
+];
+
+/// `cap_add` values that hand a container broad kernel authority (trivy
+/// flags the same set). `CAP_`-prefixed spellings are normalized before
+/// comparison.
+const COMPOSE_DANGEROUS_CAPABILITIES: &[&str] = &["ALL", "SYS_ADMIN", "SYS_MODULE"];
+
+/// Container runtime sockets: mounting one hands the service root-equivalent
+/// control of the host's container runtime.
+const COMPOSE_RUNTIME_SOCKETS: &[&str] = &[
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/podman/podman.sock",
+    "/var/run/podman/podman.sock",
+    "/run/containerd/containerd.sock",
+    "/var/run/crio/crio.sock",
+    "/run/crio/crio.sock",
+];
+
+/// Host path prefixes whose writable bind mount lets a container modify the
+/// host system or other tenants' data. `/` matches the filesystem root only.
+const COMPOSE_SENSITIVE_HOST_PATHS: &[&str] = &[
+    "/",
+    "/etc",
+    "/root",
+    "/home",
+    "/boot",
+    "/var/run",
+    "/var/lib/docker",
+    "/var/log",
+    "/proc",
+    "/sys",
+    "/dev",
+];
+
+fn scan_compose_value(
+    document: &serde_json::Value,
+    location: &DocumentLocation<'_>,
+    builder: &mut FindingBuilder<'_>,
+) {
+    let Some(services) = document
+        .get("services")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    for (service_name, service) in services {
+        let service_path = format!("/services/{}", pointer_escape(service_name));
+        for check in COMPOSE_SERVICE_CHECKS {
+            let observed = service.get(check.field);
+            let fires = match &check.predicate {
+                ComposeIacPredicate::IsTrue => {
+                    observed.and_then(serde_json::Value::as_bool) == Some(true)
+                }
+                ComposeIacPredicate::EqualsAny(values) => observed
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| values.contains(&value)),
+            };
+            if fires {
+                add_structured_iac(
+                    builder,
+                    location,
+                    StructuredIacRule {
+                        path: &format!("{service_path}/{}", check.field),
+                        anchor: service_name,
+                        ..check.rule
+                    },
+                );
+            }
+        }
+        if let Some(capabilities) = service.get("cap_add").and_then(serde_json::Value::as_array) {
+            for (index, capability) in capabilities.iter().enumerate() {
+                let normalized = capability
+                    .as_str()
+                    .unwrap_or("")
+                    .trim_start_matches("CAP_")
+                    .to_ascii_uppercase();
+                if COMPOSE_DANGEROUS_CAPABILITIES.contains(&normalized.as_str()) {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &format!("{service_path}/cap_add/{index}"),
+                            anchor: service_name,
+                            needle: capability.as_str().unwrap_or("cap_add"),
+                            rule: "iac.compose.dangerous-capability",
+                            summary: "Compose service adds a broad Linux capability",
+                            severity: Severity::High,
+                            remediation: "Drop cap_add entries such as ALL or SYS_ADMIN; grant only the specific capabilities the service needs.",
+                            cwe: "CWE-250",
+                            references: &[
+                                "https://docs.docker.com/reference/compose-file/services/#cap_add",
+                            ],
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(options) = service
+            .get("security_opt")
+            .and_then(serde_json::Value::as_array)
         {
+            for (index, option) in options.iter().enumerate() {
+                if option
+                    .as_str()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("unconfined"))
+                {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &format!("{service_path}/security_opt/{index}"),
+                            anchor: service_name,
+                            needle: option.as_str().unwrap_or("security_opt"),
+                            rule: "iac.compose.unconfined-security",
+                            summary: "Compose service disables a security profile",
+                            severity: Severity::Medium,
+                            remediation: "Remove unconfined seccomp/AppArmor options so the default security profiles apply.",
+                            cwe: "CWE-693",
+                            references: &[
+                                "https://docs.docker.com/reference/compose-file/services/#security_opt",
+                            ],
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(volumes) = service.get("volumes").and_then(serde_json::Value::as_array) {
+            for (index, volume) in volumes.iter().enumerate() {
+                let Some((source, read_only)) = compose_volume_source(volume) else {
+                    continue;
+                };
+                let volume_path = format!("{service_path}/volumes/{index}");
+                if COMPOSE_RUNTIME_SOCKETS.contains(&source) {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &volume_path,
+                            anchor: service_name,
+                            needle: source,
+                            rule: "iac.compose.docker-socket",
+                            summary: "Compose service mounts a container runtime socket",
+                            severity: Severity::Critical,
+                            remediation: "Do not mount container runtime sockets; use a rootless or remote API with least privilege instead.",
+                            cwe: "CWE-668",
+                            references: &[
+                                "https://docs.docker.com/reference/compose-file/services/#volumes",
+                            ],
+                        },
+                    );
+                } else if !read_only && is_sensitive_host_path(source) {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &volume_path,
+                            anchor: service_name,
+                            needle: source,
+                            rule: "iac.compose.sensitive-host-mount",
+                            summary: "Compose service mounts a sensitive host path writable",
+                            severity: Severity::High,
+                            remediation: "Mount only the narrowest required host path, and mount it read-only.",
+                            cwe: "CWE-668",
+                            references: &[
+                                "https://docs.docker.com/reference/compose-file/services/#volumes",
+                            ],
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Extracts the host source path and read-only flag from a Compose volume
+/// entry, for both the short `source:target[:mode]` string form and the long
+/// object form. Returns `None` for named volumes, relative paths, container
+/// paths (single-segment entries), and non-bind mounts.
+fn compose_volume_source(volume: &serde_json::Value) -> Option<(&str, bool)> {
+    if let Some(entry) = volume.as_str() {
+        let mut parts = entry.split(':');
+        let source = parts.next()?;
+        // A single segment is a container path or anonymous volume, not a
+        // host bind mount.
+        parts.next()?;
+        let read_only = parts
+            .next()
+            .is_some_and(|mode| mode.split(',').any(|flag| flag == "ro"));
+        return source.starts_with('/').then_some((source, read_only));
+    }
+    let source = volume.get("source").and_then(serde_json::Value::as_str)?;
+    if !source.starts_with('/') {
+        return None;
+    }
+    let read_only = volume.get("read_only").and_then(serde_json::Value::as_bool) == Some(true);
+    Some((source, read_only))
+}
+
+/// Whether `path` is exactly a sensitive host path or sits beneath one.
+fn is_sensitive_host_path(path: &str) -> bool {
+    let normalized = path.trim_end_matches('/');
+    COMPOSE_SENSITIVE_HOST_PATHS.iter().any(|sensitive| {
+        if *sensitive == "/" {
+            normalized.is_empty()
+        } else {
+            normalized == *sensitive
+                || normalized
+                    .strip_prefix(*sensitive)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
+    })
+}
+
+/// Whether the workflow's `on`/`true` trigger value includes `event`, in
+/// scalar, sequence, or mapping form.
+fn workflow_triggers(on: Option<&serde_json::Value>, event: &str) -> bool {
+    match on {
+        Some(serde_json::Value::String(name)) => name == event,
+        Some(serde_json::Value::Array(events)) => {
+            events.iter().any(|entry| entry.as_str() == Some(event))
+        }
+        Some(serde_json::Value::Object(events)) => events.contains_key(event),
+        _ => false,
+    }
+}
+
+/// Whether a `uses` reference is pinned to an immutable revision: a full
+/// commit SHA for action and reusable-workflow refs, or a digest for
+/// `docker://` refs. Local `./` paths are always pinned by definition.
+fn gha_unpinned_uses(uses: &str) -> bool {
+    if uses.starts_with("./") {
+        return false;
+    }
+    if let Some(image) = uses.strip_prefix("docker://") {
+        return !image.contains("@sha256:");
+    }
+    match uses.rsplit_once('@') {
+        Some((_, reference)) => {
+            !(reference.len() == 40 && reference.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        }
+        None => true,
+    }
+}
+
+/// Whether a `run` body interpolates attacker-controlled contexts directly
+/// into shell code (zizmor's template-injection class): `github.event.*`
+/// payloads, `github.head_ref`, and workflow `inputs.*`.
+fn gha_untrusted_interpolation(run: &str) -> bool {
+    run.split("${{").skip(1).any(|expression| {
+        let expression = expression.split("}}").next().unwrap_or("");
+        expression.contains("github.event.")
+            || expression.contains("github.head_ref")
+            || expression.contains("inputs.")
+    })
+}
+
+/// Whether a `runs-on` value selects self-hosted runners, in scalar,
+/// sequence, or `{labels: [...]}` form.
+fn gha_self_hosted(runs_on: Option<&serde_json::Value>) -> bool {
+    match runs_on {
+        Some(serde_json::Value::String(label)) => label == "self-hosted",
+        Some(serde_json::Value::Array(labels)) => labels
+            .iter()
+            .any(|label| label.as_str() == Some("self-hosted")),
+        Some(serde_json::Value::Object(selector)) => selector
+            .get("labels")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|labels| {
+                labels
+                    .iter()
+                    .any(|label| label.as_str() == Some("self-hosted"))
+            }),
+        _ => false,
+    }
+}
+
+fn scan_github_actions_value(
+    document: &serde_json::Value,
+    location: &DocumentLocation<'_>,
+    builder: &mut FindingBuilder<'_>,
+) {
+    const GHA_REFERENCES: &[&str] = &[
+        "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions",
+    ];
+    let on = document.get("on").or_else(|| document.get("true"));
+    let on_key = if document.get("on").is_some() {
+        "on"
+    } else {
+        "true"
+    };
+    let pull_request_target = workflow_triggers(on, "pull_request_target");
+    if pull_request_target {
+        add_structured_iac(
+            builder,
+            location,
+            StructuredIacRule {
+                path: &format!("/{on_key}"),
+                anchor: "",
+                needle: "pull_request_target",
+                rule: "iac.github-actions.pull-request-target",
+                summary: "Workflow runs on pull_request_target with base-repo privileges",
+                severity: Severity::High,
+                remediation: "Prefer pull_request; if pull_request_target is required, never check out or run untrusted PR code under it.",
+                cwe: "CWE-250",
+                references: GHA_REFERENCES,
+            },
+        );
+    }
+    if document
+        .get("permissions")
+        .and_then(serde_json::Value::as_str)
+        == Some("write-all")
+    {
+        add_structured_iac(
+            builder,
+            location,
+            StructuredIacRule {
+                path: "/permissions",
+                anchor: "",
+                needle: "write-all",
+                rule: "iac.github-actions.broad-permissions",
+                summary: "Workflow grants write-all token permissions",
+                severity: Severity::Medium,
+                remediation: "Replace write-all with the minimal per-scope permissions the jobs need.",
+                cwe: "CWE-732",
+                references: GHA_REFERENCES,
+            },
+        );
+    }
+    let Some(jobs) = document.get("jobs").and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    for (job_name, job) in jobs {
+        let job_path = format!("/jobs/{}", pointer_escape(job_name));
+        if gha_self_hosted(job.get("runs-on")) {
             add_structured_iac(
                 builder,
                 location,
                 StructuredIacRule {
-                    path: &format!("{resource_path}/Type"),
-                    anchor: logical_id,
-                    needle: "AWS::S3::Bucket",
-                    rule: "iac.cloudformation.s3-public-access-block",
-                    summary: "CloudFormation S3 bucket lacks public access blocking",
-                    severity: Severity::High,
-                    remediation: "Configure all four PublicAccessBlockConfiguration controls as true.",
-                    cwe: "CWE-284",
+                    path: &format!("{job_path}/runs-on"),
+                    anchor: job_name,
+                    needle: "self-hosted",
+                    rule: "iac.github-actions.self-hosted",
+                    summary: "Job runs on a self-hosted runner",
+                    severity: Severity::Medium,
+                    remediation: "Confirm the runner is ephemeral and isolated; self-hosted runners persist secrets and build state across jobs.",
+                    cwe: "CWE-668",
+                    references: GHA_REFERENCES,
                 },
             );
         }
-        if resource_type == "AWS::RDS::DBInstance"
-            && properties
-                .get("StorageEncrypted")
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-        {
-            add_structured_iac(
-                builder,
-                location,
-                StructuredIacRule {
-                    path: &format!("{resource_path}/Properties/StorageEncrypted"),
-                    anchor: logical_id,
-                    needle: "StorageEncrypted",
-                    rule: "iac.cloudformation.rds-encryption",
-                    summary: "CloudFormation RDS storage encryption is not enabled",
-                    severity: Severity::High,
-                    remediation: "Set StorageEncrypted to true and select an approved KMS key where required.",
-                    cwe: "CWE-311",
-                },
-            );
+        // Job-level `uses` is a reusable-workflow call; it carries no steps.
+        if let Some(uses) = job.get("uses").and_then(serde_json::Value::as_str) {
+            if gha_unpinned_uses(uses) {
+                add_structured_iac(
+                    builder,
+                    location,
+                    StructuredIacRule {
+                        path: &format!("{job_path}/uses"),
+                        anchor: job_name,
+                        needle: uses,
+                        rule: "iac.github-actions.unpinned-action",
+                        summary: "Reusable workflow is not pinned to a commit SHA",
+                        severity: Severity::Medium,
+                        remediation: "Pin reusable workflow refs to a full commit SHA.",
+                        cwe: "CWE-829",
+                        references: GHA_REFERENCES,
+                    },
+                );
+            }
+            continue;
+        }
+        let Some(steps) = job.get("steps").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for (index, step) in steps.iter().enumerate() {
+            let step_path = format!("{job_path}/steps/{index}");
+            if let Some(uses) = step.get("uses").and_then(serde_json::Value::as_str) {
+                if gha_unpinned_uses(uses) {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &format!("{step_path}/uses"),
+                            anchor: job_name,
+                            needle: uses,
+                            rule: "iac.github-actions.unpinned-action",
+                            summary: "Action is not pinned to a commit SHA",
+                            severity: Severity::Medium,
+                            remediation: "Pin action refs to a full commit SHA; tags and branches are mutable.",
+                            cwe: "CWE-829",
+                            references: GHA_REFERENCES,
+                        },
+                    );
+                }
+                // Checking out the PR head under pull_request_target runs
+                // attacker-controlled code with a privileged token.
+                if pull_request_target
+                    && uses.split('@').next() == Some("actions/checkout")
+                    && step
+                        .pointer("/with/ref")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|reference| {
+                            reference.contains("github.event.pull_request.head")
+                                || reference.contains("github.head_ref")
+                        })
+                {
+                    add_structured_iac(
+                        builder,
+                        location,
+                        StructuredIacRule {
+                            path: &format!("{step_path}/with/ref"),
+                            anchor: job_name,
+                            needle: "pull_request.head",
+                            rule: "iac.github-actions.pull-request-target-checkout",
+                            summary: "pull_request_target job checks out untrusted PR code",
+                            severity: Severity::Critical,
+                            remediation: "Check out the base ref under pull_request_target, or switch the trigger to pull_request.",
+                            cwe: "CWE-250",
+                            references: GHA_REFERENCES,
+                        },
+                    );
+                }
+            }
+            if let Some(run) = step.get("run").and_then(serde_json::Value::as_str)
+                && gha_untrusted_interpolation(run)
+            {
+                add_structured_iac(
+                    builder,
+                    location,
+                    StructuredIacRule {
+                        path: &format!("{step_path}/run"),
+                        anchor: job_name,
+                        needle: "run",
+                        rule: "iac.github-actions.script-injection",
+                        summary: "run step interpolates untrusted context into shell code",
+                        severity: Severity::High,
+                        remediation: "Bind the value through an env: variable and quote it, instead of interpolating it into the script.",
+                        cwe: "CWE-94",
+                        references: GHA_REFERENCES,
+                    },
+                );
+            }
         }
     }
 }
@@ -1827,7 +2896,7 @@ fn add_structured_iac(
     if !rule.anchor.is_empty() {
         properties.insert("object".to_owned(), rule.anchor.to_owned());
     }
-    builder.add(FindingSpec { kind: FindingKind::Iac, rule: rule.rule, line, column, summary: rule.summary, details: "A parsed IaC document contains the concrete insecure configuration described by this rule.", severity: rule.severity, confidence: Confidence::High, description: format!("Parsed configuration key: {}", rule.needle), references: &["https://kubernetes.io/docs/concepts/security/", "https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/"], properties, redacted: false, remediation: rule.remediation, cwe: Some(rule.cwe) });
+    builder.add(FindingSpec { kind: FindingKind::Iac, rule: rule.rule, line, column, summary: rule.summary, details: "A parsed IaC document contains the concrete insecure configuration described by this rule.", severity: rule.severity, confidence: Confidence::High, description: format!("Parsed configuration key: {}", rule.needle), references: rule.references, properties, redacted: false, remediation: rule.remediation, cwe: Some(rule.cwe) });
 }
 
 /// Fallback anchor search used only when no parse-time position index is
@@ -2486,6 +3555,82 @@ mod tests {
     }
 
     #[test]
+    fn compose_rules_parse_service_fields() {
+        let yaml = "services:\n  web:\n    image: nginx\n    privileged: true\n    network_mode: host\n    pid: host\n    ipc: host\n    cap_add: [SYS_ADMIN]\n    security_opt: [seccomp:unconfined]\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n      - /etc:/host-etc\n      - type: bind\n        source: /var/lib/docker\n        target: /docker\n";
+        let output = analyze("docker-compose.yml", yaml);
+        assert!(has(&output, "iac.compose.privileged"));
+        assert!(has(&output, "iac.compose.host-network"));
+        assert!(has(&output, "iac.compose.host-pid"));
+        assert!(has(&output, "iac.compose.host-ipc"));
+        assert!(has(&output, "iac.compose.dangerous-capability"));
+        assert!(has(&output, "iac.compose.unconfined-security"));
+        assert!(has(&output, "iac.compose.docker-socket"));
+        assert!(has(&output, "iac.compose.sensitive-host-mount"));
+    }
+
+    #[test]
+    fn compose_rules_skip_safe_mounts_and_non_compose_documents() {
+        // Read-only sensitive mounts, named volumes, and container paths are
+        // not host writes.
+        let yaml = "services:\n  web:\n    image: nginx\n    volumes:\n      - /etc:/host-etc:ro\n      - data:/srv\n      - /container-only\nvolumes:\n  data:\n";
+        let output = analyze("compose.yaml", yaml);
+        assert!(!has(&output, "iac.compose.sensitive-host-mount"));
+        assert!(!has(&output, "iac.compose.docker-socket"));
+        // A `services` map without image/build is not a Compose document.
+        let other = "services:\n  web:\n    enabled: true\n    privileged: true\n";
+        assert!(!has(
+            &analyze("values.yaml", other),
+            "iac.compose.privileged"
+        ));
+    }
+
+    #[test]
+    fn compose_findings_anchor_per_service() {
+        let yaml = "services:\n  first:\n    image: a\n    privileged: true\n  second:\n    image: b\n    privileged: true\n";
+        let output = analyze("docker-compose.yml", yaml);
+        let findings = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "iac.compose.privileged")
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 2);
+        assert_ne!(findings[0].location_id, findings[1].location_id);
+    }
+
+    #[test]
+    fn github_actions_rules_parse_workflow() {
+        let yaml = "on: [pull_request_target]\npermissions: write-all\njobs:\n  build:\n    runs-on: [self-hosted, linux]\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f49056e30\n      - run: echo ${{ github.event.issue.title }}\n";
+        let output = analyze(".github/workflows/ci.yml", yaml);
+        assert!(has(&output, "iac.github-actions.pull-request-target"));
+        assert!(has(
+            &output,
+            "iac.github-actions.pull-request-target-checkout"
+        ));
+        assert!(has(&output, "iac.github-actions.broad-permissions"));
+        assert!(has(&output, "iac.github-actions.self-hosted"));
+        assert!(has(&output, "iac.github-actions.unpinned-action"));
+        assert!(has(&output, "iac.github-actions.script-injection"));
+        // The SHA-pinned setup-node step must not be flagged.
+        let unpinned = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "iac.github-actions.unpinned-action")
+            .count();
+        assert_eq!(unpinned, 1);
+    }
+
+    #[test]
+    fn github_actions_rules_skip_pinned_and_safe_workflows() {
+        let yaml = "on: push\npermissions: read-all\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955\n      - uses: docker://alpine@sha256:abc\n      - uses: ./local/action\n      - run: echo ${{ github.sha }}\n";
+        let output = analyze(".github/workflows/ci.yml", yaml);
+        assert!(!has(&output, "iac.github-actions.unpinned-action"));
+        assert!(!has(&output, "iac.github-actions.pull-request-target"));
+        assert!(!has(&output, "iac.github-actions.broad-permissions"));
+        assert!(!has(&output, "iac.github-actions.self-hosted"));
+        assert!(!has(&output, "iac.github-actions.script-injection"));
+    }
+
+    #[test]
     fn structured_iac_repeated_objects_have_distinct_locations_and_ids() {
         let yaml = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: repeated\nspec:\n  containers:\n    - name: first\n      securityContext:\n        privileged: true\n        allowPrivilegeEscalation: false\n    - name: second\n      securityContext:\n        privileged: true\n        allowPrivilegeEscalation: false\n";
         let output = analyze("pod.yaml", yaml);
@@ -2639,7 +3784,9 @@ mod tests {
             ),
             "sast.rust.command-shell"
         ));
-        assert!(has(
+        // Bare `exec(...)` without a child_process alias is not reported —
+        // it is indistinguishable from RegExp.prototype.exec (#206).
+        assert!(!has(
             &analyze("x.js", "exec(command)"),
             "sast.javascript.exec-dynamic"
         ));
@@ -2666,7 +3813,7 @@ runSync(`git ${branch}`);
 const { exec: destructured, execSync: destructuredSync } = require("child_process");
 destructured(input);
 destructuredSync(`git ${branch}`);
-exec(command);
+// exec(command); — bare exec without an alias is not reported (#206)
 
 /^(?:rgba|hsla)\(([^)]+)\)$/.exec(computed);
 RegExp.prototype.exec(computed);
@@ -2684,7 +3831,7 @@ cp.exec(`fixed`);
             .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
             .count();
         assert_eq!(
-            findings, 10,
+            findings, 9,
             "all proven dynamic child_process sinks are reported once"
         );
     }
@@ -3962,9 +5109,16 @@ childProcess.exec(input);"#;
         let source = "const Map<String, String> autofillHints = <String, String>{\n  'password': 'current-password',\n  'newPassword': 'new-password',\n};\nconst token = '0123456789abcdef';\n";
         let output = analyze("autofill_hint.dart", source);
         assert!(!has(&output, "secret.high-entropy-assignment"));
-        // Kubernetes namespace/name secret references are pointers, not keys.
+        // Kubernetes namespace/name secret references are pointers, not
+        // keys — but only when the assignment key names a reference
+        // (secret_name/secretRef); a `password` key with a slash value is a
+        // credential (#178).
         assert!(!has(
-            &analyze("deploy.yaml", "password: \"default/other-demo-secret\""),
+            &analyze("deploy.yaml", "secret_name: \"default/other-demo-secret\""),
+            "secret.high-entropy-assignment"
+        ));
+        assert!(has(
+            &analyze("deploy.yaml", "password: \"admin/panel123\""),
             "secret.high-entropy-assignment"
         ));
         // Negative control: a real token assignment still flags.

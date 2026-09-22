@@ -188,9 +188,14 @@ impl IntegrationGenerator {
         let details_url = details_url.map(validate_https_url).transpose()?;
         let selected = self.selected_findings(report);
         let locations = location_index(report);
+        // The GitHub Checks API rejects any request carrying more than 50
+        // annotations, so the emitted payload is capped there regardless of
+        // the configured selection limit; `truncated` still reports the
+        // configured-limit truncation.
         let annotations: Vec<Value> = selected
             .items
             .iter()
+            .take(50)
             .filter_map(|finding| {
                 let location = report_location(&locations, finding)?;
                 let path = repository_relative_path(&location.path)?;
@@ -319,7 +324,10 @@ impl IntegrationGenerator {
             .map(|finding| {
                 json!({
                     "type": "mrkdwn",
-                    "text": format!("*{}* — {}", escape_slack(&self.finding_title(finding)), escape_slack(&self.finding_message(finding)))
+                    // Slack rejects blocks whose mrkdwn text exceeds ~2000
+                    // chars; finding messages can be up to 4096 bytes, so
+                    // the field is truncated to Slack's limit.
+                    "text": truncate_utf8(&format!("*{}* — {}", escape_slack(&self.finding_title(finding)), escape_slack(&self.finding_message(finding))), 1900)
                 })
             })
             .collect();
@@ -557,11 +565,15 @@ jobs:
             .items
             .iter()
             .filter(|finding| {
+                // Diagnostics must attach to the exact document: a suffix
+                // match would attribute `main.rs` findings to
+                // `file:///repo/src/main.rs`. The URI path is decoded and
+                // compared in full.
                 report_location(&locations, finding).is_none_or(|location| {
-                    uri.ends_with(&crate::util::percent_encode(
-                        &location.path,
-                        crate::util::is_path_uri_byte,
-                    ))
+                    uri.strip_prefix("file://").is_some_and(|path| {
+                        crate::util::percent_decode_strict(path)
+                            .is_some_and(|decoded| decoded == location.path)
+                    })
                 })
             })
             .map(|finding| lsp_diagnostic(&locations, finding, self))
@@ -754,14 +766,22 @@ fn vscode_diagnostic(
 ) -> Value {
     let location = report_location(locations, finding);
     json!({
-        "uri": location.map(|value| {
-            format!(
-                "file:///{}",
-                crate::util::percent_encode(
-                    value.path.trim_start_matches('/'),
-                    crate::util::is_path_uri_byte
+        // file:/// URIs are absolute; a repository-relative path would
+        // silently attach diagnostics to the filesystem root, so relative
+        // paths are emitted as a plain `path` field instead.
+        "uri": location.and_then(|value| {
+            value.path.starts_with('/').then(|| {
+                format!(
+                    "file:///{}",
+                    crate::util::percent_encode(
+                        value.path.trim_start_matches('/'),
+                        crate::util::is_path_uri_byte
+                    )
                 )
-            )
+            })
+        }),
+        "path": location.and_then(|value| {
+            (!value.path.starts_with('/')).then(|| value.path.clone())
         }),
         "range": lsp_range(location),
         "severity": lsp_severity(finding.severity),
@@ -836,11 +856,12 @@ fn jira_description(
     description.push_str(&format!("* Denied: {}\n", report.policy_summary.denied));
     description.push_str(&format!("* Warnings: {}\n", report.policy_summary.warned));
     description.push_str(&format!("* Findings: {}\n", report.findings.len()));
+    // run.id is interpolated inside a {{...}} monospace block; a `}}`
+    // in the id would break out and inject wiki markup, so it is
+    // escaped like finding titles.
     description.push_str(&format!(
-        "* Run: {}{}{}\n",
-        "{{",
-        report.run.id.as_str(),
-        "}}"
+        "* Run: {{{{{}}}}}\n",
+        escape_jira_wiki(report.run.id.as_str())
     ));
     if !denied_lines.is_empty() {
         description.push_str("\nh2. Top policy denials\n");
@@ -1009,11 +1030,19 @@ fn looks_secret(word: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     let secret_assignment = [
         "token=",
+        "token:",
         "secret=",
+        "secret:",
         "password=",
+        "password:",
         "passwd=",
+        "passwd:",
         "api_key=",
+        "api_key:",
         "apikey=",
+        "apikey:",
+        "key=",
+        "key:",
     ]
     .iter()
     .any(|marker| lower.contains(marker));
@@ -1027,6 +1056,8 @@ fn looks_secret(word: &str) -> bool {
         || (trimmed.starts_with("AKIA") && trimmed.len() >= 20)
         || lower.starts_with("bearer:")
         || lower.starts_with("bearer=")
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
         || trimmed.contains("PRIVATE_KEY")
 }
 
@@ -1067,7 +1098,10 @@ fn escape_jira_wiki(value: &str) -> String {
     let flattened = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut escaped = String::with_capacity(flattened.len());
     for character in flattened.chars() {
-        if matches!(character, '[' | ']' | '{' | '}' | '*' | '~' | '^' | '!') {
+        if matches!(
+            character,
+            '[' | ']' | '{' | '}' | '*' | '~' | '^' | '!' | '_' | '+' | '-' | '|' | '#'
+        ) {
             escaped.push('\\');
         }
         escaped.push(character);

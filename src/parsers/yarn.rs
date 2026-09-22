@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_yaml::Value as Yaml;
 
-use super::split_descriptor;
+use super::{split_descriptor, yaml_doc, yaml_str};
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::{ComponentId, Scope};
 struct YarnEntry {
@@ -122,7 +122,7 @@ fn parse_yarn_classic(
 }
 
 fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Result<(), InputError> {
-    let doc: Yaml = serde_yaml::from_str(text).map_err(|e| malformed(path, "yarn.lock", e))?;
+    let doc: Yaml = yaml_doc(text, path, "yarn.lock")?;
     let Some(root) = doc.as_mapping() else {
         return Err(malformed_msg(
             path,
@@ -136,7 +136,7 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
         if key == "__metadata" {
             continue;
         }
-        let Some(version) = value.get("version").and_then(Yaml::as_str) else {
+        let Some(version) = value.get("version").and_then(yaml_str) else {
             // README promises malformed lockfiles fail rather than skip
             // entries; this is the same condition the classic parser
             // hard-errors on, so Berry must not silently drop the entry.
@@ -167,7 +167,11 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
         let name = yarn_name(path, descriptor)?.to_owned();
         let descriptors = yarn_descriptors(path, key, true)?;
         let mut deps: Vec<(String, bool)> = Vec::new();
-        for (field, optional) in [("dependencies", false), ("optionalDependencies", true)] {
+        for (field, optional) in [
+            ("dependencies", false),
+            ("optionalDependencies", true),
+            ("peerDependencies", false),
+        ] {
             if let Some(map) = value.get(field).and_then(Yaml::as_mapping) {
                 for (dep, requested) in map {
                     let (Some(dep), Some(requested)) = (dep.as_str(), requested.as_str()) else {
@@ -190,7 +194,7 @@ fn parse_yarn_berry(path: &str, text: &str, out: &mut InventoryBuilder) -> Resul
             YarnEntry {
                 descriptors,
                 name,
-                version: version.to_owned(),
+                version,
                 deps,
             },
         )?;
@@ -538,6 +542,9 @@ consumer@1:
                 "  optionalDependencies:\n",
                 "    fsevents \"^2.3.2\"\n",
                 "\n",
+                "\"@babel/code-generator@^7.22.0\":\n",
+                "  version \"7.22.5\"\n",
+                "\n",
                 "fsevents@^2.3.2:\n",
                 "  version \"2.3.2\"\n",
             ),
@@ -563,14 +570,34 @@ consumer@1:
                 .any(|c| c.name == "kind-of" && c.version == "6.0.3")
         );
         assert!(
-            !inventory
+            inventory
                 .components
                 .values()
-                .any(|c| c.name == "@babel/code-generator")
+                .any(|c| c.name == "@babel/code-generator" && c.version == "7.22.5")
         );
-        assert_eq!(inventory.components.len(), 4);
-        assert_eq!(inventory.dependencies.len(), 2);
-        assert!(inventory.dependencies.iter().any(|e| e.optional));
+        assert_eq!(inventory.components.len(), 5);
+        let edges: BTreeSet<_> = inventory
+            .dependencies
+            .iter()
+            .map(|edge| {
+                let from = &inventory.components[&edge.from];
+                let to = &inventory.components[&edge.to];
+                (
+                    from.name.as_str(),
+                    to.name.as_str(),
+                    to.version.as_str(),
+                    edge.optional,
+                )
+            })
+            .collect();
+        assert_eq!(
+            edges,
+            BTreeSet::from([
+                ("left-pad", "kind-of", "6.0.3", false),
+                ("@babel/core", "@babel/code-generator", "7.22.5", false),
+                ("@babel/core", "fsevents", "2.3.2", true),
+            ])
+        );
 
         let berry = tempdir().unwrap();
         fs::write(

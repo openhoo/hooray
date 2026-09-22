@@ -790,6 +790,11 @@ impl MonitorRunner for CliMonitorRunner {
                     &database_path,
                     max_input_bytes,
                     max_archive_entries,
+                    // The fingerprint walk must honor the same depth bound
+                    // the scanner uses (ScannerConfig::default().max_depth),
+                    // or deep files the scanner ignores still churn the
+                    // fingerprint and cause spurious rescans.
+                    hooray::scanners::ScannerConfig::default().max_depth,
                 )
             })
             .await
@@ -1181,6 +1186,30 @@ mod tests {
             vec!["hooray", "integrations", "generate", "github-actions"],
         ] {
             assert!(Cli::try_parse_from(command).is_ok());
+        }
+    }
+
+    #[test]
+    fn clap_offline_flag_parses_on_every_scan_target() {
+        for command in [
+            vec!["hooray", "scan", "project", ".", "--offline"],
+            vec!["hooray", "scan", "sbom", "bom.json", "--offline"],
+            vec!["hooray", "scan", "artifact", "app.zip", "--offline"],
+            vec!["hooray", "scan", "container", "image.tar", "--offline"],
+            vec!["hooray", "scan", "auto", ".", "--offline"],
+        ] {
+            let cli = Cli::try_parse_from(command).expect("--offline parses");
+            let Command::Scan(args) = cli.command else {
+                panic!("expected scan command");
+            };
+            let offline = match args.command {
+                ScanCommand::Project(target)
+                | ScanCommand::Sbom(target)
+                | ScanCommand::Artifact(target)
+                | ScanCommand::Container(target)
+                | ScanCommand::Auto(target) => target.offline,
+            };
+            assert!(offline, "--offline must reach ScanTargetArgs.offline");
         }
     }
 

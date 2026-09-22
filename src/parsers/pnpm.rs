@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde_yaml::Value as Yaml;
 
 use super::npm::npm_scope;
-use super::{LockComponents, resolve_lock_component, split_descriptor};
-use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
+use super::{LockComponents, resolve_lock_component, split_descriptor, yaml_doc};
+use crate::input::{InputError, InventoryBuilder, entry_bound, malformed_msg, utf8};
 use crate::model::Scope;
 
 /// A resolved package identity: `(name, version)` with pnpm peer suffixes and
@@ -19,8 +19,7 @@ pub(crate) fn parse_pnpm_lock(
     bytes: &[u8],
     out: &mut InventoryBuilder,
 ) -> Result<(), InputError> {
-    let doc: Yaml = serde_yaml::from_str(utf8(bytes, path, "pnpm-lock.yaml")?)
-        .map_err(|e| malformed(path, "pnpm-lock.yaml", e))?;
+    let doc: Yaml = yaml_doc(utf8(bytes, path, "pnpm-lock.yaml")?, path, "pnpm-lock.yaml")?;
     let packages = doc.get("packages").and_then(Yaml::as_mapping);
     let snapshots = doc.get("snapshots").and_then(Yaml::as_mapping);
     let importers = doc.get("importers").and_then(Yaml::as_mapping);
@@ -85,6 +84,7 @@ pub(crate) fn parse_pnpm_lock(
             collect_pnpm_deps(&node, entry, &mut pending);
         }
     }
+    let package_names: BTreeSet<String> = entries.keys().map(|(name, _)| name.clone()).collect();
     if let Some(importers) = importers {
         for importer in importers.values() {
             for (field, scope) in [
@@ -100,7 +100,7 @@ pub(crate) fn parse_pnpm_lock(
                     let Some(node) = pnpm_resolved_parts(dep, spec) else {
                         continue;
                     };
-                    if !entries.keys().any(|(name, _)| name == &node.0) {
+                    if !package_names.contains(node.0.as_str()) {
                         // Importer-only dependency absent from `packages:`;
                         // its scope comes from the importer field through the
                         // reachability pass below.
@@ -149,7 +149,11 @@ pub(crate) fn parse_pnpm_lock(
 /// Queues a package or snapshot entry's `dependencies`/`optionalDependencies`
 /// for resolution once every component is registered.
 fn collect_pnpm_deps(from: &PnpmNode, entry: &Yaml, pending: &mut Vec<PnpmEdge>) {
-    for (field, optional) in [("dependencies", false), ("optionalDependencies", true)] {
+    for (field, optional) in [
+        ("dependencies", false),
+        ("optionalDependencies", true),
+        ("peerDependencies", false),
+    ] {
         let Some(deps) = entry.get(field).and_then(Yaml::as_mapping) else {
             continue;
         };
@@ -276,15 +280,29 @@ fn pnpm_key_parts(key: &str) -> Option<PnpmNode> {
     if let Some((name, version)) = pnpm_tarball_parts(key) {
         return Some((name.to_owned(), version.to_owned()));
     }
-    let (name, version) = split_descriptor(key)?;
+    let (name, version) = split_descriptor(key)
+        .map(|(name, version)| (name.to_owned(), version.to_owned()))
+        .or_else(|| pnpm_slash_key_parts(key))?;
     if let Some(aliased) = version.strip_prefix("npm:") {
         let (name, version) = split_descriptor(aliased)?;
         return pnpm_valid_version(version).then(|| (name.to_owned(), version.to_owned()));
     }
-    if version.is_empty() || !pnpm_valid_version(version) {
+    if version.is_empty() || !pnpm_valid_version(&version) {
         return None;
     }
-    Some((name.to_owned(), version.to_owned()))
+    Some((name, version))
+}
+
+/// pnpm v5 `packages:`/`snapshots:` keys use the `/name/version` slash form
+/// (`/lodash/4.17.15`, `/@scope/name/1.0.0`); the last segment is the version.
+/// Only leading-slash keys parse this way — bare `host/path` keys are git
+/// references, not registry packages.
+fn pnpm_slash_key_parts(key: &str) -> Option<PnpmNode> {
+    let (name, version) = key.strip_prefix('/')?.rsplit_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    pnpm_valid_version(version).then(|| (name.to_owned(), version.to_owned()))
 }
 
 /// Resolves an importer dependency entry to its real `(name, version)`.
@@ -560,5 +578,91 @@ mod tests {
                 c.name
             );
         }
+    }
+
+    #[test]
+    fn pnpm_v5_slash_keys_inventory_transitives() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            concat!(
+                "lockfileVersion: 5.4\n",
+                "\n",
+                "importers:\n",
+                "  .:\n",
+                "    dependencies:\n",
+                "      left-pad: 1.3.0\n",
+                "\n",
+                "packages:\n",
+                "\n",
+                "  /left-pad/1.3.0:\n",
+                "    resolution: {integrity: sha512-x}\n",
+                "    dependencies:\n",
+                "      kind-of: 6.0.3\n",
+                "\n",
+                "  /kind-of/6.0.3:\n",
+                "    resolution: {integrity: sha512-y}\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let component = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing component {name}"))
+        };
+        assert_eq!(component("left-pad").version, "1.3.0");
+        assert_eq!(component("kind-of").version, "6.0.3");
+        assert!(inventory.dependencies.iter().any(|e| {
+            e.from == component("left-pad").identity && e.to == component("kind-of").identity
+        }));
+    }
+
+    #[test]
+    fn pnpm_peer_dependencies_produce_edges() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            concat!(
+                "lockfileVersion: '9.0'\n",
+                "\n",
+                "importers:\n",
+                "  .:\n",
+                "    dependencies:\n",
+                "      plugin:\n",
+                "        specifier: ^1.0.0\n",
+                "        version: 1.0.0\n",
+                "\n",
+                "packages:\n",
+                "\n",
+                "  plugin@1.0.0:\n",
+                "    resolution: {integrity: sha512-x}\n",
+                "\n",
+                "  host@2.0.0:\n",
+                "    resolution: {integrity: sha512-y}\n",
+                "\n",
+                "snapshots:\n",
+                "\n",
+                "  plugin@1.0.0:\n",
+                "    peerDependencies:\n",
+                "      host: 2.0.0\n",
+                "\n",
+                "  host@2.0.0: {}\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let component = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing component {name}"))
+        };
+        assert!(inventory.dependencies.iter().any(|e| {
+            e.from == component("plugin").identity && e.to == component("host").identity
+        }));
     }
 }

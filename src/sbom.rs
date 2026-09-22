@@ -70,7 +70,13 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
     if sbom.bom_format.as_deref() != Some("CycloneDX") {
         return Err(SbomError::InvalidFormat);
     }
-    if sbom.components.is_empty() {
+    let metadata_components = sbom
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.component.as_ref())
+        .map(|component| component.components.as_slice())
+        .unwrap_or_default();
+    if sbom.components.is_empty() && metadata_components.is_empty() {
         return Err(SbomError::NoComponents);
     }
 
@@ -101,6 +107,16 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
     };
     let mut state = sbom_state(&asset_id, &source);
     collect_components(&sbom.components, None, 0, "components", &mut state)?;
+    // CycloneDX also permits components nested under the root
+    // `metadata.component`; they describe the asset's own inventory, so they
+    // are collected unparented like the top-level `components` array.
+    collect_components(
+        metadata_components,
+        None,
+        0,
+        "metadata.component.components",
+        &mut state,
+    )?;
     collect_declared_dependencies(
         &sbom.dependencies,
         &state.refs,
@@ -391,7 +407,9 @@ fn required<'a>(
 /// Resolves a component's `(purl, version)` from the optional SBOM identity
 /// fields. A versioned purl wins and supplies a missing version; an
 /// unversioned purl gains the declared version; without a purl the SPDX
-/// `name@version` fallback applies. `Ok(None)` means the entry carries no
+/// `pkg:generic/<name>@<version>` package URL is synthesized so downstream
+/// purl fields and OSV queries always see a spec-valid value. `Ok(None)`
+/// means the entry carries no
 /// usable identity at all and must be skipped by the caller; malformed purls
 /// still fail closed.
 fn component_identity(
@@ -421,7 +439,20 @@ fn component_identity(
                     .transpose(),
             }
         }
-        None => Ok(version.map(|version| (format!("{name}@{version}"), version.to_owned()))),
+        // A component without a purl still needs a spec-valid package URL:
+        // the value flows verbatim into CycloneDX `purl` fields and OSV
+        // queries, so a bare `name@version` placeholder would poison both.
+        // `pkg:generic` is the purl type for components with no ecosystem.
+        None => Ok(version.map(|version| {
+            (
+                format!(
+                    "pkg:generic/{}@{}",
+                    percent_encode(name, is_purl_byte),
+                    percent_encode(version, is_purl_byte)
+                ),
+                version.to_owned(),
+            )
+        })),
     }
 }
 
@@ -738,11 +769,12 @@ fn collect_spdx_relationships(
                 Scope::Unknown,
             ),
             // "A BUILD_DEPENDENCY_OF B" states that A is a build dependency
-            // of B, i.e. B builds against A; keep the forward pair and tag
-            // the edge with build scope.
+            // of B, i.e. B depends on A; invert the pair exactly like
+            // DEPENDENCY_OF so edges keep pointing from the dependent side
+            // to its dependency, tagged with build scope.
             "BUILD_DEPENDENCY_OF" => (
-                relationship.spdx_element_id.as_str(),
                 relationship.related_spdx_element.as_str(),
+                relationship.spdx_element_id.as_str(),
                 Scope::Build,
             ),
             _ => continue,
@@ -791,35 +823,50 @@ fn parse_spdx_licenses(value: Option<&str>) -> BTreeSet<License> {
     }])
 }
 
+/// Routes SPDX JSON documents to the SPDX parser. Only a top-level
+/// `"spdxVersion"` key counts: a CycloneDX document may legitimately carry
+/// the same key nested inside `metadata` or `properties`, and routing on
+/// that would fail a valid CycloneDX input with a confusing SPDX error.
+/// The scan tracks JSON string state and object/array depth so keys inside
+/// string values or nested containers never match.
 pub(crate) fn looks_like_spdx(input: &[u8]) -> bool {
     const KEY: &[u8] = b"\"spdxVersion\"";
-    let mut offset = 0;
-    while let Some(index) = input[offset..]
-        .windows(KEY.len())
-        .position(|window| window == KEY)
-    {
-        let key_start = offset + index;
-        let after = key_start + KEY.len();
-        let colon = input[after..]
-            .iter()
-            .take_while(|byte| byte.is_ascii_whitespace())
-            .count();
-        if input.get(after + colon) != Some(&b':') {
-            offset = after;
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0_usize;
+    while index < input.len() {
+        let byte = input[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
             continue;
         }
-        let before = input[..key_start]
-            .iter()
-            .rev()
-            .take_while(|byte| byte.is_ascii_whitespace())
-            .count();
-        let preceded = key_start
-            .checked_sub(before + 1)
-            .is_some_and(|index| matches!(input[index], b'{' | b','));
-        if preceded {
-            return true;
+        match byte {
+            b'"' => {
+                if depth == 1 && input[index..].starts_with(KEY) {
+                    let after = index + KEY.len();
+                    let colon = input[after..]
+                        .iter()
+                        .take_while(|byte| byte.is_ascii_whitespace())
+                        .count();
+                    if input.get(after + colon) == Some(&b':') {
+                        return true;
+                    }
+                }
+                in_string = true;
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
         }
-        offset = after;
+        index += 1;
     }
     false
 }
@@ -948,14 +995,14 @@ mod tests {
             parse_cyclonedx(br#"{}"#),
             Err(SbomError::InvalidFormat)
         ));
-        // A missing purl is spec-optional: the component falls back to the
-        // SPDX-style `name@version` identity instead of failing.
+        // A missing purl is spec-optional: the component falls back to a
+        // synthesized `pkg:generic` package URL instead of failing.
         let recovered = parse_cyclonedx(
             br#"{"bomFormat":"CycloneDX","components":[{"name":"a","version":"1"}]}"#,
         )
         .unwrap();
         let component = recovered.components.values().next().unwrap();
-        assert_eq!(component.purl, "a@1");
+        assert_eq!(component.purl, "pkg:generic/a@1");
         assert_eq!(component.version, "1");
         assert!(matches!(
             parse_cyclonedx(br#"{"bomFormat":"CycloneDX","components":[{"bom-ref":"a","name":"a","version":"1","purl":"pkg:npm/a@1"}],"dependencies":[{"ref":"a","dependsOn":["missing"]}]}"#),
@@ -1125,9 +1172,12 @@ mod tests {
             Err(SbomError::InvalidComponent { field: "name", .. })
         ));
         // A present-but-blank purl is treated as absent and falls back to
-        // `name@version`; a missing version recovers from the purl.
+        // `pkg:generic/name@version`; a missing version recovers from the purl.
         for (component, expected) in [
-            (r#"{"name":"a","version":"1","purl":"   "}"#, "a@1"),
+            (
+                r#"{"name":"a","version":"1","purl":"   "}"#,
+                "pkg:generic/a@1",
+            ),
             (r#"{"name":"a","purl":"pkg:cargo/a@1"}"#, "pkg:cargo/a@1"),
             (
                 r#"{"name":"a","version":"1","purl":"pkg:cargo/a"}"#,
@@ -1409,15 +1459,16 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_name_and_version_without_fabricating_purl() {
+    fn falls_back_to_generic_purl_from_name_and_version() {
         let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-a","name":"openssl","versionInfo":"3.2.1"}]}"#;
         let inventory = parse_cyclonedx(input).unwrap();
         let component = inventory.components.values().next().unwrap();
-        assert_eq!(component.purl, "openssl@3.2.1");
-        assert!(!component.purl.starts_with("pkg:"));
+        // Purl-less components get a spec-valid generic purl: the value is
+        // emitted into CycloneDX purl fields and OSV queries verbatim.
+        assert_eq!(component.purl, "pkg:generic/openssl@3.2.1");
         assert_eq!(
             component.identity,
-            stable_component_id("openssl@3.2.1").unwrap()
+            stable_component_id("pkg:generic/openssl@3.2.1").unwrap()
         );
         inventory.validate().unwrap();
     }
@@ -1488,8 +1539,8 @@ mod tests {
     fn inverts_spdx_dependency_of_edge_direction() {
         let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-lib","name":"lib","versionInfo":"1"},{"SPDXID":"SPDXRef-app","name":"app","versionInfo":"2"}],"relationships":[{"spdxElementId":"SPDXRef-lib","relationshipType":"DEPENDENCY_OF","relatedSpdxElement":"SPDXRef-app"}]}"#;
         let inventory = parse_cyclonedx(input).unwrap();
-        let lib = stable_component_id("lib@1").unwrap();
-        let app = stable_component_id("app@2").unwrap();
+        let lib = stable_component_id("pkg:generic/lib@1").unwrap();
+        let app = stable_component_id("pkg:generic/app@2").unwrap();
         assert_eq!(inventory.dependencies.len(), 1);
         let edge = inventory.dependencies.iter().next().unwrap();
         assert_eq!(edge.from, app, "the dependent package must own the edge");
@@ -1498,16 +1549,17 @@ mod tests {
     }
 
     #[test]
-    fn maps_spdx_build_dependency_of_forward_with_build_scope() {
+    fn inverts_spdx_build_dependency_of_with_build_scope() {
         let input = br#"{"spdxVersion":"SPDX-2.3","name":"doc","packages":[{"SPDXID":"SPDXRef-tool","name":"tool","versionInfo":"1"},{"SPDXID":"SPDXRef-lib","name":"lib","versionInfo":"2"}],"relationships":[{"spdxElementId":"SPDXRef-tool","relationshipType":"BUILD_DEPENDENCY_OF","relatedSpdxElement":"SPDXRef-lib"}]}"#;
         let inventory = parse_cyclonedx(input).unwrap();
-        let tool = stable_component_id("tool@1").unwrap();
-        let lib = stable_component_id("lib@2").unwrap();
+        let tool = stable_component_id("pkg:generic/tool@1").unwrap();
+        let lib = stable_component_id("pkg:generic/lib@2").unwrap();
         assert_eq!(inventory.dependencies.len(), 1);
         let edge = inventory.dependencies.iter().next().unwrap();
-        // "tool BUILD_DEPENDENCY_OF lib" means tool builds against lib.
-        assert_eq!(edge.from, tool);
-        assert_eq!(edge.to, lib);
+        // "tool BUILD_DEPENDENCY_OF lib" means lib depends on tool, so the
+        // edge points from the dependent package to its build dependency.
+        assert_eq!(edge.from, lib);
+        assert_eq!(edge.to, tool);
         assert_eq!(edge.scope, Scope::Build);
     }
 

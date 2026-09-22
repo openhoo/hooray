@@ -82,9 +82,6 @@ enum Command {
         /// Xray CLI version to record in the generator identity.
         #[arg(long)]
         xray_cli_version: Option<String>,
-        /// Vulnerability database snapshot date (provenance only).
-        #[arg(long)]
-        xray_db_date: Option<String>,
     },
     /// Record both scanner sides for one case into a replay file.
     Record {
@@ -109,6 +106,9 @@ enum Command {
         /// Xray CLI version.
         #[arg(long)]
         xray_cli_version: Option<String>,
+        /// Xray server version.
+        #[arg(long)]
+        xray_version: Option<String>,
         /// Xray vulnerability database snapshot date (`YYYY-MM-DD`).
         #[arg(long)]
         xray_db_date: Option<String>,
@@ -195,18 +195,20 @@ async fn run_pinned_scan(
     // Hooray's fail-closed symlink checks require canonical absolute paths.
     let resolved = std::fs::canonicalize(case_path).unwrap_or_else(|_| case_path.to_owned());
     let case_path: &Path = resolved.as_path();
-    let input = match ScanInput::detect(case_path, &config) {
-        Ok(input) => input,
-        Err(error) => {
-            // Wrapped SBOM/zip cases are directories containing the artifact.
-            let Some(artifact) = corpus::find_artifact(None, case_path) else {
-                return Err(anyhow::anyhow!(error)).with_context(|| {
-                    format!("failed to classify case input {}", case_path.display())
-                });
-            };
-            ScanInput::detect(&artifact, &config)
-                .with_context(|| format!("failed to classify case input {}", case_path.display()))?
+    // `ScanInput::detect` classifies every directory as a project, so a
+    // wrapped SBOM/zip case (a directory containing the artifact file)
+    // would scan as an empty project. Resolve the artifact first; only a
+    // directory without a recognized artifact is a real project scan.
+    let input = if case_path.is_dir() {
+        match corpus::find_artifact(None, case_path) {
+            Some(artifact) => ScanInput::detect(&artifact, &config).with_context(|| {
+                format!("failed to classify case input {}", case_path.display())
+            })?,
+            None => ScanInput::ProjectDirectory(case_path.to_owned()),
         }
+    } else {
+        ScanInput::detect(case_path, &config)
+            .with_context(|| format!("failed to classify case input {}", case_path.display()))?
     };
     pinned_scan_input(input, &config, policy).await
 }
@@ -248,14 +250,21 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     lock.write_all(b"\n")?;
     Ok(())
 }
-
 fn case_label(case: &Path) -> String {
     // Recordings key on this label, so it must be stable regardless of how
     // the operator spelled the path ('.', './dir/', absolute, relative).
     let resolved = std::fs::canonicalize(case).unwrap_or_else(|_| case.to_owned());
-    match resolved.file_name().and_then(|name| name.to_str()) {
+    // A file input (SBOM/archive) names its parent case directory: `check`
+    // re-scans `corpus/<case_id>` and a bare file name would never resolve
+    // to a case path, leaving the recording uncheckable.
+    let label_path = if resolved.is_file() {
+        resolved.parent().unwrap_or(resolved.as_path())
+    } else {
+        resolved.as_path()
+    };
+    match label_path.file_name().and_then(|name| name.to_str()) {
         Some(name) if !name.is_empty() => name.to_owned(),
-        _ => resolved.display().to_string(),
+        _ => label_path.display().to_string(),
     }
 }
 
@@ -308,7 +317,6 @@ async fn command_normalize_xray(command: &Command) -> anyhow::Result<i32> {
     print_json(&report)?;
     Ok(0)
 }
-
 async fn command_record(command: &Command) -> anyhow::Result<i32> {
     let Command::Record {
         case,
@@ -319,6 +327,7 @@ async fn command_record(command: &Command) -> anyhow::Result<i32> {
         policy,
         xray_cli_version,
         xray_db_date,
+        xray_version,
         commands,
         environment,
         enforcement_min_purl_recall,
@@ -335,6 +344,18 @@ async fn command_record(command: &Command) -> anyhow::Result<i32> {
     let scan_mode = if *offline { "offline" } else { "osv-live" };
     let report = run_pinned_scan(case, *offline, policy.as_ref()).await?;
     let hooray = normalize::normalize_hooray(&report, &case_id, scan_mode)?;
+    // A recording that covers nothing is worse than no recording: reject
+    // cases whose scan produced no observable content so a wrapped or
+    // malformed corpus cannot bake an empty side into the corpus.
+    if hooray.components.is_empty()
+        && hooray.vulnerabilities.is_empty()
+        && hooray.license_findings.is_empty()
+    {
+        bail!(
+            "case {} produced an empty scan; refusing to record nothing",
+            case.display()
+        );
+    }
 
     let audit = read_optional(xray_json, "--xray-json")?;
     let sbom = read_optional(xray_sbom, "--xray-sbom")?;
@@ -359,7 +380,7 @@ async fn command_record(command: &Command) -> anyhow::Result<i32> {
         provenance: Provenance {
             hooray_version: env!("CARGO_PKG_VERSION").to_owned(),
             xray_cli_version: xray_cli_version.clone(),
-            xray_version: None,
+            xray_version: xray_version.clone(),
             xray_db_date: xray_db_date.clone(),
             commands: commands.clone(),
             environment: environment.clone(),
@@ -407,8 +428,16 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
             recordings.display()
         );
     }
-    if format != "table" && format != "json" {
-        bail!("unsupported format '{format}'; expected 'table' or 'json'");
+    for (label, gate) in [
+        ("--min-purl-recall", *min_purl_recall),
+        ("--min-purl-precision", *min_purl_precision),
+        ("--min-cve-jaccard", *min_cve_jaccard),
+    ] {
+        if let Some(value) = gate
+            && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            bail!("{label} must be a finite value in 0.0–1.0, got {value}");
+        }
     }
 
     let mut results: Vec<CaseCheck> = Vec::new();
@@ -420,7 +449,7 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         let text = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("failed to read {}", manifest_path.display()))?;
         Some(
-            serde_json::from_str::<CorpusManifest>(&text)
+            CorpusManifest::parse(&text)
                 .with_context(|| format!("invalid corpus manifest {}", manifest_path.display()))?,
         )
     } else {
@@ -544,9 +573,13 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
             match corpus::scan_input_for_kind(&case.kind, &case_path, &offline_config()) {
                 Ok(input) => match pinned_scan_input(input, &offline_config(), None).await {
                     Ok(report) => {
-                        let fresh =
-                            normalize::normalize_hooray(&report, &recording.case_id, "offline")?;
-                        drift_notes.extend(compare::drift_violations(&fresh, &recording.hooray));
+                        match normalize::normalize_hooray(&report, &recording.case_id, "offline") {
+                            Ok(fresh) => drift_notes
+                                .extend(compare::drift_violations(&fresh, &recording.hooray)),
+                            Err(error) => {
+                                drift_notes.push(format!("drift re-scan failed: {error:#}"))
+                            }
+                        }
                     }
                     Err(error) => drift_notes.push(format!("drift re-scan failed: {error:#}")),
                 },
@@ -560,37 +593,44 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         }
 
         // Scorecard + thresholds (strictest of recording gate vs CLI flag).
+        // Gates evaluate for EVERY recording: a missing `enforcement` key
+        // means "no recording-side gate", not "skip the CLI gates".
         let card = compare::scorecard(&recording.hooray, &recording.xray);
         let mut threshold_notes = Vec::new();
-        if let Some(enforcement) = &recording.enforcement {
-            let checks = [
-                (
-                    compare::effective_threshold(enforcement.min_purl_recall, *min_purl_recall),
-                    card.purl_recall,
-                    "purl recall",
+        let enforcement = recording.enforcement.as_ref();
+        let checks = [
+            (
+                compare::effective_threshold(
+                    enforcement.and_then(|e| e.min_purl_recall),
+                    *min_purl_recall,
                 ),
-                (
-                    compare::effective_threshold(
-                        enforcement.min_purl_precision,
-                        *min_purl_precision,
-                    ),
-                    card.purl_precision,
-                    "purl precision",
+                card.purl_recall,
+                "purl recall",
+            ),
+            (
+                compare::effective_threshold(
+                    enforcement.and_then(|e| e.min_purl_precision),
+                    *min_purl_precision,
                 ),
-                (
-                    compare::effective_threshold(enforcement.min_cve_jaccard, *min_cve_jaccard),
-                    card.cve_jaccard,
-                    "cve jaccard",
+                card.purl_precision,
+                "purl precision",
+            ),
+            (
+                compare::effective_threshold(
+                    enforcement.and_then(|e| e.min_cve_jaccard),
+                    *min_cve_jaccard,
                 ),
-            ];
-            for (threshold, value, label) in checks {
-                if compare::violates(threshold, value) {
-                    threshold_notes.push(format!(
-                        "{label} {:.3} below threshold {:.3}",
-                        value,
-                        threshold.unwrap_or_default()
-                    ));
-                }
+                card.cve_jaccard,
+                "cve jaccard",
+            ),
+        ];
+        for (threshold, value, label) in checks {
+            if compare::violates(threshold, value) {
+                threshold_notes.push(format!(
+                    "{label} {:.3} below threshold {:.3}",
+                    value,
+                    threshold.unwrap_or_default()
+                ));
             }
         }
         compare::apply_recording_check(

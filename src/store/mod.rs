@@ -257,7 +257,7 @@ impl Store {
 #[cfg(unix)]
 fn create_private_database_if_missing(path: &Path) -> Result<(), StoreError> {
     use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     if path == Path::new(":memory:") {
         return Ok(());
@@ -272,7 +272,26 @@ fn create_private_database_if_missing(path: &Path) -> Result<(), StoreError> {
             drop(file);
             Ok(())
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // A pre-existing database (older version, restored backup,
+            // umask'd copy) may carry group/other-readable permissions;
+            // the privacy invariant is enforced on every open, not only
+            // at creation.
+            let metadata =
+                std::fs::metadata(path).map_err(|source| StoreError::DatabaseCreate {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            if metadata.is_file() && metadata.permissions().mode() & 0o077 != 0 {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                    |source| StoreError::DatabaseCreate {
+                        path: path.to_owned(),
+                        source,
+                    },
+                )?;
+            }
+            Ok(())
+        }
         Err(source) => Err(StoreError::DatabaseCreate {
             path: path.to_owned(),
             source,
@@ -288,7 +307,12 @@ fn create_private_database_if_missing(_path: &Path) -> Result<(), StoreError> {
 fn configure_connection(c: &Connection, wal: bool) -> Result<(), rusqlite::Error> {
     c.busy_timeout(BUSY_TIMEOUT)?;
     c.pragma_update(None, "foreign_keys", "ON")?;
-    c.pragma_update(None, "synchronous", "NORMAL")?;
+    // FULL (not NORMAL): under WAL, NORMAL only checkpoints on sync and can
+    // lose the last committed transaction(s) on power loss. This store holds
+    // the audit trail (`audit_events`, `retention_events`), whose entire
+    // purpose is a durable record, so every commit must reach stable storage.
+    // Under WAL the extra cost of FULL is one WAL fsync per commit.
+    c.pragma_update(None, "synchronous", "FULL")?;
     if wal {
         c.pragma_update(None, "journal_mode", "WAL")?;
     }
@@ -302,28 +326,47 @@ fn table_exists(t: &Transaction<'_>, name: &str) -> Result<bool, rusqlite::Error
     )
 }
 fn migrate_legacy_v1(t: &Transaction<'_>) -> Result<(), StoreError> {
-    let mut s = t.prepare("SELECT report_json FROM scan_runs ORDER BY started_at,run_id")?;
-    let rows = s.query_map([], |r| r.get::<_, String>(0))?;
-    let mut reports = Vec::new();
-    for row in rows {
-        let report = serde_json::from_str::<ScanReport>(&row?)?;
-        ensure_supported_report_schema(&report)?;
-        reports.push(report);
-    }
-    drop(s);
-    t.execute_batch("DROP TABLE scan_findings; DROP TABLE scan_runs;")?;
+    // Page by rowid so peak memory is one report, not the whole legacy
+    // store: a multi-GB database must not multiply allocations.
+    t.execute_batch("ALTER TABLE scan_runs RENAME TO legacy_scan_runs;")?;
+    t.execute_batch("DROP TABLE scan_findings;")?;
     t.execute_batch(CORE_SCHEMA)?;
-    for report in reports {
-        reject_unredacted_secrets(&report.findings)?;
-        report.validate()?;
-        let sanitized = crate::report::sanitize_report(&report)
-            .map_err(|error| StoreError::Sanitization(error.to_string()))?;
-        let report = &*sanitized;
-        let json = serde_json::to_string(report)?;
-        let count =
-            i64::try_from(report.findings.len()).map_err(|_| StoreError::FindingCountOverflow)?;
-        insert_report(t, report, &json, count)?;
+    const PAGE: i64 = 64;
+    let mut last_rowid = 0_i64;
+    loop {
+        let mut s = t.prepare(
+            "SELECT rowid, report_json FROM legacy_scan_runs WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+        )?;
+        let rows = s.query_map([last_rowid, PAGE], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut page = Vec::new();
+        for row in rows {
+            page.push(row?);
+        }
+        drop(s);
+        if page.is_empty() {
+            break;
+        }
+        for (rowid, json) in &page {
+            last_rowid = *rowid;
+            let report = serde_json::from_str::<ScanReport>(json)?;
+            ensure_supported_report_schema(&report)?;
+            reject_unredacted_secrets(&report.findings)?;
+            report.validate()?;
+            let sanitized = crate::report::sanitize_report(&report)
+                .map_err(|error| StoreError::Sanitization(error.to_string()))?;
+            let report = &*sanitized;
+            let json = serde_json::to_string(report)?;
+            let count = i64::try_from(report.findings.len())
+                .map_err(|_| StoreError::FindingCountOverflow)?;
+            insert_report(t, report, &json, count)?;
+        }
+        if page.len() < PAGE as usize {
+            break;
+        }
     }
+    t.execute_batch("DROP TABLE legacy_scan_runs;")?;
     t.execute("INSERT INTO schema_migrations(version,name,applied_at) VALUES (1,'core','1970-01-01T00:00:00Z')",[])?;
     Ok(())
 }
@@ -491,7 +534,7 @@ pub(crate) mod fixtures {
             advisory_digest: Some("advisories".into()),
             policy_digest: Some("policy".into()),
             finding_ids: vec!["finding:1".into()],
-            updated_at: "2026-01-01Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
         }
     }
 
@@ -502,7 +545,7 @@ pub(crate) mod fixtures {
             dedupe_key: format!("dedupe:{id}"),
             kind: "changed".into(),
             payload: serde_json::json!({"event": id}),
-            created_at: "2026-01-01Z".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
             attempts: 0,
             next_attempt_at: due.map(str::to_owned),
             delivered_at: None,
@@ -540,7 +583,7 @@ mod tests {
     fn migrates_v1_fixture_transactionally() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("db");
-        let r = report("legacy", "2026-01-01Z", &["f1"]);
+        let r = report("legacy", "2026-01-01T00:00:00Z", &["f1"]);
         {
             let c = Connection::open(&path).unwrap();
             c.execute_batch("CREATE TABLE scan_runs(run_id TEXT PRIMARY KEY NOT NULL,schema_version TEXT NOT NULL,started_at TEXT NOT NULL,completed_at TEXT,finding_count INTEGER NOT NULL,report_json TEXT NOT NULL) STRICT; CREATE TABLE scan_findings(run_id TEXT NOT NULL,finding_id TEXT NOT NULL,kind TEXT NOT NULL,severity TEXT NOT NULL,rule_id TEXT NOT NULL,component_id TEXT,location_id TEXT,PRIMARY KEY(run_id,finding_id),FOREIGN KEY(run_id) REFERENCES scan_runs(run_id) ON DELETE CASCADE) STRICT, WITHOUT ROWID;").unwrap();
@@ -565,7 +608,7 @@ mod tests {
     fn fails_closed_before_drop_on_foreign_legacy_report_schema() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("db");
-        let r = report("legacy", "2026-01-01Z", &["f1"]);
+        let r = report("legacy", "2026-01-01T00:00:00Z", &["f1"]);
         {
             let c = Connection::open(&path).unwrap();
             c.execute_batch("CREATE TABLE scan_runs(run_id TEXT PRIMARY KEY NOT NULL,schema_version TEXT NOT NULL,started_at TEXT NOT NULL,completed_at TEXT,finding_count INTEGER NOT NULL,report_json TEXT NOT NULL) STRICT; CREATE TABLE scan_findings(run_id TEXT NOT NULL,finding_id TEXT NOT NULL,kind TEXT NOT NULL,severity TEXT NOT NULL,rule_id TEXT NOT NULL,component_id TEXT,location_id TEXT,PRIMARY KEY(run_id,finding_id),FOREIGN KEY(run_id) REFERENCES scan_runs(run_id) ON DELETE CASCADE) STRICT, WITHOUT ROWID;").unwrap();
@@ -655,6 +698,22 @@ mod tests {
                 .unwrap(),
             "ok"
         );
+    }
+    #[test]
+    fn connections_require_full_synchronous_for_commit_durability() {
+        // synchronous=FULL (2) is the durability contract: NORMAL (1) under
+        // WAL can drop the last committed audit/retention rows on power loss.
+        let dir = tempdir().unwrap();
+        let file_store = Store::open(dir.path().join("db")).unwrap();
+        for store in [file_store, Store::open_memory().unwrap()] {
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+        }
     }
     #[test]
     fn pagination_rejects_zero_oversize_and_unrepresentable_offsets() {

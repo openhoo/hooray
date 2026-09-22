@@ -114,6 +114,48 @@ impl Recording {
                 found: self.xray.case_id.clone(),
             });
         }
+        // The case id joins onto the corpus root during `check`; anything
+        // but a plain directory name could escape the corpus or collide
+        // with another case's key.
+        if !crate::parity::corpus::is_valid_case_id(&self.case_id) {
+            return Err(ParityError::InvalidInput(format!(
+                "invalid case_id {:?}: expected a plain directory name",
+                self.case_id
+            )));
+        }
+        // Generator identity is part of the contract: a recording whose
+        // sides name foreign tools (or swapped sides) must not pass as a
+        // hooray-vs-xray comparison.
+        if self.hooray.generator.name != "hooray" {
+            return Err(ParityError::InvalidInput(format!(
+                "hooray side generator is '{}', expected 'hooray'",
+                self.hooray.generator.name
+            )));
+        }
+        if self.xray.generator.name != "xray" {
+            return Err(ParityError::InvalidInput(format!(
+                "xray side generator is '{}', expected 'xray'",
+                self.xray.generator.name
+            )));
+        }
+        // Gate thresholds must be finite and inside the documented
+        // 0.0–1.0 range; NaN or unbounded values would silently disable
+        // the gate (every comparison against NaN is false).
+        if let Some(enforcement) = &self.enforcement {
+            for (label, value) in [
+                ("min_purl_recall", enforcement.min_purl_recall),
+                ("min_purl_precision", enforcement.min_purl_precision),
+                ("min_cve_jaccard", enforcement.min_cve_jaccard),
+            ] {
+                if let Some(value) = value
+                    && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+                {
+                    return Err(ParityError::InvalidInput(format!(
+                        "enforcement {label} must be a finite value in 0.0–1.0, got {value}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -258,5 +300,34 @@ mod tests {
         let error = tampered.validate().unwrap_err();
         assert!(matches!(error, ParityError::CaseMismatch { .. }));
         assert!(error.to_string().contains("other-case"));
+    }
+
+    #[test]
+    fn rejects_foreign_generator_names() {
+        let mut tampered = fixture();
+        tampered.hooray.generator.name = "other-tool".to_owned();
+        let error = tampered.validate().unwrap_err();
+        assert!(error.to_string().contains("expected 'hooray'"));
+
+        let mut tampered = fixture();
+        tampered.xray.generator.name = "hooray".to_owned();
+        let error = tampered.validate().unwrap_err();
+        assert!(error.to_string().contains("expected 'xray'"));
+    }
+
+    #[test]
+    fn rejects_non_finite_and_out_of_range_gates() {
+        for bad in [f64::NAN, f64::INFINITY, -0.1, 1.5] {
+            let mut tampered = fixture();
+            tampered.enforcement = Some(Enforcement {
+                min_purl_recall: Some(bad),
+                min_purl_precision: None,
+                min_cve_jaccard: None,
+            });
+            assert!(
+                tampered.validate().is_err(),
+                "gate value {bad} must be rejected"
+            );
+        }
     }
 }

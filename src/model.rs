@@ -225,6 +225,9 @@ impl DependencyPath {
 pub struct DependencyPaths {
     #[serde(default)]
     pub paths: Vec<DependencyPath>,
+    /// Reports serialized before this field existed carry no value; default
+    /// keeps them deserializable like the sibling `paths` field.
+    #[serde(default)]
     pub truncated: bool,
 }
 
@@ -255,6 +258,14 @@ impl Inventory {
             require_text("component.name", &component.name)?;
             require_text("component.version", &component.version)?;
             require_text("component.purl", &component.purl)?;
+            // `component.purl` feeds CycloneDX/SPDX purl fields and OSV
+            // queries, so it must be a real package URL, not a free-form
+            // `name@version` placeholder.
+            if crate::util::parse_purl_body(&component.purl).is_none() {
+                return Err(ModelInvariantError::InvalidComponentPurl(
+                    component.identity.clone(),
+                ));
+            }
 
             for source in &component.provenance {
                 require_text("source.locator", &source.locator)?;
@@ -343,6 +354,10 @@ pub enum ModelInvariantError {
     UnredactedSecretEvidence(FindingId),
     #[error("secret finding {0} contains a forbidden evidence property '{1}'")]
     RawSecretProperty(FindingId, String),
+    #[error("component {0} carries a malformed package URL")]
+    InvalidComponentPurl(ComponentId),
+    #[error("run.started_at must be an RFC 3339 timestamp")]
+    InvalidRunTimestamp,
     #[error("policy {0} references an unknown finding")]
     PolicyUnknownFinding(PolicyId),
     #[error("policy summary does not match policy decisions")]
@@ -793,6 +808,13 @@ impl ScanReport {
     pub fn validate(&self) -> Result<(), ModelInvariantError> {
         require_text("schema_version", &self.schema_version)?;
         require_text("run.started_at", &self.run.started_at)?;
+        // `started_at` is compared as text for history ordering, retention,
+        // and typed output fields (CycloneDX metadata.timestamp, SPDX
+        // creationInfo.created, JUnit timestamp), so it must be a real
+        // RFC 3339 timestamp rather than any non-empty string.
+        if chrono::DateTime::parse_from_rfc3339(&self.run.started_at).is_err() {
+            return Err(ModelInvariantError::InvalidRunTimestamp);
+        }
         self.inventory.validate()?;
         let location_ids = self.inventory.location_ids();
 
@@ -868,13 +890,14 @@ impl ScanReport {
     }
 }
 
+/// Flags evidence property keys that plausibly carry raw secret material.
+/// Matching is whole-key or whole-segment: the key is split on `_`
+/// separators, each segment is normalized to lowercase ASCII alphanumerics,
+/// and the key is sensitive only when every segment is a sensitive word.
+/// Substring matching is deliberately avoided so metadata keys like
+/// `match_offset` or `line_content` cannot reject a valid report.
 fn is_secret_property(key: &str) -> bool {
-    let normalized: String = key
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    [
+    const SENSITIVE_WORDS: [&str; 8] = [
         "secret",
         "raw",
         "value",
@@ -883,9 +906,29 @@ fn is_secret_property(key: &str) -> bool {
         "token",
         "password",
         "credential",
-    ]
-    .iter()
-    .any(|sensitive| normalized.contains(sensitive))
+    ];
+    let normalized: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if SENSITIVE_WORDS.contains(&normalized.as_str()) {
+        return true;
+    }
+    let mut count = 0_usize;
+    let all_sensitive = key
+        .split('_')
+        .map(|segment| {
+            segment
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|segment| !segment.is_empty())
+        .inspect(|_| count += 1)
+        .all(|segment| SENSITIVE_WORDS.contains(&segment.as_str()));
+    count > 1 && all_sensitive
 }
 
 #[cfg(test)]

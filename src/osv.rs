@@ -25,6 +25,11 @@ const MAX_BATCH_SIZE: usize = 1_000;
 /// A conformant endpoint stops returning `next_page_token`; a mirror echoing
 /// a stable token must not loop `scan` forever.
 const MAX_PAGES_PER_PURL: usize = 100;
+/// Upper bound on distinct vulnerability ids whose detail documents are
+/// fetched and retained per scan. `MAX_PAGES_PER_PURL` bounds page count but
+/// not ids per page, so a hostile or compromised mirror could otherwise
+/// force unbounded `GET /v1/vulns/{id}` requests and unbounded memory.
+const MAX_VULN_DETAILS: usize = 10_000;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound for buffering a single OSV response body, matching the 100 MiB
@@ -230,6 +235,20 @@ impl OsvClient {
             .values()
             .flat_map(|ids| ids.iter().cloned())
             .collect();
+        // Page count is bounded per purl, but ids per page are not: a mirror
+        // could return millions of distinct ids and force an unbounded number
+        // of detail fetches plus a full `Vulnerability` retained per id.
+        if unique_ids.len() > MAX_VULN_DETAILS {
+            return Err(OsvError::TooLarge {
+                endpoint: format!(
+                    "{}v1/vulns ({} distinct ids)",
+                    self.base_url,
+                    unique_ids.len()
+                ),
+                actual: unique_ids.len(),
+                maximum: MAX_VULN_DETAILS,
+            });
+        }
         let details = stream::iter(unique_ids.into_iter().map(|id| async move {
             let detail = self.fetch_vulnerability(&id).await?;
             Ok::<_, OsvError>((id, detail))
@@ -407,6 +426,10 @@ struct Vulnerability {
     summary: Option<String>,
     details: Option<String>,
     modified: Option<String>,
+    /// Timestamp marking an advisory the database pulled back (rejected
+    /// CVEs, withdrawn GHSAs). Withdrawn advisories must not surface as open
+    /// findings.
+    withdrawn: Option<String>,
     #[serde(default)]
     severity: Vec<OsvSeverity>,
     #[serde(default)]
@@ -429,6 +452,10 @@ struct Affected {
     package: Option<AffectedPackage>,
     #[serde(default)]
     ranges: Vec<AffectedRange>,
+    /// Explicitly enumerated affected versions; advisories may list these
+    /// instead of (or alongside) `ranges`.
+    #[serde(default)]
+    versions: Vec<String>,
     #[serde(default)]
     database_specific: Value,
     #[serde(default)]
@@ -439,6 +466,11 @@ struct Affected {
 
 #[derive(Debug, Deserialize)]
 struct AffectedPackage {
+    /// Package name in the advisory's own ecosystem naming (e.g. a PyPI
+    /// distribution name). Compared against the component when `purl` is
+    /// absent so sibling packages in a multi-package advisory do not
+    /// cross-apply their ranges and severities.
+    name: Option<String>,
     purl: Option<String>,
     ecosystem: Option<String>,
 }
@@ -482,6 +514,22 @@ fn map_findings(
             let Some(vulnerability) = details.get(advisory_id) else {
                 continue;
             };
+            // A `withdrawn` timestamp marks an advisory the database pulled
+            // back (rejected CVEs, withdrawn GHSAs); it must not surface as
+            // an open finding.
+            if vulnerability
+                .withdrawn
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                continue;
+            }
+            // `RuleId::new` only rejects an empty-after-trim rule id, so an
+            // empty or whitespace-only advisory id would silently produce
+            // `osv:` findings; validate the id itself first.
+            if vulnerability.id.trim().is_empty() {
+                return Err(OsvError::InvalidVulnerabilityId);
+            }
             let references: BTreeSet<String> = vulnerability
                 .references
                 .iter()
@@ -523,7 +571,7 @@ fn vulnerability_finding(
         Some(&component.identity),
         None,
     );
-    let affected_ranges = affected_ranges(vulnerability, &component.purl);
+    let affected_ranges = affected_ranges(vulnerability, component);
     let fixed_versions = fixed_versions(&affected_ranges);
     let remediation = (!fixed_versions.is_empty() || !references.is_empty()).then(|| Remediation {
         description: if fixed_versions.is_empty() {
@@ -562,7 +610,7 @@ fn vulnerability_finding(
         aliases: vulnerability.aliases.iter().cloned().collect(),
         summary: vulnerability.summary.clone(),
         details: vulnerability.details.clone(),
-        severity: vulnerability_severity(vulnerability, &component.purl),
+        severity: vulnerability_severity(vulnerability, component),
         confidence: Confidence::High,
         evidence: BTreeSet::from([evidence.clone()]),
         applicability: Some(ApplicabilityAnalyzer::analyze(ApplicabilityInput {
@@ -580,19 +628,18 @@ fn vulnerability_finding(
     }
 }
 
-fn affected_ranges(vulnerability: &Vulnerability, purl: &str) -> Vec<OsvAffectedRange> {
+fn affected_ranges(vulnerability: &Vulnerability, component: &Component) -> Vec<OsvAffectedRange> {
     vulnerability
         .affected
         .iter()
-        .filter(|affected| {
-            affected
-                .package
-                .as_ref()
-                .and_then(|package| package.purl.as_deref())
-                .is_none_or(|affected_purl| same_package(affected_purl, purl))
-        })
+        .filter(|affected| affected_package_matches(affected.package.as_ref(), component))
         .flat_map(|affected| {
             let ecosystem = affected.package.as_ref().and_then(affected_ecosystem);
+            let versions: Vec<String> = affected
+                .versions
+                .iter()
+                .filter_map(|version| clean_version(Some(version)))
+                .collect();
             affected.ranges.iter().filter_map(move |range| {
                 let range_type = match range
                     .kind
@@ -608,6 +655,7 @@ fn affected_ranges(vulnerability: &Vulnerability, purl: &str) -> Vec<OsvAffected
                 Some(OsvAffectedRange {
                     range_type,
                     ecosystem: ecosystem.clone(),
+                    versions: versions.clone(),
                     events: range
                         .events
                         .iter()
@@ -624,6 +672,85 @@ fn affected_ranges(vulnerability: &Vulnerability, purl: &str) -> Vec<OsvAffected
         .collect()
 }
 
+/// Decides whether an OSV `affected[].package` descriptor names the queried
+/// component. A `purl` matches on package identity (type + decoded
+/// namespace/name + qualifiers, version stripped). Without a purl, `name`
+/// must equal the component's package name and `ecosystem` (when present)
+/// must map to the component's purl type; an entry carrying neither name
+/// nor purl cannot be attributed to a package and is skipped instead of
+/// wildcarding onto every component.
+fn affected_package_matches(package: Option<&AffectedPackage>, component: &Component) -> bool {
+    let Some(package) = package else {
+        // No package descriptor at all: the entry cannot be attributed to a
+        // package, so it applies to the queried component (OSV entries may
+        // legally omit `package` when the advisory is unscoped).
+        return true;
+    };
+    if let Some(purl) = package.purl.as_deref() {
+        return same_package(purl, &component.purl);
+    }
+    let ecosystem_matches = |package: &AffectedPackage| {
+        package.ecosystem.as_deref().is_none_or(|ecosystem| {
+            purl_type_matches(&normalize_osv_ecosystem(ecosystem), component)
+        })
+    };
+    match package
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => ecosystem_matches(package) && package_name_matches(name, component),
+        // Ecosystem-only entries (no name, no purl) apply ecosystem-wide;
+        // ecosystems that do not map to a purl type can never match.
+        None => package.ecosystem.is_some() && ecosystem_matches(package),
+    }
+}
+
+/// Compares a normalized OSV ecosystem name against the component's purl
+/// type.
+fn purl_type_matches(normalized_ecosystem: &str, component: &Component) -> bool {
+    component
+        .purl
+        .strip_prefix("pkg:")
+        .and_then(|body| body.split('/').next())
+        .is_some_and(|kind| kind.eq_ignore_ascii_case(normalized_ecosystem))
+}
+
+/// Compares an advisory's `package.name` against the component: the declared
+/// name first, then the percent-decoded name carried by the purl (namespace
+/// joined per ecosystem convention) so lockfile names that differ from purl
+/// naming still match.
+fn package_name_matches(name: &str, component: &Component) -> bool {
+    if name.eq_ignore_ascii_case(component.name.trim()) {
+        return true;
+    }
+    purl_package_name(&component.purl)
+        .is_some_and(|purl_name| name.eq_ignore_ascii_case(&purl_name))
+}
+
+/// Decodes the package name a purl carries, joining namespace and name the
+/// way the ecosystem's OSV naming does (`:` for Maven, `/` elsewhere).
+fn purl_package_name(purl: &str) -> Option<String> {
+    let body = purl.strip_prefix("pkg:")?;
+    let body = body.split(['?', '#']).next().unwrap_or(body);
+    let (kind, path) = body.split_once('/')?;
+    if path.is_empty() || path.split('/').any(str::is_empty) {
+        return None;
+    }
+    let final_segment = path.rsplit('/').next().unwrap_or(path);
+    let name_len = final_segment
+        .rsplit_once('@')
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+        .map_or(final_segment.len(), |(name, _)| name.len());
+    let path = &path[..path.len() - final_segment.len() + name_len];
+    let decoded = crate::util::percent_decode_strict(path)?;
+    Some(match kind.to_ascii_lowercase().as_str() {
+        "maven" => decoded.replacen('/', ":", 1),
+        _ => decoded,
+    })
+}
+
 fn affected_ecosystem(package: &AffectedPackage) -> Option<String> {
     package
         .purl
@@ -633,26 +760,37 @@ fn affected_ecosystem(package: &AffectedPackage) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .or_else(|| {
-            package.ecosystem.as_deref().and_then(|ecosystem| {
-                let normalized = match ecosystem.to_ascii_lowercase().as_str() {
-                    "crates.io" => "cargo",
-                    "pypi" => "pypi",
-                    "npm" => "npm",
-                    "go" => "golang",
-                    "maven" => "maven",
-                    "nuget" => "nuget",
-                    "hex" => "hex",
-                    "hackage" => "hackage",
-                    _ => return None,
-                };
-                Some(normalized.to_owned())
-            })
+            package
+                .ecosystem
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(normalize_osv_ecosystem)
         })
+}
+
+/// Maps an OSV ecosystem name to the purl type hooray emits for it. Names
+/// without a purl equivalent keep their lowercased OSV spelling, which can
+/// never equal a purl type — an advisory scoped to an ecosystem hooray does
+/// not emit (Debian, OSS-Fuzz, …) must not wildcard onto every component.
+fn normalize_osv_ecosystem(ecosystem: &str) -> String {
+    let lowered = ecosystem.trim().to_ascii_lowercase();
+    match lowered.as_str() {
+        "crates.io" => "cargo".to_owned(),
+        "go" => "golang".to_owned(),
+        "packagist" => "composer".to_owned(),
+        "rubygems" => "gem".to_owned(),
+        "debian" => "deb".to_owned(),
+        _ => lowered,
+    }
 }
 
 fn fixed_versions(ranges: &[OsvAffectedRange]) -> BTreeSet<String> {
     ranges
         .iter()
+        // GIT-range `fixed` events are commit SHAs, not versions; rendering
+        // them as upgrade advice would mislead remediation.
+        .filter(|range| range.range_type != OsvRangeType::Git)
         .flat_map(|range| range.events.iter())
         .filter_map(|event| event.fixed.clone())
         .collect()
@@ -665,18 +803,46 @@ fn clean_version(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// `left` is the advisory's affected purl, `right` the component's. The
+/// base identity (type + decoded namespace/name, version stripped) must
+/// match; when the advisory purl carries qualifiers (`?distro=`, `?arch=`)
+/// they must equal the component's exactly — an unqualified advisory entry
+/// applies regardless of the component's qualifiers, while a qualified one
+/// stays scoped to its distro/arch so per-distro ranges never merge.
 fn same_package(left: &str, right: &str) -> bool {
-    package_identity(left) == package_identity(right)
+    let (left_base, left_qualifiers) = package_identity(left);
+    let (right_base, right_qualifiers) = package_identity(right);
+    left_base == right_base && (left_qualifiers.is_empty() || left_qualifiers == right_qualifiers)
 }
 
-fn package_identity(purl: &str) -> &str {
-    let package = purl.split(['?', '#']).next().unwrap_or(purl);
-    package
+/// Splits a purl into its base identity (percent-decoded
+/// namespace/name with the version stripped — the last `@` of the final
+/// segment, matching `util::parse_purl_body`, so unencoded npm scopes like
+/// `pkg:npm/@scope/name` keep their scope instead of collapsing to
+/// `pkg:npm/`) and its sorted qualifier list.
+fn package_identity(purl: &str) -> (String, Vec<String>) {
+    let body = purl.strip_prefix("pkg:").unwrap_or(purl);
+    let (path, qualifiers) = match body.split_once(['?', '#']) {
+        Some((path, qualifiers)) => (path, qualifiers),
+        None => (body, ""),
+    };
+    let final_segment = path.rsplit('/').next().unwrap_or(path);
+    let name_len = final_segment
         .rsplit_once('@')
-        .map_or(package, |(identity, _)| identity)
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+        .map_or(final_segment.len(), |(name, _)| name.len());
+    let path = &path[..path.len() - final_segment.len() + name_len];
+    let base = crate::util::percent_decode_strict(path).unwrap_or_else(|| path.to_owned());
+    let mut qualifiers: Vec<String> = qualifiers
+        .split('&')
+        .filter(|qualifier| !qualifier.is_empty())
+        .map(str::to_owned)
+        .collect();
+    qualifiers.sort_unstable();
+    (base, qualifiers)
 }
 
-fn vulnerability_severity(vulnerability: &Vulnerability, purl: &str) -> Severity {
+fn vulnerability_severity(vulnerability: &Vulnerability, component: &Component) -> Severity {
     // Per-package severity sources (affected[].severity plus the affected[]
     // database_specific/ecosystem_specific labels) must be scoped to the
     // queried purl exactly like `affected_ranges`; a multi-package advisory
@@ -684,13 +850,7 @@ fn vulnerability_severity(vulnerability: &Vulnerability, purl: &str) -> Severity
     let matching_affected: Vec<&Affected> = vulnerability
         .affected
         .iter()
-        .filter(|affected| {
-            affected
-                .package
-                .as_ref()
-                .and_then(|package| package.purl.as_deref())
-                .is_none_or(|affected_purl| same_package(affected_purl, purl))
-        })
+        .filter(|affected| affected_package_matches(affected.package.as_ref(), component))
         .collect();
     vulnerability
         .severity
@@ -779,6 +939,8 @@ fn cvss_score(vector: &str) -> Option<f64> {
         cvss_v3_score(vector)
     } else if vector.starts_with("CVSS:2.0/") || vector.starts_with("AV:") {
         cvss_v2_score(vector)
+    } else if vector.starts_with("CVSS:4.0/") {
+        cvss_v4_score(vector)
     } else {
         None
     }
@@ -865,6 +1027,655 @@ fn round_up_tenth(value: f64) -> f64 {
 
 fn round_nearest_tenth(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
+}
+
+/// CVSS v4.0 scoring, ported from the FIRST.org reference calculator
+/// (RedHatProductSecurity/cvss-v4-calculator, BSD-2-Clause): the vector is
+/// reduced to a six-digit MacroVector (EQ1–EQ6), the MacroVector's score is
+/// looked up, then interpolated downward by the vector's severity distance
+/// from the MacroVector's highest-severity members.
+mod cvss_v4 {
+    use std::collections::BTreeMap;
+
+    /// MacroVector score table (spec Table 23), sorted for binary search.
+    static LOOKUP: &[(&str, f64)] = &[
+        ("000000", 10.0),
+        ("000001", 9.9),
+        ("000010", 9.8),
+        ("000011", 9.5),
+        ("000020", 9.5),
+        ("000021", 9.2),
+        ("000100", 10.0),
+        ("000101", 9.6),
+        ("000110", 9.3),
+        ("000111", 8.7),
+        ("000120", 9.1),
+        ("000121", 8.1),
+        ("000200", 9.3),
+        ("000201", 9.0),
+        ("000210", 8.9),
+        ("000211", 8.0),
+        ("000220", 8.1),
+        ("000221", 6.8),
+        ("001000", 9.8),
+        ("001001", 9.5),
+        ("001010", 9.5),
+        ("001011", 9.2),
+        ("001020", 9.0),
+        ("001021", 8.4),
+        ("001100", 9.3),
+        ("001101", 9.2),
+        ("001110", 8.9),
+        ("001111", 8.1),
+        ("001120", 8.1),
+        ("001121", 6.5),
+        ("001200", 8.8),
+        ("001201", 8.0),
+        ("001210", 7.8),
+        ("001211", 7.0),
+        ("001220", 6.9),
+        ("001221", 4.8),
+        ("002001", 9.2),
+        ("002011", 8.2),
+        ("002021", 7.2),
+        ("002101", 7.9),
+        ("002111", 6.9),
+        ("002121", 5.0),
+        ("002201", 6.9),
+        ("002211", 5.5),
+        ("002221", 2.7),
+        ("010000", 9.9),
+        ("010001", 9.7),
+        ("010010", 9.5),
+        ("010011", 9.2),
+        ("010020", 9.2),
+        ("010021", 8.5),
+        ("010100", 9.5),
+        ("010101", 9.1),
+        ("010110", 9.0),
+        ("010111", 8.3),
+        ("010120", 8.4),
+        ("010121", 7.1),
+        ("010200", 9.2),
+        ("010201", 8.1),
+        ("010210", 8.2),
+        ("010211", 7.1),
+        ("010220", 7.2),
+        ("010221", 5.3),
+        ("011000", 9.5),
+        ("011001", 9.3),
+        ("011010", 9.2),
+        ("011011", 8.5),
+        ("011020", 8.5),
+        ("011021", 7.3),
+        ("011100", 9.2),
+        ("011101", 8.2),
+        ("011110", 8.0),
+        ("011111", 7.2),
+        ("011120", 7.0),
+        ("011121", 5.9),
+        ("011200", 8.4),
+        ("011201", 7.0),
+        ("011210", 7.1),
+        ("011211", 5.2),
+        ("011220", 5.0),
+        ("011221", 3.0),
+        ("012001", 8.6),
+        ("012011", 7.5),
+        ("012021", 5.2),
+        ("012101", 7.1),
+        ("012111", 5.2),
+        ("012121", 2.9),
+        ("012201", 6.3),
+        ("012211", 2.9),
+        ("012221", 1.7),
+        ("100000", 9.8),
+        ("100001", 9.5),
+        ("100010", 9.4),
+        ("100011", 8.7),
+        ("100020", 9.1),
+        ("100021", 8.1),
+        ("100100", 9.4),
+        ("100101", 8.9),
+        ("100110", 8.6),
+        ("100111", 7.4),
+        ("100120", 7.7),
+        ("100121", 6.4),
+        ("100200", 8.7),
+        ("100201", 7.5),
+        ("100210", 7.4),
+        ("100211", 6.3),
+        ("100220", 6.3),
+        ("100221", 4.9),
+        ("101000", 9.4),
+        ("101001", 8.9),
+        ("101010", 8.8),
+        ("101011", 7.7),
+        ("101020", 7.6),
+        ("101021", 6.7),
+        ("101100", 8.6),
+        ("101101", 7.6),
+        ("101110", 7.4),
+        ("101111", 5.8),
+        ("101120", 5.9),
+        ("101121", 5.0),
+        ("101200", 7.2),
+        ("101201", 5.7),
+        ("101210", 5.7),
+        ("101211", 5.2),
+        ("101220", 5.2),
+        ("101221", 2.5),
+        ("102001", 8.3),
+        ("102011", 7.0),
+        ("102021", 5.4),
+        ("102101", 6.5),
+        ("102111", 5.8),
+        ("102121", 2.6),
+        ("102201", 5.3),
+        ("102211", 2.1),
+        ("102221", 1.3),
+        ("110000", 9.5),
+        ("110001", 9.0),
+        ("110010", 8.8),
+        ("110011", 7.6),
+        ("110020", 7.6),
+        ("110021", 7.0),
+        ("110100", 9.0),
+        ("110101", 7.7),
+        ("110110", 7.5),
+        ("110111", 6.2),
+        ("110120", 6.1),
+        ("110121", 5.3),
+        ("110200", 7.7),
+        ("110201", 6.6),
+        ("110210", 6.8),
+        ("110211", 5.9),
+        ("110220", 5.2),
+        ("110221", 3.0),
+        ("111000", 8.9),
+        ("111001", 7.8),
+        ("111010", 7.6),
+        ("111011", 6.7),
+        ("111020", 6.2),
+        ("111021", 5.8),
+        ("111100", 7.4),
+        ("111101", 5.9),
+        ("111110", 5.7),
+        ("111111", 5.7),
+        ("111120", 4.7),
+        ("111121", 2.3),
+        ("111200", 6.1),
+        ("111201", 5.2),
+        ("111210", 5.7),
+        ("111211", 2.9),
+        ("111220", 2.4),
+        ("111221", 1.6),
+        ("112001", 7.1),
+        ("112011", 5.9),
+        ("112021", 3.0),
+        ("112101", 5.8),
+        ("112111", 2.6),
+        ("112121", 1.5),
+        ("112201", 2.3),
+        ("112211", 1.3),
+        ("112221", 0.6),
+        ("200000", 9.3),
+        ("200001", 8.7),
+        ("200010", 8.6),
+        ("200011", 7.2),
+        ("200020", 7.5),
+        ("200021", 5.8),
+        ("200100", 8.6),
+        ("200101", 7.4),
+        ("200110", 7.4),
+        ("200111", 6.1),
+        ("200120", 5.6),
+        ("200121", 3.4),
+        ("200200", 7.0),
+        ("200201", 5.4),
+        ("200210", 5.2),
+        ("200211", 4.0),
+        ("200220", 4.0),
+        ("200221", 2.2),
+        ("201000", 8.5),
+        ("201001", 7.5),
+        ("201010", 7.4),
+        ("201011", 5.5),
+        ("201020", 6.2),
+        ("201021", 5.1),
+        ("201100", 7.2),
+        ("201101", 5.7),
+        ("201110", 5.5),
+        ("201111", 4.1),
+        ("201120", 4.6),
+        ("201121", 1.9),
+        ("201200", 5.3),
+        ("201201", 3.6),
+        ("201210", 3.4),
+        ("201211", 1.9),
+        ("201220", 1.9),
+        ("201221", 0.8),
+        ("202001", 6.4),
+        ("202011", 5.1),
+        ("202021", 2.0),
+        ("202101", 4.7),
+        ("202111", 2.1),
+        ("202121", 1.1),
+        ("202201", 2.4),
+        ("202211", 0.9),
+        ("202221", 0.4),
+        ("210000", 8.8),
+        ("210001", 7.5),
+        ("210010", 7.3),
+        ("210011", 5.3),
+        ("210020", 6.0),
+        ("210021", 5.0),
+        ("210100", 7.3),
+        ("210101", 5.5),
+        ("210110", 5.9),
+        ("210111", 4.0),
+        ("210120", 4.1),
+        ("210121", 2.0),
+        ("210200", 5.4),
+        ("210201", 4.3),
+        ("210210", 4.5),
+        ("210211", 2.2),
+        ("210220", 2.0),
+        ("210221", 1.1),
+        ("211000", 7.5),
+        ("211001", 5.5),
+        ("211010", 5.8),
+        ("211011", 4.5),
+        ("211020", 4.0),
+        ("211021", 2.1),
+        ("211100", 6.1),
+        ("211101", 5.1),
+        ("211110", 4.8),
+        ("211111", 1.8),
+        ("211120", 2.0),
+        ("211121", 0.9),
+        ("211200", 4.6),
+        ("211201", 1.8),
+        ("211210", 1.7),
+        ("211211", 0.7),
+        ("211220", 0.8),
+        ("211221", 0.2),
+        ("212001", 5.3),
+        ("212011", 2.4),
+        ("212021", 1.4),
+        ("212101", 2.4),
+        ("212111", 1.2),
+        ("212121", 0.5),
+        ("212201", 1.0),
+        ("212211", 0.3),
+        ("212221", 0.1),
+    ];
+
+    /// Severity level index per metric value (spec interpolation weights).
+    fn metric_level(metric: &str, value: &str) -> Option<f64> {
+        Some(match (metric, value) {
+            ("AV", "N") => 0.0,
+            ("AV", "A") => 0.1,
+            ("AV", "L") => 0.2,
+            ("AV", "P") => 0.3,
+            ("PR", "N") => 0.0,
+            ("PR", "L") => 0.1,
+            ("PR", "H") => 0.2,
+            ("UI", "N") => 0.0,
+            ("UI", "P") => 0.1,
+            ("UI", "A") => 0.2,
+            ("AC", "L") => 0.0,
+            ("AC", "H") => 0.1,
+            ("AT", "N") => 0.0,
+            ("AT", "P") => 0.1,
+            ("VC", "H") | ("VI", "H") | ("VA", "H") => 0.0,
+            ("VC", "L") | ("VI", "L") | ("VA", "L") => 0.1,
+            ("VC", "N") | ("VI", "N") | ("VA", "N") => 0.2,
+            ("SC", "H") => 0.1,
+            ("SC", "L") => 0.2,
+            ("SC", "N") => 0.3,
+            ("SI", "S") | ("SA", "S") => 0.0,
+            ("SI", "H") | ("SA", "H") => 0.1,
+            ("SI", "L") | ("SA", "L") => 0.2,
+            ("SI", "N") | ("SA", "N") => 0.3,
+            ("CR", "H") | ("IR", "H") | ("AR", "H") => 0.0,
+            ("CR", "M") | ("IR", "M") | ("AR", "M") => 0.1,
+            ("CR", "L") | ("IR", "L") | ("AR", "L") => 0.2,
+            ("E", "U") => 0.2,
+            ("E", "P") => 0.1,
+            ("E", "A") => 0.0,
+            _ => return None,
+        })
+    }
+
+    /// Highest-severity vector fragments for each MacroVector level
+    /// (spec MAX_COMPOSED table).
+    fn max_composed(eq: usize, level: usize) -> &'static [&'static str] {
+        match (eq, level) {
+            (1, 0) => &["AV:N/PR:N/UI:N/"],
+            (1, 1) => &["AV:A/PR:N/UI:N/", "AV:N/PR:L/UI:N/", "AV:N/PR:N/UI:P/"],
+            (1, 2) => &["AV:P/PR:N/UI:N/", "AV:A/PR:L/UI:P/"],
+            (2, 0) => &["AC:L/AT:N/"],
+            (2, 1) => &["AC:H/AT:N/", "AC:L/AT:P/"],
+            (4, 0) => &["SC:H/SI:S/SA:S/"],
+            (4, 1) => &["SC:H/SI:H/SA:H/"],
+            (4, 2) => &["SC:L/SI:L/SA:L/"],
+            (5, 0) => &["E:A/"],
+            (5, 1) => &["E:P/"],
+            (5, 2) => &["E:U/"],
+            _ => &[],
+        }
+    }
+
+    /// EQ3+EQ6 highest-severity fragments, keyed by (eq3 level, eq6 level).
+    fn max_composed_eq3(eq3: usize, eq6: usize) -> &'static [&'static str] {
+        match (eq3, eq6) {
+            (0, 0) => &["VC:H/VI:H/VA:H/CR:H/IR:H/AR:H/"],
+            (0, 1) => &[
+                "VC:H/VI:H/VA:L/CR:M/IR:M/AR:H/",
+                "VC:H/VI:H/VA:H/CR:M/IR:M/AR:M/",
+            ],
+            (1, 0) => &[
+                "VC:L/VI:H/VA:H/CR:H/IR:H/AR:H/",
+                "VC:H/VI:L/VA:H/CR:H/IR:H/AR:H/",
+            ],
+            (1, 1) => &[
+                "VC:L/VI:H/VA:L/CR:H/IR:M/AR:H/",
+                "VC:L/VI:H/VA:H/CR:H/IR:M/AR:M/",
+                "VC:H/VI:L/VA:H/CR:M/IR:H/AR:M/",
+                "VC:H/VI:L/VA:L/CR:M/IR:H/AR:H/",
+                "VC:L/VI:L/VA:H/CR:H/IR:H/AR:M/",
+            ],
+            (2, 1) => &["VC:L/VI:L/VA:L/CR:H/IR:H/AR:H/"],
+            _ => &[],
+        }
+    }
+
+    /// Max severity distance inside each MacroVector (+1), spec MAX_SEVERITY.
+    fn max_severity(eq: usize, level: usize, eq6: usize) -> Option<f64> {
+        Some(match (eq, level, eq6) {
+            (1, 0, _) => 1.0,
+            (1, 1, _) => 4.0,
+            (1, 2, _) => 5.0,
+            (2, 0, _) => 1.0,
+            (2, 1, _) => 2.0,
+            (3, 0, 0) => 7.0,
+            (3, 0, 1) => 6.0,
+            (3, 1, 0) | (3, 1, 1) => 8.0,
+            (3, 2, 1) => 10.0,
+            (4, 0, _) => 6.0,
+            (4, 1, _) => 5.0,
+            (4, 2, _) => 4.0,
+            _ => return None,
+        })
+    }
+
+    /// Valid values per metric; base metrics are mandatory, the rest default
+    /// to "X" (not defined).
+    fn metric_values(metric: &str) -> Option<&'static [&'static str]> {
+        Some(match metric {
+            "AV" => &["N", "A", "L", "P"],
+            "AC" => &["L", "H"],
+            "AT" => &["N", "P"],
+            "PR" => &["N", "L", "H"],
+            "UI" => &["N", "P", "A"],
+            "VC" | "VI" | "VA" | "SC" | "SI" | "SA" => &["N", "L", "H"],
+            "E" => &["X", "A", "P", "U"],
+            "CR" | "IR" | "AR" => &["X", "H", "M", "L"],
+            "MAV" => &["X", "N", "A", "L", "P"],
+            "MAC" => &["X", "L", "H"],
+            "MAT" => &["X", "N", "P"],
+            "MPR" => &["X", "N", "L", "H"],
+            "MUI" => &["X", "N", "P", "A"],
+            "MVC" | "MVI" | "MVA" | "MSC" => &["X", "H", "L", "N"],
+            "MSI" | "MSA" => &["X", "S", "H", "L", "N"],
+            "S" => &["X", "N", "P"],
+            "AU" => &["X", "N", "Y"],
+            "R" => &["X", "A", "U", "I"],
+            "V" => &["X", "D", "C"],
+            "RE" => &["X", "L", "M", "H"],
+            "U" => &["X", "Clear", "Green", "Amber", "Red"],
+            _ => return None,
+        })
+    }
+
+    const BASE_METRICS: &[&str] = &[
+        "AV", "AC", "AT", "PR", "UI", "VC", "VI", "VA", "SC", "SI", "SA",
+    ];
+
+    /// Effective metric value: an explicit modified (M*) value wins, then the
+    /// raw value, with "X" resolving to the spec's worst-case defaults for
+    /// E/CR/IR/AR.
+    fn effective<'a>(metrics: &'a BTreeMap<&'a str, &'a str>, metric: &str) -> Option<&'a str> {
+        let modified = format!("M{metric}");
+        if let Some(value) = metrics.get(modified.as_str())
+            && *value != "X"
+        {
+            return Some(value);
+        }
+        match metrics.get(metric).copied() {
+            Some("X") | None => match metric {
+                "E" => Some("A"),
+                "CR" | "IR" | "AR" => Some("H"),
+                _ => metrics.get(metric).copied(),
+            },
+            value => value,
+        }
+    }
+
+    /// Scores a `CVSS:4.0/…` vector; `None` when the vector is malformed.
+    pub(super) fn score(vector: &str) -> Option<f64> {
+        let mut metrics: BTreeMap<&str, &str> = BTreeMap::new();
+        for part in vector.split('/').skip(1) {
+            let (key, value) = part.split_once(':')?;
+            if !metric_values(key)?.contains(&value) {
+                return None;
+            }
+            metrics.insert(key, value);
+        }
+        // Every base metric is mandatory.
+        if !BASE_METRICS.iter().all(|key| metrics.contains_key(key)) {
+            return None;
+        }
+
+        let get = |metric: &str| effective(&metrics, metric);
+
+        // No impact on the vulnerable or subsequent system → 0.0.
+        if ["VC", "VI", "VA", "SC", "SI", "SA"]
+            .iter()
+            .all(|metric| get(metric) == Some("N"))
+        {
+            return Some(0.0);
+        }
+
+        let (av, pr, ui) = (get("AV")?, get("PR")?, get("UI")?);
+        let eq1 = if av == "N" && pr == "N" && ui == "N" {
+            0
+        } else if (av == "N" || pr == "N" || ui == "N") && av != "P" {
+            1
+        } else {
+            2
+        };
+        let eq2 = if get("AC")? == "L" && get("AT")? == "N" {
+            0
+        } else {
+            1
+        };
+        let (vc, vi, va) = (get("VC")?, get("VI")?, get("VA")?);
+        let eq3 = if vc == "H" && vi == "H" {
+            0
+        } else if vc == "H" || vi == "H" || va == "H" {
+            1
+        } else {
+            2
+        };
+        let eq4 = if get("MSI") == Some("S") || get("MSA") == Some("S") {
+            0
+        } else if get("SC")? == "H" || get("SI")? == "H" || get("SA")? == "H" {
+            1
+        } else {
+            2
+        };
+        let eq5 = match get("E")? {
+            "A" => 0,
+            "P" => 1,
+            "U" => 2,
+            _ => return None,
+        };
+        let eq6 = if (get("CR")? == "H" && vc == "H")
+            || (get("IR")? == "H" && vi == "H")
+            || (get("AR")? == "H" && va == "H")
+        {
+            0
+        } else {
+            1
+        };
+
+        let macro_vector = format!("{eq1}{eq2}{eq3}{eq4}{eq5}{eq6}");
+        let value = LOOKUP
+            .binary_search_by(|(key, _)| (*key).cmp(macro_vector.as_str()))
+            .ok()
+            .map(|index| LOOKUP[index].1)?;
+
+        // Next-lower MacroVector scores per EQ (NaN → absent, ignored below).
+        let next = |digits: [usize; 6]| -> f64 {
+            let key = digits.map(|digit| char::from(b'0' + digit as u8));
+            let key: String = key.iter().collect();
+            LOOKUP
+                .binary_search_by(|(probe, _)| (*probe).cmp(key.as_str()))
+                .ok()
+                .map(|index| LOOKUP[index].1)
+                .unwrap_or(f64::NAN)
+        };
+        let mv = [eq1, eq2, eq3, eq4, eq5, eq6];
+        let lower = |index: usize, bump: usize| {
+            let mut digits = mv;
+            digits[index] += bump;
+            next(digits)
+        };
+        let score_eq1 = lower(0, 1);
+        let score_eq2 = lower(1, 1);
+        let score_eq3eq6 = match (eq3, eq6) {
+            (0, 0) => next([eq1, eq2, eq3, eq4, eq5, eq6 + 1]).max(next([
+                eq1,
+                eq2,
+                eq3 + 1,
+                eq4,
+                eq5,
+                eq6,
+            ])),
+            (1, 1) | (0, 1) => next([eq1, eq2, eq3 + 1, eq4, eq5, eq6]),
+            (1, 0) => next([eq1, eq2, eq3, eq4, eq5, eq6 + 1]),
+            _ => next([eq1, eq2, eq3 + 1, eq4, eq5, eq6 + 1]),
+        };
+        let score_eq4 = lower(3, 1);
+        let score_eq5 = lower(4, 1);
+
+        // Compose candidate maximum vectors and pick the first whose
+        // severity distance to the scored vector is non-negative.
+        fn parse_fragment(fragment: &str) -> BTreeMap<&str, &str> {
+            fragment
+                .split('/')
+                .filter_map(|part| part.split_once(':'))
+                .collect()
+        }
+
+        let mut max_vector: Option<BTreeMap<&str, &str>> = None;
+        let mut distances: BTreeMap<&str, f64> = BTreeMap::new();
+        'outer: for eq1_max in max_composed(1, eq1) {
+            for eq2_max in max_composed(2, eq2) {
+                for eq3_max in max_composed_eq3(eq3, eq6) {
+                    for eq4_max in max_composed(4, eq4) {
+                        for eq5_max in max_composed(5, eq5) {
+                            let mut candidate = parse_fragment(eq1_max);
+                            candidate.extend(parse_fragment(eq2_max));
+                            candidate.extend(parse_fragment(eq3_max));
+                            candidate.extend(parse_fragment(eq4_max));
+                            candidate.extend(parse_fragment(eq5_max));
+                            distances.clear();
+                            let mut all_non_negative = true;
+                            for metric in [
+                                "AV", "PR", "UI", "AC", "AT", "VC", "VI", "VA", "SC", "SI", "SA",
+                                "CR", "IR", "AR", "E",
+                            ] {
+                                let effective_level = metric_level(metric, get(metric)?)?;
+                                let max_level = candidate
+                                    .get(metric)
+                                    .and_then(|value| metric_level(metric, value))?;
+                                let distance = effective_level - max_level;
+                                distances.insert(metric, distance);
+                                if distance < 0.0 {
+                                    all_non_negative = false;
+                                }
+                            }
+                            if all_non_negative {
+                                max_vector = Some(candidate);
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        max_vector?;
+
+        let distance_eq1 = distances["AV"] + distances["PR"] + distances["UI"];
+        let distance_eq2 = distances["AC"] + distances["AT"];
+        let distance_eq3eq6 = distances["VC"]
+            + distances["VI"]
+            + distances["VA"]
+            + distances["CR"]
+            + distances["IR"]
+            + distances["AR"];
+        let distance_eq4 = distances["SC"] + distances["SI"] + distances["SA"];
+
+        const STEP: f64 = 0.1;
+        let mut normalized = 0.0;
+        let mut existing_lower = 0;
+        for (available, distance, max_severity) in [
+            (
+                value - score_eq1,
+                distance_eq1,
+                max_severity(1, eq1, eq6)? * STEP,
+            ),
+            (
+                value - score_eq2,
+                distance_eq2,
+                max_severity(2, eq2, eq6)? * STEP,
+            ),
+            (
+                value - score_eq3eq6,
+                distance_eq3eq6,
+                max_severity(3, eq3, eq6)? * STEP,
+            ),
+            (
+                value - score_eq4,
+                distance_eq4,
+                max_severity(4, eq4, eq6)? * STEP,
+            ),
+        ] {
+            if !available.is_nan() {
+                existing_lower += 1;
+                normalized += available * (distance / max_severity);
+            }
+        }
+        // EQ5's proportional distance is always zero but still counts as an
+        // existing lower MacroVector.
+        if !(value - score_eq5).is_nan() {
+            existing_lower += 1;
+        }
+        let mean = if existing_lower == 0 {
+            0.0
+        } else {
+            normalized / existing_lower as f64
+        };
+        let raw = (value - mean).clamp(0.0, 10.0);
+        Some(((raw + 1e-6) * 10.0).round() / 10.0)
+    }
+}
+
+fn cvss_v4_score(vector: &str) -> Option<f64> {
+    cvss_v4::score(vector)
 }
 
 #[cfg(test)]
@@ -1740,8 +2551,9 @@ mod tests {
                 "ecosystem_specific": {"severity": "LOW"}
             }]
         })).unwrap();
+        let component = component("demo", "demo", "1.0.0", "pkg:cargo/demo@1.0.0");
         assert_eq!(
-            vulnerability_severity(&vulnerability, "pkg:cargo/demo@1.0.0"),
+            vulnerability_severity(&vulnerability, &component),
             Severity::Critical
         );
     }
