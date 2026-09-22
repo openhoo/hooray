@@ -466,12 +466,13 @@ fn scan_virtual_files(
                 &mut builder,
             )?,
             LockfileRoute::Manifest { parse, lock_names } => {
-                // The manifest's declared constraints are superseded by any
-                // sibling lockfile; the parser still receives the first
-                // present lockfile so it can skip redundant work.
-                let lock = lock_names
-                    .iter()
-                    .find_map(|name| files.get(&sibling(path, name)));
+                // The manifest's declared constraints are superseded by the
+                // nearest covering lockfile — a sibling, or one in an
+                // ancestor directory for workspace members whose lockfile
+                // lives at the workspace root (pnpm workspaces, npm/yarn
+                // workspaces). The parser still receives the first present
+                // lockfile so it can skip redundant work.
+                let lock = covering_lockfile(path, lock_names, &files);
                 parse(path, bytes, lock, &mut builder)?;
             }
         }
@@ -1021,6 +1022,28 @@ fn sibling(path: &str, name: &str) -> String {
         .map(|(parent, _)| format!("{parent}/{name}"))
         .unwrap_or_else(|| name.to_owned())
 }
+
+/// Returns the nearest lockfile covering a manifest at `path`: its sibling
+/// first, then ancestor directories outward, so a workspace member's
+/// manifest is superseded by the workspace-root lockfile that resolved its
+/// dependencies.
+fn covering_lockfile<'a>(
+    path: &str,
+    lock_names: &[&'static str],
+    files: &'a BTreeMap<String, Vec<u8>>,
+) -> Option<&'a Vec<u8>> {
+    let mut dir = path.rsplit_once('/').map(|(parent, _)| parent);
+    while let Some(current) = dir {
+        if let Some(lock) = lock_names
+            .iter()
+            .find_map(|name| files.get(&format!("{current}/{name}")))
+        {
+            return Some(lock);
+        }
+        dir = current.rsplit_once('/').map(|(parent, _)| parent);
+    }
+    lock_names.iter().find_map(|name| files.get(*name))
+}
 fn base_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -1129,7 +1152,7 @@ fn parse_package_json(
 /// Returns the concrete purl version for a specifier, stripping pnpm-style
 /// `1.2.3(integrity)` annotations, or `None` for empty values and range
 /// constraints (`^1.2`, `~1.2`, `>=1`, `1.*`, `a || b`, `git+https://…`).
-fn concrete_version_specifier(version: &str) -> Option<String> {
+pub(crate) fn concrete_version_specifier(version: &str) -> Option<String> {
     let trimmed = version.trim();
     let concrete = trimmed.split('(').next().unwrap_or(trimmed).trim_end();
     if concrete.is_empty()
@@ -2277,6 +2300,62 @@ mod tests {
         let inventory = scan_path(&tar_path, &config()).unwrap();
         assert_eq!(inventory.asset.kind, AssetKind::Filesystem);
         assert!(inventory.components.values().any(|c| c.name == "a"));
+    }
+
+    #[test]
+    fn workspace_manifest_deps_are_covered_by_ancestor_lockfile() {
+        // A workspace member's package.json has no sibling lockfile; the
+        // workspace-root pnpm-lock.yaml resolved its dependencies, so the
+        // manifest's declared constraints must not become specifier-versioned
+        // phantom components (#339).
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"probe","private":true,"dependencies":{"is-odd":"^3.0.1"}}"#,
+        )
+        .unwrap();
+        let web = dir.path().join("apps/web");
+        fs::create_dir_all(&web).unwrap();
+        fs::write(
+            web.join("package.json"),
+            r#"{"name":"web","private":true,"dependencies":{"is-even":"^1.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            concat!(
+                "lockfileVersion: '9.0'\n",
+                "\n",
+                "importers:\n",
+                "  .:\n",
+                "    dependencies:\n",
+                "      is-odd:\n",
+                "        specifier: ^3.0.1\n",
+                "        version: 3.0.1\n",
+                "  apps/web:\n",
+                "    dependencies:\n",
+                "      is-even:\n",
+                "        specifier: ^1.0.0\n",
+                "        version: 1.0.0\n",
+                "\n",
+                "packages:\n",
+                "\n",
+                "  is-odd@3.0.1:\n",
+                "    resolution: {integrity: sha512-x}\n",
+                "\n",
+                "  is-even@1.0.0:\n",
+                "    resolution: {integrity: sha512-y}\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let mut components: Vec<(&str, &str)> = inventory
+            .components
+            .values()
+            .map(|c| (c.name.as_str(), c.version.as_str()))
+            .collect();
+        components.sort_unstable();
+        assert_eq!(components, [("is-even", "1.0.0"), ("is-odd", "3.0.1")]);
     }
 
     #[test]

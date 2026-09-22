@@ -6,8 +6,8 @@ use serde_yaml::Value as Yaml;
 use super::npm::npm_scope;
 use super::{LockComponents, resolve_lock_component, split_descriptor};
 use crate::input::{
-    InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8,
-    yaml_expansion_within_budget,
+    InputError, InventoryBuilder, concrete_version_specifier, entry_bound, malformed,
+    malformed_msg, utf8, yaml_expansion_within_budget,
 };
 use crate::model::Scope;
 
@@ -88,7 +88,13 @@ pub(crate) fn parse_pnpm_lock(
             collect_pnpm_deps(&node, entry, &mut pending);
         }
     }
-    let package_names: BTreeSet<String> = entries.keys().map(|(name, _)| name.clone()).collect();
+    let mut package_versions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (name, version) in entries.keys() {
+        package_versions
+            .entry(name.clone())
+            .or_default()
+            .insert(version.clone());
+    }
     if let Some(importers) = importers {
         for importer in importers.values() {
             for (field, scope) in [
@@ -104,11 +110,26 @@ pub(crate) fn parse_pnpm_lock(
                     let Some(node) = pnpm_resolved_parts(dep, spec) else {
                         continue;
                     };
-                    if !package_names.contains(node.0.as_str()) {
+                    // pnpm 12 writes workspace-importer dependencies as bare
+                    // specifier strings (`is-even: ^1.0.0`); a specifier is a
+                    // constraint, not a resolved version, so it resolves
+                    // against the locked versions of that package name.
+                    let node = match concrete_version_specifier(&node.1) {
+                        Some(version) if pnpm_concrete_version(&version) => node,
+                        _ => match package_versions.get(node.0.as_str()) {
+                            Some(versions) => (node.0, versions.iter().next().unwrap().to_string()),
+                            None => continue,
+                        },
+                    };
+                    if !package_versions.contains_key(node.0.as_str()) {
                         // Importer-only dependency absent from `packages:`;
                         // its scope comes from the importer field through the
                         // reachability pass below.
                         entries.insert(node.clone(), None);
+                        package_versions
+                            .entry(node.0.clone())
+                            .or_default()
+                            .insert(node.1.clone());
                     }
                     roots.push((node, scope));
                 }
@@ -418,6 +439,16 @@ fn pnpm_tarball_parts(text: &str) -> Option<(&str, &str)> {
 /// a protocol `:`, or a path `/` is specifier text, not a version.
 fn pnpm_valid_version(version: &str) -> bool {
     !version.contains('@') && !version.contains(':') && !version.contains('/')
+}
+
+/// A concrete resolved version starts with a digit and has no `x`/`X`
+/// wildcard segments; tags (`latest`) and partial ranges (`1.x`) are
+/// specifiers that resolve against the lockfile's recorded versions.
+fn pnpm_concrete_version(version: &str) -> bool {
+    version.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && !version
+            .split('.')
+            .any(|segment| segment.eq_ignore_ascii_case("x"))
 }
 
 #[cfg(test)]
@@ -877,5 +908,101 @@ mod tests {
             scan_path(dir.path(), &config()),
             Err(InputError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn pnpm_workspace_importer_specifiers_resolve_to_locked_versions() {
+        // pnpm 12 writes workspace-importer dependencies as bare specifier
+        // strings; they must resolve against `packages:` instead of becoming
+        // specifier-versioned phantom components (#339).
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            concat!(
+                "---\n",
+                "lockfileVersion: '9.0'\n",
+                "\n",
+                "importers:\n",
+                "  .:\n",
+                "    dependencies:\n",
+                "      is-odd:\n",
+                "        specifier: ^3.0.1\n",
+                "        version: 3.0.1\n",
+                "  apps/web:\n",
+                "    dependencies:\n",
+                "      is-even: ^1.0.0\n",
+                "      tagged: latest\n",
+                "      ranged: 1.x\n",
+                "      missing: ^9.9.9\n",
+                "    devDependencies:\n",
+                "      vitest: ^4.0.0\n",
+                "\n",
+                "---\n",
+                "lockfileVersion: '9.0'\n",
+                "\n",
+                "settings:\n",
+                "  autoInstallPeers: true\n",
+                "\n",
+                "packages:\n",
+                "\n",
+                "  is-odd@3.0.1:\n",
+                "    resolution: {integrity: sha512-x}\n",
+                "\n",
+                "  is-even@1.0.0:\n",
+                "    resolution: {integrity: sha512-y}\n",
+                "\n",
+                "  tagged@2.0.0:\n",
+                "    resolution: {integrity: sha512-t}\n",
+                "\n",
+                "  ranged@1.4.2:\n",
+                "    resolution: {integrity: sha512-r}\n",
+                "\n",
+                "  vitest@4.1.5:\n",
+                "    resolution: {integrity: sha512-v}\n",
+                "\n",
+                "snapshots:\n",
+                "\n",
+                "  is-odd@3.0.1: {}\n",
+                "\n",
+                "  is-even@1.0.0: {}\n",
+                "\n",
+                "  tagged@2.0.0: {}\n",
+                "\n",
+                "  ranged@1.4.2: {}\n",
+                "\n",
+                "  vitest@4.1.5: {}\n",
+            ),
+        )
+        .unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let mut components: Vec<(&str, &str)> = inventory
+            .components
+            .values()
+            .map(|c| (c.name.as_str(), c.version.as_str()))
+            .collect();
+        components.sort_unstable();
+        // Only resolved versions appear: no specifier text becomes a version,
+        // and an importer specifier with no locked package yields nothing.
+        assert_eq!(
+            components,
+            [
+                ("is-even", "1.0.0"),
+                ("is-odd", "3.0.1"),
+                ("ranged", "1.4.2"),
+                ("tagged", "2.0.0"),
+                ("vitest", "4.1.5"),
+            ]
+        );
+        // Specifier-valued roots still classify their resolved package by the
+        // importer field that referenced them.
+        let scope_of = |name: &str| {
+            inventory
+                .components
+                .values()
+                .find(|c| c.name == name)
+                .map(|c| c.scope)
+        };
+        assert_eq!(scope_of("vitest"), Some(Scope::Development));
+        assert_eq!(scope_of("is-even"), Some(Scope::Runtime));
     }
 }
