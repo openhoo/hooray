@@ -90,7 +90,7 @@ jobs:
           output: ""
 
       - name: Enforce Hoolicy policy
-        uses: openhoo/hoolicy/actions/check@17cac347ab3561eea664b0bee3c670de86ec3ffa # v0.3.2
+        uses: openhoo/hoolicy/actions/check@2175cd50a816e90b37a0395d6bb93e6ce729c256 # v0.4.0
         with:
           version: 0.3.2
 
