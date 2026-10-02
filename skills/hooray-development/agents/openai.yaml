@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hooray Development"
+  short_description: "Develop and verify Hooray source changes"
+  default_prompt: "Use $hooray-development to implement and verify this change in the source repository."
