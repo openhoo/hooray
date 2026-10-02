@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hooray User Guide"
+  short_description: "Scan projects and triage Hooray findings"
+  default_prompt: "Use $hooray-scanning to set up and verify this workflow in my project."

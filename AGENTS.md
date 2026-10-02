@@ -28,3 +28,14 @@ The local [queue helper](.agents/skills/work-issues/scripts/issue_queue.py)
 records ownership and verification receipts outside Git; it grants no external
 permissions. A local test pass, green PR, merged PR and verified issue closure
 are distinct evidence states. Preserve required checks and negative controls.
+
+## Agent skills
+
+- For focused work on the scanner itself, read
+  [hooray-development](skills/hooray-development/SKILL.md).
+- For scanning and triage in a consuming project, read
+  [hooray-scanning](skills/hooray-scanning/SKILL.md).
+
+Installable sources live in `skills/`; `.agents/skills` exposes the development
+skill through a relative link. Existing issue-campaign skills remain available
+for their scoped workflows. Keep skill guidance aligned with source and CI.

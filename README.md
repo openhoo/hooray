@@ -13,6 +13,30 @@ suppression. Findings carry stable identifiers, evidence, confidence,
 applicability, remediation data, risk factors, and policy decisions. Operational
 failures are distinct from policy denials through separate exit codes.
 
+## Agent skills
+
+Two installable skills serve different tasks:
+
+- [`hooray-scanning`](skills/hooray-scanning/SKILL.md) helps agents scan your project and triage findings with policies and reports.
+- [`hooray-development`](skills/hooray-development/SKILL.md) helps agents
+  change and verify hooray itself. Repository agents find it through
+  `AGENTS.md` and `.agents/skills`.
+
+Install the user skill from your consuming project's directory:
+
+```bash
+npx skills add openhoo/hooray --skill hooray-scanning
+```
+
+For contributor work, select `--skill hooray-development`. Add `--global`
+for use across projects; otherwise installation is project-scoped. The installer
+lets you select your supported coding agent. Skills supply instructions and
+bundled references; install the product separately using the guidance below.
+
+For unpublished changes, pass the local checkout path instead of
+`openhoo/hooray`, for example
+`npx skills add ./hooray --skill hooray-scanning` from its parent directory.
+
 ## Capabilities
 
 ### Inputs and inventory
