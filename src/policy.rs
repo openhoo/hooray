@@ -287,7 +287,9 @@ impl Policy {
     /// exceptions are rejected at compile time. Fail-closed denials are
     /// additionally overridable only by exceptions whose selectors name that
     /// exact fail-closed policy ID, so generic selectors can never widen
-    /// them into allows.
+    /// them into allows. When multiple fail-closed guards deny, each guard
+    /// requires its own matching unexpired exception before the finding can
+    /// be allowed.
     pub fn evaluate(
         &self,
         findings: &BTreeMap<crate::model::FindingId, Finding>,
@@ -383,28 +385,47 @@ impl<'a> CompiledPolicy<'a> {
             .as_ref()
             .and_then(|id| inventory.components.get(id));
 
-        let mut decision = if self.policy.fail_closed.unknown_applicability
+        let unknown_applicability = self.policy.fail_closed.unknown_applicability
             && finding
                 .applicability
                 .as_ref()
-                .is_none_or(|value| value.status == ApplicabilityStatus::Unknown)
-        {
-            decision(
+                .is_none_or(|value| value.status == ApplicabilityStatus::Unknown);
+        let unknown_license = self.policy.fail_closed.unknown_licenses
+            && component.is_none_or(|value| known_license_expressions(value).is_empty());
+        let mut exempted = None;
+        for (enabled, id, reason) in [
+            (
+                unknown_applicability,
                 "fail-closed-applicability",
-                finding,
-                PolicyOutcome::Deny,
                 "applicability is unknown and policy is fail-closed",
-            )
-        } else if self.policy.fail_closed.unknown_licenses
-            && component.is_none_or(|value| known_license_expressions(value).is_empty())
-        {
-            decision(
+            ),
+            (
+                unknown_license,
                 "fail-closed-license",
-                finding,
-                PolicyOutcome::Deny,
                 "component license is unknown and policy is fail-closed",
-            )
-        } else if let Some(rule) = self
+            ),
+        ] {
+            if enabled {
+                let mut selected = self.apply_exception(
+                    decision(id, finding, PolicyOutcome::Deny, reason),
+                    finding,
+                    component,
+                    now,
+                );
+                if selected.outcome == PolicyOutcome::Deny {
+                    return selected;
+                }
+                if let Some(previous) = exempted.take() {
+                    let previous: PolicyDecision = previous;
+                    selected.reason = format!("{}; {}", previous.reason, selected.reason);
+                }
+                exempted = Some(selected);
+            }
+        }
+        if let Some(selected) = exempted {
+            return selected;
+        }
+        let selected = if let Some(rule) = self
             .rules
             .iter()
             .find(|rule| rule.matches(finding, component))
@@ -423,7 +444,16 @@ impl<'a> CompiledPolicy<'a> {
                 "no policy rule matched",
             )
         };
+        self.apply_exception(selected, finding, component, now)
+    }
 
+    fn apply_exception(
+        &self,
+        mut decision: PolicyDecision,
+        finding: &Finding,
+        component: Option<&Component>,
+        now: DateTime<FixedOffset>,
+    ) -> PolicyDecision {
         // Fail-closed denials are only overridable by exceptions whose
         // selectors explicitly name the failing fail-closed policy id;
         // generic selectors must not widen such denials into allows.
@@ -954,6 +984,51 @@ mod tests {
         let selected = evaluate_one(&policy, finding, &inventory);
         assert_eq!(selected.outcome, PolicyOutcome::Deny);
         assert_eq!(selected.policy_id.as_str(), "fail-closed-applicability");
+    }
+
+    #[test]
+    fn fail_closed_exceptions_cannot_override_independent_guards() {
+        let inventory = inventory(None, Scope::Runtime, "pkg:cargo/example@1");
+        let mut item = finding("finding");
+        item.applicability = None;
+        let mut policy = policy(Vec::new());
+        policy.fail_closed = FailClosed {
+            unknown_applicability: true,
+            unknown_licenses: true,
+        };
+        let exception = |id: &str, policy_id: &str| PolicyException {
+            id: id.to_owned(),
+            owner: "security".to_owned(),
+            reason: "accepted unknown".to_owned(),
+            ticket: "SEC-1".to_owned(),
+            expires_at: "2026-07-22T12:00:00Z".to_owned(),
+            compensating_controls: BTreeSet::new(),
+            selectors: ExceptionSelectors {
+                finding_id: Some("finding".to_owned()),
+                policy_id: Some(policy_id.to_owned()),
+                ..ExceptionSelectors::default()
+            },
+        };
+        policy
+            .exceptions
+            .push(exception("applicability", "fail-closed-applicability"));
+        let selected = evaluate_one(&policy, item.clone(), &inventory);
+        assert_eq!(selected.outcome, PolicyOutcome::Deny);
+        assert_eq!(selected.policy_id.as_str(), "fail-closed-license");
+        assert_eq!(selected.exception_id, None);
+
+        policy
+            .exceptions
+            .push(exception("license", "fail-closed-license"));
+        let allowed = evaluate_one(&policy, item.clone(), &inventory);
+        assert_eq!(allowed.outcome, PolicyOutcome::Allow);
+        assert!(allowed.reason.contains("exception applicability:"));
+        assert!(allowed.reason.contains("exception license:"));
+        policy.exceptions[1].expires_at = "2026-07-21T12:00:00Z".to_owned();
+        assert_eq!(
+            evaluate_one(&policy, item, &inventory).outcome,
+            PolicyOutcome::Deny
+        );
     }
 
     #[test]

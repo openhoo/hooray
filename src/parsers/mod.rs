@@ -169,51 +169,44 @@ fn version_clause_satisfies(version: &str, clause: &str) -> bool {
 /// <0.3.0`, `^0.0.3` is `>=0.0.3 <0.0.4` — the upper bound increments the
 /// leftmost non-zero component, or the last component when all are zero.
 fn npm_caret_satisfies(version: &str, operand: &str) -> bool {
-    let Some(mut upper) = numeric_parts(operand) else {
+    let Some(parts) = numeric_parts(operand) else {
         return false;
     };
     if version_cmp(version, operand) == Ordering::Less {
         return false;
     }
-    match upper.iter().position(|part| *part > 0) {
-        Some(index) => {
-            upper[index] += 1;
-            upper.iter_mut().skip(index + 1).for_each(|part| *part = 0);
-        }
-        None => {
-            let last = upper.len() - 1;
-            upper[last] += 1;
-        }
-    }
-    version_cmp(version, &join_numeric(&upper)) == Ordering::Less
-}
-
-/// npm `~` ranges: `~1.2.3` is `>=1.2.3 <1.3.0`, `~1` is `>=1 <2` — the
-/// upper bound increments the minor component, or the major when only one
-/// component is given.
-fn npm_tilde_satisfies(version: &str, operand: &str) -> bool {
-    let Some(mut upper) = numeric_parts(operand) else {
-        return false;
-    };
-    if version_cmp(version, operand) == Ordering::Less {
-        return false;
-    }
-    if upper.len() >= 2 {
-        upper[1] += 1;
-        upper.iter_mut().skip(2).for_each(|part| *part = 0);
-    } else {
-        upper[0] += 1;
-    }
-    version_cmp(version, &join_numeric(&upper)) == Ordering::Less
-}
-
-/// Renders numeric version parts back to `a.b.c` text for comparison.
-fn join_numeric(parts: &[u64]) -> String {
-    parts
+    let fixed = parts
         .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(".")
+        .position(|part| *part > 0)
+        .unwrap_or(parts.len() - 1)
+        + 1;
+    numeric_prefix_matches(version, &parts[..fixed])
+}
+
+/// npm `~` ranges: `~1.2.3` is `>=1.2.3 <1.3.0`, `~1` is `>=1 <2`.
+/// Matching the fixed prefix avoids constructing an overflowing upper bound.
+fn npm_tilde_satisfies(version: &str, operand: &str) -> bool {
+    let Some(parts) = numeric_parts(operand) else {
+        return false;
+    };
+    if version_cmp(version, operand) == Ordering::Less {
+        return false;
+    }
+    numeric_prefix_matches(version, &parts[..parts.len().min(2)])
+}
+
+/// A range's upper bound increments the last fixed component. Release
+/// versions below that bound retain exactly this prefix, even when the
+/// component is u64::MAX. Missing release parts compare as zero, matching
+/// version_cmp without integer addition.
+fn numeric_prefix_matches(version: &str, prefix: &[u64]) -> bool {
+    let Some(parts) = numeric_parts(version) else {
+        return false;
+    };
+    prefix
+        .iter()
+        .enumerate()
+        .all(|(index, expected)| parts.get(index).copied().unwrap_or(0) == *expected)
 }
 
 /// Numeric release components of a version operand: `1.2.3` → `[1,2,3]`,
@@ -413,6 +406,43 @@ mod tests {
         assert_eq!(resolved.as_str(), "component:4.0.0");
         let resolved = resolve_lock_component(&recorded, None).unwrap();
         assert_eq!(resolved.as_str(), "component:4.0.0");
+    }
+
+    #[test]
+    fn version_ranges_handle_largest_numeric_components_without_panicking() {
+        let largest = u64::MAX.to_string();
+        for constraint in [format!("^{largest}"), format!("~{largest}")] {
+            assert!(!version_satisfies("1.0.0", &constraint));
+            assert!(version_satisfies(&largest, &constraint));
+            assert!(version_satisfies(&format!("{largest}.9.0"), &constraint));
+        }
+        let constraint = format!("~1.{largest}.0");
+        assert!(version_satisfies(&format!("1.{largest}.9"), &constraint));
+        assert!(!version_satisfies("2.0.0", &constraint));
+        assert!(!version_satisfies("1.0.0", &constraint));
+    }
+
+    #[test]
+    fn npm_ranges_preserve_lower_bounds_and_fixed_release_prefixes() {
+        for (constraint, accepted, rejected) in [
+            ("^1.2.3", "1.9.0", "2.0.0"),
+            ("^0.2.3", "0.2.9", "0.3.0"),
+            ("^0.0.3", "0.0.3", "0.0.4"),
+            ("^0.0", "0.0.9", "0.1.0"),
+            ("~1.2.3", "1.2.9", "1.3.0"),
+            ("~1", "1.9.0", "2.0.0"),
+        ] {
+            assert!(
+                version_satisfies(accepted, constraint),
+                "{accepted} in {constraint}"
+            );
+            assert!(
+                !version_satisfies(rejected, constraint),
+                "{rejected} outside {constraint}"
+            );
+        }
+        assert!(!version_satisfies("1.2.2", "^1.2.3"));
+        assert!(!version_satisfies("1.2.2", "~1.2.3"));
     }
 
     #[test]

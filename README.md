@@ -101,7 +101,9 @@ Rules are evaluated by descending priority and then rule ID. Outcomes are
 Policies can fail closed when applicability or license data is unknown.
 Exceptions can override these denials only when their selectors explicitly
 name the fail-closed policy id (`fail-closed-applicability` or
-`fail-closed-license`).
+`fail-closed-license`). If both guards deny, each requires its own matching,
+unexpired exception; accepting unknown applicability alone cannot bypass
+unknown-license enforcement.
 
 Exceptions are deliberately narrow and auditable. Every exception requires an
 ID, owner, reason, ticket, RFC 3339 expiry, and at least one exact selector.
@@ -260,7 +262,10 @@ dead-letters exhausted events, and prunes expired records.
 Targets register through the CLI. `monitor targets add TARGET_ID --source
 SOURCE --interval-seconds SECONDS` stores a watch entry, `list` paginates
 registered targets, and `remove` deletes a target together with its queued
-events.
+events. Relative filesystem sources are stored as absolute paths anchored to
+the directory where the target was registered, so restarting the monitor from
+another directory watches the same source. Existing targets with relative
+sources are unchanged; remove and re-register them to anchor their paths.
 
 ```bash
 hooray monitor --once
@@ -482,7 +487,10 @@ hooray integrations generate pre-commit|github-actions|gitlab-ci|gitlab-security
 ```
 
 `INPUT` must match the selected scan subcommand. Use `-` as input only with
-`scan sbom` or `scan auto`. Output defaults to JSON on standard output; use
+`scan sbom` or `scan auto`. SBOM components with versioned package URLs inherit
+the percent-decoded version when their declared version is absent. Conflicting
+declared and package-URL versions fail validation rather than scanning an
+ambiguous identity. Output defaults to JSON on standard output; use
 `--output FILE` for a file. `gitlab-artifacts` instead requires a new directory
 path. The default policy is `hooray-policy.yaml` and the default history database
 is `hooray.db`.
@@ -523,7 +531,7 @@ history, and standalone policy-evaluation commands support JSON and YAML only.
 | `gitlab-code-quality` | GitLab Code Quality JSON |
 | `json-lines` | NDJSON envelopes for run, component, finding, policy, and summary records |
 | `csv` | RFC 4180 flat finding rows with fixed columns from `stable_finding_id` through `first_location_path` |
-| `gitlab-artifacts` | Atomic directory bundle containing all five GitLab artifacts (Linux/Android only; other platforms return `UnsupportedAtomicPublication`) |
+| `gitlab-artifacts` | Atomic directory bundle containing all five GitLab artifacts (Linux/Android/macOS; other platforms return `UnsupportedAtomicPublication`) |
 
 The `gitlab-artifacts` directory contains exactly
 `gl-code-quality-report.json`, `gl-sarif-report.sarif`,

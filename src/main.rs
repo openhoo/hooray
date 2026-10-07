@@ -49,13 +49,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Scan a project, SBOM, archive, or container and enforce policy
     Scan(ScanArgs),
+    /// Validate a policy or evaluate it against a stored scan
     Policy(PolicyArgs),
+    /// Show dependency inventory from the latest or a selected scan
     Inventory(InventoryArgs),
+    /// List, inspect, or compare stored scan runs
     History(HistoryArgs),
+    /// Render a stored scan in a human or CI report format
     Report(ReportArgs),
+    /// Serve the HTTP API at the configured address
     Serve(ServeArgs),
+    /// Watch registered targets and notify when findings change
     Monitor(MonitorArgs),
+    /// Generate pre-commit, GitHub Actions, or GitLab CI configuration
     Integrations(IntegrationsArgs),
 }
 
@@ -67,10 +75,15 @@ struct ScanArgs {
 
 #[derive(Debug, Subcommand)]
 enum ScanCommand {
+    /// Scan a project directory containing dependency files and source
     Project(ScanTargetArgs),
+    /// Scan CycloneDX or SPDX JSON; use - to read standard input
     Sbom(ScanTargetArgs),
+    /// Scan a ZIP or TAR archive without extracting it to disk
     Artifact(ScanTargetArgs),
+    /// Scan an OCI layout directory or OCI/Docker image TAR
     Container(ScanTargetArgs),
+    /// Detect the input type; use - for an SBOM on standard input
     Auto(ScanTargetArgs),
 }
 
@@ -220,6 +233,7 @@ enum MonitorTargetsCommand {
 struct MonitorTargetAddArgs {
     #[arg(value_name = "TARGET_ID")]
     target_id: String,
+    /// Input path; relative paths are anchored to the registration directory
     #[arg(long, value_name = "SOURCE")]
     source: String,
     // Mirrors MonitorTarget::validate so out-of-range intervals are rejected
@@ -636,7 +650,11 @@ fn run_monitor_targets(config: &Config, args: MonitorTargetsArgs) -> Result<Comm
             }
             let target = MonitorTarget::new(
                 args.target_id,
-                args.source,
+                std::path::absolute(&args.source)
+                    .context("cannot anchor monitor source to the registration directory")?
+                    .to_str()
+                    .context("monitor source path is not UTF-8")?
+                    .to_owned(),
                 args.interval_seconds,
                 Utc::now().timestamp(),
             )?;

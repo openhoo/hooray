@@ -9,7 +9,9 @@ use crate::model::{
     Location, ModelInvariantError, Scope, Source, SourceKind, stable_component_id,
     stable_location_id,
 };
-use crate::util::{is_purl_byte, parse_purl_body, percent_encode, sha256_hex};
+use crate::util::{
+    is_purl_byte, parse_purl_body, percent_decode_strict, percent_encode, sha256_hex,
+};
 
 const MAX_SBOM_BYTES: usize = 100 * 1024 * 1024;
 const MAX_COMPONENTS: usize = 1_000_000;
@@ -405,7 +407,8 @@ fn required<'a>(
 }
 
 /// Resolves a component's `(purl, version)` from the optional SBOM identity
-/// fields. A versioned purl wins and supplies a missing version; an
+/// fields. A versioned purl supplies a missing version after percent-decoding; a
+/// contradictory declared version is rejected. An
 /// unversioned purl gains the declared version; without a purl the SPDX
 /// `pkg:generic/<name>@<version>` package URL is synthesized so downstream
 /// purl fields and OSV queries always see a spec-valid value. `Ok(None)`
@@ -427,10 +430,21 @@ fn component_identity(
                 });
             }
             match purl_version(purl) {
-                Some(purl_version) => Ok(Some((
-                    purl.to_owned(),
-                    version.unwrap_or(purl_version).to_owned(),
-                ))),
+                Some(purl_version) => {
+                    let decoded = percent_decode_strict(purl_version).ok_or_else(|| {
+                        SbomError::InvalidComponent {
+                            path: path.to_owned(),
+                            field: "purl",
+                        }
+                    })?;
+                    if version.is_some_and(|version| version != decoded) {
+                        return Err(SbomError::InvalidComponent {
+                            path: path.to_owned(),
+                            field: "purl",
+                        });
+                    }
+                    Ok(Some((purl.to_owned(), decoded)))
+                }
                 None => version
                     .map(|version| {
                         append_purl_version(purl, version, path)
@@ -977,6 +991,43 @@ mod tests {
                 && component.locations.len() == 1
         }));
         inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn sbom_versions_decode_purls_and_reject_conflicting_declarations() {
+        for format in ["cyclonedx", "spdx"] {
+            let document = |version: Option<&str>, purl: &str| {
+                let version = version.map(|value| serde_json::Value::String(value.to_owned()));
+                if format == "cyclonedx" {
+                    serde_json::json!({"bomFormat": "CycloneDX", "components": [{
+                        "name": "a", "version": version, "purl": purl
+                    }]})
+                } else {
+                    serde_json::json!({"spdxVersion": "SPDX-2.3", "packages": [{
+                        "SPDXID": "SPDXRef-a", "name": "a", "versionInfo": version,
+                        "externalRefs": [{"referenceType": "purl", "referenceLocator": purl}]
+                    }]})
+                }
+            };
+            for version in [None, Some("1!2.0+local")] {
+                let input =
+                    serde_json::to_vec(&document(version, "pkg:pypi/a@1%212.0%2Blocal")).unwrap();
+                let inventory = parse_cyclonedx(&input).unwrap();
+                let component = inventory.components.values().next().unwrap();
+                assert_eq!(component.version, "1!2.0+local", "{format}");
+                assert_eq!(component.purl, "pkg:pypi/a@1%212.0%2Blocal");
+            }
+            for purl in ["pkg:pypi/a@2.0", "pkg:pypi/a@1%2", "pkg:pypi/a@1%FF"] {
+                let input = serde_json::to_vec(&document(Some("1.0"), purl)).unwrap();
+                assert!(
+                    matches!(
+                        parse_cyclonedx(&input),
+                        Err(SbomError::InvalidComponent { field: "purl", .. })
+                    ),
+                    "{format}: {purl}"
+                );
+            }
+        }
     }
 
     #[test]

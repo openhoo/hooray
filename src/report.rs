@@ -8,7 +8,7 @@ use std::{
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
 };
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 use serde::Serialize;
@@ -552,7 +552,40 @@ fn publish_directory_no_replace(staging: &Path, destination: &Path) -> Result<()
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_os = "macos")]
+fn publish_directory_no_replace(staging: &Path, destination: &Path) -> Result<(), ReportError> {
+    let old = CString::new(staging.as_os_str().as_bytes()).map_err(|_| {
+        ReportError::InvalidDestination {
+            path: staging.to_path_buf(),
+            reason: "staging path contains NUL".into(),
+        }
+    })?;
+    let new = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        ReportError::InvalidDestination {
+            path: destination.to_path_buf(),
+            reason: "destination path contains NUL".into(),
+        }
+    })?;
+    // SAFETY: both pointers reference live NUL-terminated byte strings.
+    // RENAME_EXCL atomically refuses any existing destination, including
+    // empty directories and symlinks, without a check-then-rename race.
+    let result = unsafe { libc::renamex_np(old.as_ptr(), new.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let source = io::Error::last_os_error();
+    if source.kind() == io::ErrorKind::AlreadyExists {
+        Err(ReportError::DestinationExists(destination.to_path_buf()))
+    } else {
+        Err(ReportError::Publish {
+            staging: staging.to_path_buf(),
+            destination: destination.to_path_buf(),
+            source,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 fn publish_directory_no_replace(_staging: &Path, destination: &Path) -> Result<(), ReportError> {
     Err(ReportError::UnsupportedAtomicPublication(
         destination.to_path_buf(),
@@ -3050,7 +3083,7 @@ mod tests {
         assert!(rendered["licenses"][0]["license"].get("id").is_none());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn gitlab_artifact_bundle_is_complete_private_and_no_clobber() {
         use std::os::unix::fs::PermissionsExt;
@@ -3100,6 +3133,32 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".hooray-gitlab-")
         }));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn atomic_bundle_publication_preserves_existing_empty_directory_and_symlink() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("marker"), "staged").unwrap();
+        let destination = directory.path().join("existing");
+        fs::create_dir(&destination).unwrap();
+        assert!(matches!(
+            publish_directory_no_replace(&staging, &destination),
+            Err(ReportError::DestinationExists(_))
+        ));
+        assert!(staging.join("marker").exists());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        let link = directory.path().join("link");
+        symlink(&destination, &link).unwrap();
+        assert!(matches!(
+            publish_directory_no_replace(&staging, &link),
+            Err(ReportError::DestinationExists(_))
+        ));
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(staging.join("marker").exists());
     }
 
     #[test]

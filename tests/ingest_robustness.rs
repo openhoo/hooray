@@ -125,9 +125,21 @@ fn no_pipeline_panics_on_mutated_fixtures() {
     // Positive controls: pristine fixtures must reach the pipeline.
     for source in &sources {
         executed += 1;
-        let dir = source.parent();
+        // Keep controls independent of ignore files in the developer's
+        // home/repository ancestors. Preserve sibling manifests so project
+        // lockfiles retain their declaration/license context.
+        let case_dir = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(source.parent().expect("fixture parent")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), case_dir.path().join(entry.file_name())).unwrap();
+            }
+        }
+        let case_path = case_dir
+            .path()
+            .join(source.file_name().expect("fixture filename"));
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_case(source, dir, &policy)
+            run_case(&case_path, Some(case_dir.path()), &policy)
         }));
         match &outcome {
             Ok(stage) if stage == "accepted" => control_accepted += 1,
@@ -150,11 +162,6 @@ fn no_pipeline_panics_on_mutated_fixtures() {
             Ok(bytes) => bytes,
             Err(_) => continue,
         };
-        let extension = source
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("txt")
-            .to_string();
         let stem = source
             .file_stem()
             .and_then(|e| e.to_str())
@@ -164,7 +171,9 @@ fn no_pipeline_panics_on_mutated_fixtures() {
         for (label, mutated) in mutations(&bytes, stem.len() as u64 + 7) {
             executed += 1;
             let case_dir = tempfile::tempdir().unwrap();
-            let case_path = case_dir.path().join(format!("{stem}.{extension}"));
+            let case_path = case_dir
+                .path()
+                .join(source.file_name().expect("fixture filename"));
             std::fs::write(&case_path, &mutated).unwrap();
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -212,12 +221,7 @@ fn no_pipeline_panics_on_structure_aware_mutations() {
 
     let sources: Vec<PathBuf> = walkdir_sorted(&fixtures_root)
         .into_iter()
-        .filter(|path| {
-            matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("json") | Some("yaml") | Some("yml") | Some("toml")
-            )
-        })
+        .filter(|path| structured_format(path).is_some())
         .collect();
     assert!(!sources.is_empty(), "no structured fixtures found");
 
@@ -230,7 +234,7 @@ fn no_pipeline_panics_on_structure_aware_mutations() {
             Ok(raw) => raw,
             Err(_) => continue,
         };
-        let extension = source.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let format = structured_format(source).expect("filtered structured fixture");
         let stem = source
             .file_stem()
             .and_then(|e| e.to_str())
@@ -239,29 +243,23 @@ fn no_pipeline_panics_on_structure_aware_mutations() {
 
         // Parse to the native Value tree; unparseable fixtures have no deep
         // grammar to attack and are already covered by the byte-flip guard.
-        let base = match extension {
-            "json" => serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .map(|v| v.to_string()),
-            _ => serde_yaml::from_str::<serde_yaml::Value>(&raw)
-                .ok()
-                .and_then(|v| serde_yaml::to_string(&v).ok())
-                .or_else(|| raw.parse::<toml::Table>().ok().map(|v| v.to_string())),
-        };
+        let base = structured_base(format, &raw);
         let Some(base) = base else {
             continue;
         };
 
         let mut state = stem.len() as u64 | 1;
         for round in 0..6 {
-            let mutated = if extension == "json" {
-                mutate_json(&base, &mut state)
-            } else {
-                mutate_lines(&base, &mut state, round)
+            let mutated = match format {
+                "json" => mutate_json(&base, &mut state),
+                "toml" => mutate_toml(&base, &mut state),
+                _ => mutate_lines(&base, &mut state, round),
             };
             executed += 1;
             let case_dir = tempfile::tempdir().unwrap();
-            let case_path = case_dir.path().join(format!("{stem}.{extension}"));
+            let case_path = case_dir
+                .path()
+                .join(source.file_name().expect("fixture filename"));
             std::fs::write(&case_path, &mutated).unwrap();
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -290,6 +288,63 @@ fn no_pipeline_panics_on_structure_aware_mutations() {
         "pipeline defects on structure-mutated input:\n{}",
         panics.join("\n")
     );
+}
+
+fn structured_format(path: &Path) -> Option<&'static str> {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("Cargo.lock" | "poetry.lock") => Some("toml"),
+        Some("Pipfile.lock" | "Package.resolved") => Some("json"),
+        Some("pubspec.lock") => Some("yaml"),
+        _ => match path.extension().and_then(|extension| extension.to_str()) {
+            Some("json") => Some("json"),
+            Some("yaml" | "yml") => Some("yaml"),
+            Some("toml") => Some("toml"),
+            _ => None,
+        },
+    }
+}
+
+fn structured_base(format: &str, raw: &str) -> Option<String> {
+    match format {
+        "json" => serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .map(|v| v.to_string()),
+        "toml" => raw
+            .parse::<toml::Table>()
+            .ok()
+            .and_then(|v| toml::to_string(&v).ok()),
+        _ => serde_yaml::from_str::<serde_yaml::Value>(raw)
+            .ok()
+            .and_then(|v| serde_yaml::to_string(&v).ok()),
+    }
+}
+
+fn mutate_toml(base: &str, state: &mut u64) -> String {
+    let value = base.parse::<toml::Table>().expect("base TOML parses");
+    let mut tree = serde_json::to_value(value).expect("TOML to JSON tree");
+    damage_json(&mut tree, state);
+    let value: toml::Table =
+        serde_json::from_value(tree).expect("mutated tree remains TOML-compatible");
+    toml::to_string(&value).expect("mutated TOML serializes")
+}
+
+#[test]
+fn structured_toml_mutations_keep_native_syntax_and_lockfile_dispatch() {
+    let raw = "[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+    for name in ["Cargo.lock", "poetry.lock", "Cargo.toml"] {
+        let format = structured_format(Path::new(name)).unwrap();
+        assert_eq!(format, "toml");
+        let base = structured_base(format, raw).unwrap();
+        assert!(base.parse::<toml::Table>().unwrap().contains_key("package"));
+        let mut state = 7;
+        for _ in 0..6 {
+            assert!(
+                mutate_toml(&base, &mut state)
+                    .parse::<toml::Table>()
+                    .is_ok()
+            );
+        }
+    }
 }
 
 fn mutate_json(base: &str, state: &mut u64) -> String {

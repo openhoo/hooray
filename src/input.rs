@@ -912,6 +912,7 @@ fn read_limited_below(root: &Path, path: &Path, maximum: u64) -> Result<Vec<u8>,
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_file_bounded(mut file: File, path: &Path, maximum: u64) -> Result<Vec<u8>, InputError> {
     let file_size = file
         .metadata()

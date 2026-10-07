@@ -834,7 +834,10 @@ where
                     continue;
                 }
             };
-            validate_text("source fingerprint", &fingerprint, MAX_ETAG_BYTES)?;
+            if let Err(error) = validate_text("source fingerprint", &fingerprint, MAX_ETAG_BYTES) {
+                self.reschedule_target(&mut target, &error.to_string(), now, &mut summary)?;
+                continue;
+            }
             let source_changed = target.source_fingerprint.as_deref() != Some(fingerprint.as_str());
             let advisory_changed = refresh.changed
                 || target.advisory_digest.as_deref() != Some(advisory_digest.as_str());
@@ -850,7 +853,15 @@ where
                 summary.targets_reevaluated += 1;
                 match self.runner.evaluate(&target).await {
                     Ok(evaluation) => {
-                        evaluation.inventory.validate()?;
+                        if let Err(error) = evaluation.inventory.validate() {
+                            self.reschedule_target(
+                                &mut target,
+                                &error.to_string(),
+                                now,
+                                &mut summary,
+                            )?;
+                            continue;
+                        }
                         let diff =
                             FindingDiff::between(&target.finding_ids, &evaluation.finding_ids);
                         if diff.has_changes() {
@@ -1107,7 +1118,12 @@ fn redact_error(error: &str) -> String {
                 .split_once(['=', ':'])
                 .map_or("secret", |(name, _)| name);
             result.push(format!("{name}=[REDACTED]"));
-            index += 1;
+            // An attached separator with no value (`token: abc` or
+            // `password= abc`) puts the secret in the next word.
+            let separate_value = MARKERS
+                .iter()
+                .any(|marker| trimmed == format!("{marker}=") || trimmed == format!("{marker}:"));
+            index += if separate_value { 2 } else { 1 };
         } else if spaced {
             result.push(format!("{word} = [REDACTED]"));
             index += 3;
@@ -1131,6 +1147,19 @@ mod tests {
 
     use super::*;
     use crate::model::{Asset, AssetId, AssetKind};
+
+    #[test]
+    fn monitor_errors_redact_values_after_attached_assignment_separators() {
+        for marker in ["token", "password", "passwd", "secret", "api_key", "apikey"] {
+            for separator in [":", "="] {
+                let redacted = redact_error(&format!(
+                    "failed {marker}{separator} aaaaaaaaaaaaaaaaaa retry"
+                ));
+                assert!(!redacted.contains("aaaaaaaaaaaaaaaaaa"), "{redacted}");
+                assert!(redacted.contains("retry"));
+            }
+        }
+    }
 
     #[test]
     fn encoded_monitor_times_match_monitor_storage_format() {
@@ -1428,6 +1457,8 @@ mod tests {
         policy: Mutex<String>,
         fingerprint: Mutex<String>,
         fingerprint_error: Mutex<Option<String>>,
+        invalid_fingerprint_target: Mutex<Option<String>>,
+        invalid_inventory_target: Mutex<Option<String>>,
         evaluation_error: Mutex<Option<String>>,
         findings: Mutex<BTreeSet<FindingId>>,
         scans: AtomicUsize,
@@ -1442,6 +1473,8 @@ mod tests {
                 policy: Mutex::new("policy-1".into()),
                 fingerprint: Mutex::new("source-1".into()),
                 fingerprint_error: Mutex::new(None),
+                invalid_fingerprint_target: Mutex::new(None),
+                invalid_inventory_target: Mutex::new(None),
                 evaluation_error: Mutex::new(None),
                 findings: Mutex::new(ids(&["finding-a"])),
                 scans: AtomicUsize::new(0),
@@ -1474,18 +1507,21 @@ mod tests {
         }
         fn source_fingerprint<'a>(
             &'a self,
-            _target: &'a MonitorTarget,
+            target: &'a MonitorTarget,
         ) -> MonitorFuture<'a, Result<String, MonitorError>> {
             Box::pin(async move {
                 if let Some(error) = self.fingerprint_error.lock().unwrap().clone() {
                     return Err(MonitorError::Runner(error));
+                }
+                if self.invalid_fingerprint_target.lock().unwrap().as_deref() == Some(&target.id) {
+                    return Ok(String::new());
                 }
                 Ok(self.fingerprint.lock().unwrap().clone())
             })
         }
         fn evaluate<'a>(
             &'a self,
-            _target: &'a MonitorTarget,
+            target: &'a MonitorTarget,
         ) -> MonitorFuture<'a, Result<Evaluation, MonitorError>> {
             Box::pin(async move {
                 self.scans.fetch_add(1, Ordering::SeqCst);
@@ -1493,8 +1529,12 @@ mod tests {
                 if let Some(error) = self.evaluation_error.lock().unwrap().clone() {
                     return Err(MonitorError::Runner(error));
                 }
+                let mut inventory = inventory();
+                if self.invalid_inventory_target.lock().unwrap().as_deref() == Some(&target.id) {
+                    inventory.asset.name.clear();
+                }
                 Ok(Evaluation {
-                    inventory: inventory(),
+                    inventory,
                     finding_ids: self.findings.lock().unwrap().clone(),
                 })
             })
@@ -1629,6 +1669,44 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!(service.repository().targets["target"].next_due_at, 115);
+    }
+
+    #[tokio::test]
+    async fn invalid_runner_outputs_reschedule_only_the_affected_target() {
+        for invalid_inventory in [false, true] {
+            let mut repository = MemoryRepository::default();
+            let mut poisoned = target(100);
+            poisoned.id = "a-poisoned".into();
+            let mut healthy = target(100);
+            healthy.id = "b-healthy".into();
+            repository.targets.insert(poisoned.id.clone(), poisoned);
+            repository.targets.insert(healthy.id.clone(), healthy);
+            let runner = Arc::new(FakeRunner::new());
+            if invalid_inventory {
+                *runner.invalid_inventory_target.lock().unwrap() = Some("a-poisoned".into());
+            } else {
+                *runner.invalid_fingerprint_target.lock().unwrap() = Some("a-poisoned".into());
+            }
+            let notifier = Arc::new(FakeNotifier::succeeding());
+            let mut service = service(
+                repository,
+                Arc::new(FakeClock::new(100)),
+                runner,
+                notifier.clone(),
+                RetryPolicy::default(),
+            );
+            let summary = service.run_once().await.unwrap();
+            assert_eq!(summary.target_failures.len(), 1);
+            assert_eq!(summary.target_failures[0].target_id, "a-poisoned");
+            assert_eq!(summary.events_created, 1);
+            assert_eq!(notifier.calls.load(Ordering::SeqCst), 1);
+            let targets = &service.repository().targets;
+            assert!(targets["a-poisoned"].next_due_at > 100);
+            assert!(targets["a-poisoned"].inventory.is_none());
+            assert!(targets["a-poisoned"].finding_ids.is_empty());
+            assert_eq!(targets["b-healthy"].next_due_at, 110);
+            assert!(targets["b-healthy"].inventory.is_some());
+        }
     }
 
     #[tokio::test]

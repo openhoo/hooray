@@ -50,12 +50,9 @@ pub(crate) fn scan_oci_tar(path: &Path, config: &Config) -> Result<Inventory, In
                 .map_err(|e| malformed("manifest", "OCI manifest", e))?;
             let config_bytes = outer
                 .get(&blob_path(&manifest.config.digest)?)
-                .map(|bytes| {
-                    verify_digest(&manifest.config.digest, bytes)?;
-                    Ok::<Vec<u8>, InputError>(bytes.clone())
-                })
-                .transpose()?
-                .unwrap_or_default();
+                .ok_or_else(|| InputError::MissingBlob(manifest.config.digest.clone()))?;
+            verify_digest(&manifest.config.digest, config_bytes)?;
+            let config_bytes = config_bytes.clone();
             let filesystem = oci_manifest_filesystem(&manifest, config, |digest| {
                 let bytes = outer
                     .get(&blob_path(digest)?)
@@ -881,6 +878,53 @@ mod tests {
             Err(InputError::DigestMismatch(value)) if value == claimed
         ));
     }
+    #[test]
+    fn oci_tar_requires_the_verified_config_blob() {
+        let dir = tempdir().unwrap();
+        let config_json = br#"{"os":"linux","architecture":"amd64"}"#;
+        let config_digest = sha256(config_json);
+        let manifest = format!(r#"{{"config":{{"digest":"{config_digest}"}},"layers":[]}}"#);
+        let manifest_digest = sha256(manifest.as_bytes());
+        let index = format!(r#"{{"manifests":[{{"digest":"{manifest_digest}"}}]}}"#);
+        let path = dir.path().join("missing-config.tar");
+        write_tar(
+            &path,
+            &[
+                ("oci-layout", b"{}"),
+                ("index.json", index.as_bytes()),
+                (&blob_name(&manifest_digest), manifest.as_bytes()),
+            ],
+        );
+        assert!(
+            matches!(scan_oci_tar(&path, &config()), Err(InputError::MissingBlob(value)) if value == config_digest)
+        );
+        write_tar(
+            &path,
+            &[
+                ("oci-layout", b"{}"),
+                ("index.json", index.as_bytes()),
+                (&blob_name(&manifest_digest), manifest.as_bytes()),
+                (&blob_name(&config_digest), b"corrupted"),
+            ],
+        );
+        assert!(
+            matches!(scan_oci_tar(&path, &config()), Err(InputError::DigestMismatch(value)) if value == config_digest)
+        );
+        write_tar(
+            &path,
+            &[
+                ("oci-layout", b"{}"),
+                ("index.json", index.as_bytes()),
+                (&blob_name(&manifest_digest), manifest.as_bytes()),
+                (&blob_name(&config_digest), config_json),
+            ],
+        );
+        assert_eq!(
+            scan_oci_tar(&path, &config()).unwrap().asset.metadata["os"],
+            "linux"
+        );
+    }
+
     #[test]
     fn opaque_whiteout_removes_only_the_target_directory_contents() {
         let first = tar_bytes(&[
