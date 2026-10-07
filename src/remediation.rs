@@ -296,8 +296,38 @@ fn parse_generic(ecosystem: PackageEcosystem, value: &str) -> Option<VersionKey>
     Some(VersionKey {
         epoch: 0,
         release,
-        suffix: VersionSuffix::Generic(tokenize(pre)?),
+        suffix: VersionSuffix::Generic(if ecosystem == PackageEcosystem::Nuget {
+            tokenize(pre)?
+        } else {
+            semver_prerelease_parts(pre)?
+        }),
     })
+}
+
+// SemVer compares each dot-separated prerelease identifier as a whole.
+// Splitting alphanumeric identifiers into digit runs changes their ordering
+// (alpha11 sorts before alpha2), and lowercasing changes ASCII precedence.
+fn semver_prerelease_parts(value: &str) -> Option<Vec<VersionPart>> {
+    if value.is_empty() {
+        return Some(Vec::new());
+    }
+    value
+        .split('.')
+        .map(|identifier| {
+            if identifier.is_empty()
+                || !identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                return None;
+            }
+            if identifier.bytes().all(|byte| byte.is_ascii_digit()) {
+                identifier.parse().ok().map(VersionPart::Number)
+            } else {
+                Some(VersionPart::Text(identifier.to_owned()))
+            }
+        })
+        .collect()
 }
 
 fn parse_pep440(value: &str) -> Option<VersionKey> {
@@ -901,6 +931,33 @@ mod tests {
             nearest_fixed_version(PackageEcosystem::Npm, "1.0.0-az", ["1.0.0-beta"]),
             Some("1.0.0-beta".to_owned())
         );
+    }
+
+    #[test]
+    fn semver_prerelease_compares_complete_case_sensitive_identifiers() {
+        for ecosystem in [
+            PackageEcosystem::Cargo,
+            PackageEcosystem::Npm,
+            PackageEcosystem::Go,
+        ] {
+            assert_eq!(
+                nearest_fixed_version(ecosystem, "1.0.0-alpha2", ["1.0.0-alpha11"]),
+                None,
+                "{ecosystem:?}"
+            );
+            assert_eq!(
+                nearest_fixed_version(ecosystem, "1.0.0-alpha11", ["1.0.0-alpha2"]),
+                Some("1.0.0-alpha2".to_owned())
+            );
+            assert_eq!(
+                nearest_fixed_version(ecosystem, "1.0.0-a-B", ["1.0.0-a-b"]),
+                Some("1.0.0-a-b".to_owned())
+            );
+            assert_eq!(
+                nearest_fixed_version(ecosystem, "1.0.0-beta.2", ["1.0.0-beta.11"]),
+                Some("1.0.0-beta.11".to_owned())
+            );
+        }
     }
 
     #[test]

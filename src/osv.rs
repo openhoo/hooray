@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
     time::Duration,
 };
 
@@ -67,7 +68,7 @@ pub enum OsvError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("OSV vulnerability contains an empty identifier")]
+    #[error("OSV vulnerability contains an empty or mismatched identifier")]
     InvalidVulnerabilityId,
     #[error("OSV batch response contained {actual} results for {expected} queries")]
     ResultCount { expected: usize, actual: usize },
@@ -149,6 +150,7 @@ impl OsvClient {
 
         let purls: Vec<&str> = components_by_purl.keys().copied().collect();
         let mut vulnerability_ids: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        let unique_ids = Mutex::new(BTreeSet::new());
 
         type PageChain<'a> = std::pin::Pin<
             Box<dyn Future<Output = (usize, Result<BTreeSet<String>, OsvError>)> + Send + 'a>,
@@ -165,7 +167,7 @@ impl OsvClient {
             // own purl.
             // Plain for-loop instead of an iterator-adaptor closure: a
             // closure returning an async block that captures the item's
-            // borrowed fields makes `buffer_unordered` demand a higher-ranked
+            // borrowed fields makes `buffered` demand a higher-ranked
             // FnOnce impl rustc cannot prove ("implementation of FnOnce is
             // not general enough"). Pushing concrete pinned futures keeps
             // every capture owned or borrow-of-self, so no item borrow
@@ -173,14 +175,21 @@ impl OsvClient {
             let mut chains: Vec<PageChain<'_>> = Vec::with_capacity(chunk.len());
             for (index, (purl, result)) in chunk.iter().copied().zip(results).enumerate() {
                 // Own the purl so no borrow of the chunk iteration item
-                // crosses an await inside `buffer_unordered`.
+                // crosses an await inside `buffered`.
                 let purl = purl.to_owned();
+                let unique_ids = &unique_ids;
                 chains.push(Box::pin(async move {
-                    let mut ids: BTreeSet<String> = result
-                        .vulns
-                        .into_iter()
-                        .map(|vulnerability| vulnerability.id)
-                        .collect();
+                    let mut ids = BTreeSet::new();
+                    if let Err(error) = self.insert_vulnerability_ids(
+                        &mut ids,
+                        unique_ids,
+                        result
+                            .vulns
+                            .into_iter()
+                            .map(|vulnerability| vulnerability.id),
+                    ) {
+                        return (index, Err(error));
+                    }
                     let mut page_token = result.next_page_token;
                     let mut pages = 0usize;
                     while let Some(token) = page_token.filter(|token| !token.is_empty()) {
@@ -202,53 +211,31 @@ impl OsvClient {
                                 .expect("validated one-result response"),
                             Err(error) => return (index, Err(error)),
                         };
-                        ids.extend(page.vulns.into_iter().map(|vulnerability| vulnerability.id));
+                        if let Err(error) = self.insert_vulnerability_ids(
+                            &mut ids,
+                            unique_ids,
+                            page.vulns.into_iter().map(|vulnerability| vulnerability.id),
+                        ) {
+                            return (index, Err(error));
+                        }
                         page_token = page.next_page_token;
                     }
                     (index, Ok(ids))
                 }));
             }
-            let outcomes = stream::iter(chains)
-                .buffer_unordered(self.concurrency.max(1))
-                .collect::<Vec<(usize, Result<BTreeSet<String>, OsvError>)>>()
-                .await;
-
-            // Completion order is nondeterministic, so outcomes are scattered
-            // back to their chunk positions before merging: per-purl sets land
-            // in the purl-keyed map independently of order, and the first
-            // failure in purl order is surfaced, matching the previous
-            // sequential first-error behavior.
-            let mut slots: Vec<Option<Result<BTreeSet<String>, OsvError>>> =
-                (0..chunk.len()).map(|_| None).collect();
-            for (index, outcome) in outcomes {
-                slots[index] = Some(outcome);
-            }
-            for (purl, outcome) in chunk.iter().copied().zip(slots) {
-                match outcome.expect("every chunk purl records a chain outcome") {
-                    Ok(ids) => vulnerability_ids.entry(purl).or_default().extend(ids),
-                    Err(error) => return Err(error),
-                }
+            // Ordered buffering preserves purl-order errors while retaining
+            // only a bounded number of completed chains. The shared budget
+            // admits IDs during page consumption, before any next-page fetch.
+            let mut outcomes = stream::iter(chains).buffered(self.concurrency);
+            while let Some((index, outcome)) = outcomes.next().await {
+                vulnerability_ids.insert(chunk[index], outcome?);
             }
         }
 
-        let unique_ids: BTreeSet<String> = vulnerability_ids
-            .values()
-            .flat_map(|ids| ids.iter().cloned())
-            .collect();
-        // Page count is bounded per purl, but ids per page are not: a mirror
-        // could return millions of distinct ids and force an unbounded number
-        // of detail fetches plus a full `Vulnerability` retained per id.
-        if unique_ids.len() > MAX_VULN_DETAILS {
-            return Err(OsvError::TooLarge {
-                endpoint: format!(
-                    "{}v1/vulns ({} distinct ids)",
-                    self.base_url,
-                    unique_ids.len()
-                ),
-                actual: unique_ids.len(),
-                maximum: MAX_VULN_DETAILS,
-            });
-        }
+        let unique_ids = unique_ids
+            .into_inner()
+            .expect("advisory budget lock is not poisoned");
+
         let details = stream::iter(unique_ids.into_iter().map(|id| async move {
             let detail = self.fetch_vulnerability(&id).await?;
             Ok::<_, OsvError>((id, detail))
@@ -265,6 +252,48 @@ impl OsvClient {
             &details,
             Some(inventory),
         )
+    }
+
+    /// Enforce the distinct-advisory budget during accumulation, before another
+    /// continuation page or batch can be requested. Duplicate IDs do not spend
+    /// the budget again, either within a page chain or across components.
+    fn insert_vulnerability_ids(
+        &self,
+        ids: &mut BTreeSet<String>,
+        budget: &Mutex<BTreeSet<String>>,
+        incoming: impl IntoIterator<Item = String>,
+    ) -> Result<(), OsvError> {
+        let mut unique_ids = budget.lock().expect("advisory budget lock is not poisoned");
+        if unique_ids.len() > MAX_VULN_DETAILS {
+            return Err(OsvError::TooLarge {
+                endpoint: format!(
+                    "{}v1/vulns ({} distinct ids)",
+                    self.base_url,
+                    unique_ids.len()
+                ),
+                actual: unique_ids.len(),
+                maximum: MAX_VULN_DETAILS,
+            });
+        }
+        for id in incoming {
+            if id.trim().is_empty() {
+                return Err(OsvError::InvalidVulnerabilityId);
+            }
+            unique_ids.insert(id.clone());
+            if unique_ids.len() > MAX_VULN_DETAILS {
+                return Err(OsvError::TooLarge {
+                    endpoint: format!(
+                        "{}v1/vulns ({} distinct ids)",
+                        self.base_url,
+                        unique_ids.len()
+                    ),
+                    actual: unique_ids.len(),
+                    maximum: MAX_VULN_DETAILS,
+                });
+            }
+            ids.insert(id);
+        }
+        Ok(())
     }
 
     async fn query_batch(&self, queries: &[Query<'_>]) -> Result<Vec<QueryResult>, OsvError> {
@@ -310,7 +339,13 @@ impl OsvClient {
                 endpoint: endpoint.to_string(),
                 source,
             })?;
-        decode_response(response, &endpoint).await
+        let vulnerability: Vulnerability = decode_response(response, &endpoint).await?;
+        // Check before the withdrawal filter: an unrelated withdrawn document
+        // must never turn a queried advisory into an apparently clean result.
+        if vulnerability.id.trim().is_empty() || vulnerability.id != id {
+            return Err(OsvError::InvalidVulnerabilityId);
+        }
+        Ok(vulnerability)
     }
 }
 
@@ -2278,6 +2313,89 @@ mod tests {
                 actual: 0
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn rejects_substituted_advisory_details_before_withdrawal_filtering() {
+        for extra in [json!({}), json!({"withdrawn": "2026-01-01T00:00:00Z"})] {
+            let error = scan_failing_via(
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "results": [{"vulns": [{"id": "OSV-detail"}]}]
+                })),
+                Some(ResponseTemplate::new(200).set_body_json(detail("OSV-substitute", extra))),
+            )
+            .await;
+            assert!(matches!(error, OsvError::InvalidVulnerabilityId));
+        }
+    }
+
+    #[tokio::test]
+    async fn stops_remaining_page_chains_when_global_advisory_budget_is_exceeded() {
+        let server = MockServer::start().await;
+        let vulns: Vec<_> = (0..=MAX_VULN_DETAILS)
+            .map(|index| json!({"id": format!("OSV-{index}")}))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {"vulns": &vulns[..6000]},
+                    {"vulns": &vulns[6000..], "next_page_token": "second-must-not-be-fetched"},
+                    {"next_page_token": "must-not-be-fetched"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let error = OsvClient::new(&server.uri(), 1)
+            .unwrap()
+            .scan(&inventory([
+                component("component:a", "a", "1.0.0", "pkg:cargo/a@1.0.0"),
+                component("component:b", "b", "1.0.0", "pkg:cargo/b@1.0.0"),
+                component("component:c", "c", "1.0.0", "pkg:cargo/c@1.0.0"),
+            ]))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OsvError::TooLarge { maximum, .. }
+            if maximum == MAX_VULN_DETAILS));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_advisory_limit_before_fetching_continuation_pages() {
+        let server = MockServer::start().await;
+        let purl = "pkg:cargo/failure@1.0.0";
+        let vulns: Vec<_> = (0..=MAX_VULN_DETAILS)
+            .map(|index| json!({"id": format!("OSV-{index}")}))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(json!({"queries": [{"package": {"purl": purl}}]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"vulns": vulns, "next_page_token": "more"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .and(body_json(
+                json!({"queries": [{"package": {"purl": purl}, "page_token": "more"}]}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": [{}]})))
+            .mount(&server)
+            .await;
+        let error = OsvClient::new(&server.uri(), 1)
+            .unwrap()
+            .scan(&inventory([component(
+                "component:failure",
+                "failure",
+                "1.0.0",
+                purl,
+            )]))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OsvError::TooLarge { actual, maximum, .. }
+            if actual == MAX_VULN_DETAILS + 1 && maximum == MAX_VULN_DETAILS));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

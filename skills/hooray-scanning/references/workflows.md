@@ -26,7 +26,8 @@ Rules sort by descending priority then ID; default outcome applies if none
 match. `fail_closed.unknown_applicability` and `unknown_licenses` are available
 when those unknowns should block. Exceptions have ID, owner, reason, ticket,
 RFC3339 expiry, and at least one exact selector; selector globs are forbidden.
-Overriding fail-closed denial needs its exact fail-closed policy ID. Never invent
+Overriding fail-closed denial needs its exact fail-closed policy ID. If both
+unknown guards deny, each requires its own valid exception. Never invent
 an approval owner/ticket or silently disable fail-closed behavior.
 
 ## Comparable history
@@ -52,8 +53,8 @@ different spelling. Supported full-report formats include JSON/YAML/table,
 SARIF, JUnit, HTML, CycloneDX-VEX, SPDX, CSV, and JSON-lines. Inventory/history/
 standalone policy evaluation support JSON/YAML only.
 
-The `gitlab-artifacts` format creates an atomic directory bundle on Linux/
-Android only; the destination parent must exist and destination must not.
+The `gitlab-artifacts` format creates an atomic directory bundle on Linux,
+Android, and macOS; the destination parent must exist and destination must not.
 Do not call an unsupported platform/output result a successful scan.
 
 Use the release-verified scan action or a generated integration, review the

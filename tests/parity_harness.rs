@@ -108,12 +108,44 @@ async fn run_pinned_offline(input: ScanInput) -> ScanReport {
     engine.scan(request).await.expect("pinned scan")
 }
 
+/// Copies a committed case below a temporary root, retaining its directory
+/// name for asset/license attribution and preserving every fixture byte.
+/// Real scans must reject unsafe ancestor ignore files; the replay harness
+/// must not depend on ignore files in the developer's home directory.
+#[cfg(feature = "parity")]
+fn staged_case(case_path: &Path) -> (tempfile::TempDir, PathBuf) {
+    fn copy(source: &Path, destination: &Path) {
+        let metadata = std::fs::symlink_metadata(source).expect("fixture metadata");
+        if metadata.is_dir() {
+            std::fs::create_dir(destination).expect("staged fixture directory");
+            for entry in std::fs::read_dir(source).expect("fixture directory entries") {
+                let entry = entry.expect("fixture directory entry");
+                copy(&entry.path(), &destination.join(entry.file_name()));
+            }
+        } else {
+            assert!(
+                metadata.is_file(),
+                "nonregular fixture: {}",
+                source.display()
+            );
+            std::fs::copy(source, destination).expect("stage fixture bytes");
+        }
+    }
+    let directory = tempfile::tempdir().expect("temporary corpus root");
+    let path = directory
+        .path()
+        .join(case_path.file_name().expect("case filename"));
+    copy(case_path, &path);
+    (directory, path)
+}
+
 /// Shared pinned pipeline for one corpus case: resolve the scannable input
 /// through the kind-aware corpus resolver, scan offline with pinned run
 /// identity, and normalize to the canonical report.
 #[cfg(feature = "parity")]
 async fn normalized_case_scan(case_id: &str, kind: &str, case_path: &Path) -> CanonicalReport {
-    let input = corpus::scan_input_for_kind(kind, case_path, &offline_config())
+    let (_staging, staged_path) = staged_case(case_path);
+    let input = corpus::scan_input_for_kind(kind, &staged_path, &offline_config())
         .expect("corpus case input classifies");
     let report = run_pinned_offline(input).await;
     normalize::normalize_hooray(&report, case_id, "offline").expect("normalization succeeds")

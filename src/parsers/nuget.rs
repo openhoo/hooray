@@ -183,9 +183,12 @@ pub(crate) fn parse_nuget_lock(
         .get("dependencies")
         .and_then(Value::as_object)
         .ok_or_else(|| malformed_msg(path, "packages.lock.json", "missing dependencies object"))?;
-    let mut ids = LockComponents::new();
     let mut entries = 0_usize;
     for packages in frameworks.values().filter_map(Value::as_object) {
+        // A framework selects its own resolved versions. Components remain
+        // shared in the inventory, but edges cannot use another framework's
+        // same-named package or invent a cross-framework dependency.
+        let mut ids = LockComponents::new();
         for (name, package) in packages {
             entries += 1;
             entry_bound(entries, path, "packages.lock.json")?;
@@ -220,8 +223,6 @@ pub(crate) fn parse_nuget_lock(
                 .or_default()
                 .insert(version.to_owned(), id);
         }
-    }
-    for packages in frameworks.values().filter_map(Value::as_object) {
         for (name, package) in packages {
             let version = package
                 .get("resolved")
@@ -259,6 +260,38 @@ mod tests {
     use crate::model::Scope;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn nuget_lock_dependency_edges_stay_in_their_target_framework() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("packages.lock.json"), r#"{"dependencies":{
+            "net6.0":{"App":{"type":"Direct","resolved":"1.0.0","dependencies":{"Shared":">= 1"}},"Shared":{"type":"Transitive","resolved":"1.0.0"}},
+            "net8.0":{"App":{"type":"Direct","resolved":"2.0.0","dependencies":{"Shared":">= 1","Other":">= 1"}},"Shared":{"type":"Transitive","resolved":"2.0.0"}},
+            "net9.0":{"Other":{"type":"Direct","resolved":"3.0.0"}}
+        }}"#).unwrap();
+        let inventory = scan_path(dir.path(), &config()).unwrap();
+        let edges: std::collections::BTreeSet<_> = inventory
+            .dependencies
+            .iter()
+            .map(|edge| {
+                let from = &inventory.components[&edge.from];
+                let to = &inventory.components[&edge.to];
+                (
+                    from.name.as_str(),
+                    from.version.as_str(),
+                    to.name.as_str(),
+                    to.version.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            edges,
+            std::collections::BTreeSet::from([
+                ("app", "1.0.0", "shared", "1.0.0"),
+                ("app", "2.0.0", "shared", "2.0.0"),
+            ])
+        );
+    }
 
     #[test]
     fn directory_packages_props_produces_nuget_components() {

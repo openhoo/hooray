@@ -161,16 +161,28 @@ pub(crate) fn jsonc_to_json(text: &str) -> String {
                 i += 1;
             }
             b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(b' ');
+                while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
                     i += 1;
                 }
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                out.push(b' ');
                 i += 2;
                 while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    if matches!(bytes[i], b'\n' | b'\r') {
+                        out.push(bytes[i]);
+                    }
                     i += 1;
                 }
-                i = (i + 2).min(bytes.len());
+                if i + 1 >= bytes.len() {
+                    // Keep an invalid JSON token so the caller rejects an
+                    // unterminated block comment instead of accepting a
+                    // truncated but otherwise valid document.
+                    out.extend_from_slice(b"/*");
+                    break;
+                }
+                i += 2;
             }
             b',' => {
                 let mut j = i + 1;
@@ -179,7 +191,7 @@ pub(crate) fn jsonc_to_json(text: &str) -> String {
                         Some(b) if b.is_ascii_whitespace() => j += 1,
                         Some(b'/') if bytes.get(j + 1) == Some(&b'/') => {
                             j += 2;
-                            while j < bytes.len() && bytes[j] != b'\n' {
+                            while j < bytes.len() && !matches!(bytes[j], b'\n' | b'\r') {
                                 j += 1;
                             }
                         }
@@ -205,7 +217,7 @@ pub(crate) fn jsonc_to_json(text: &str) -> String {
             }
         }
     }
-    String::from_utf8(out).expect("JSONC sanitization only removes ASCII bytes")
+    String::from_utf8(out).expect("JSONC sanitization only replaces ASCII bytes")
 }
 
 #[cfg(test)]

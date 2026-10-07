@@ -1002,14 +1002,57 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 fn redact_secrets(value: &str) -> String {
+    const MARKERS: [&str; 7] = [
+        "token", "password", "passwd", "secret", "api_key", "apikey", "key",
+    ];
     let mut output = String::with_capacity(value.len());
-    for token in value.split_inclusive(char::is_whitespace) {
+    let mut tokens = value.split_inclusive(char::is_whitespace).peekable();
+    let mut redact_next = false;
+    while let Some(token) = tokens.next() {
         let word_end = token.trim_end_matches(char::is_whitespace).len();
         let (word, suffix) = token.split_at(word_end);
-        if looks_secret(word) {
+        // Whitespace-only tokens must not consume a pending secret value.
+        if word.is_empty() {
+            output.push_str(suffix);
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        let trimmed = lower.trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']'
+            )
+        });
+        if redact_next {
             output.push_str(REDACTED);
+            redact_next = false;
+        } else if looks_secret(word) {
+            output.push_str(REDACTED);
+            redact_next = MARKERS
+                .iter()
+                .any(|marker| trimmed == format!("{marker}=") || trimmed == format!("{marker}:"));
         } else {
             output.push_str(word);
+            if trimmed == "bearer" {
+                redact_next = true;
+            } else if MARKERS.contains(&trimmed)
+                && tokens
+                    .clone()
+                    .find(|next| !next.trim().is_empty())
+                    .is_some_and(|next| matches!(next.trim(), "=" | ":" | ":="))
+            {
+                // Keep the non-secret assignment syntax, then redact its
+                // value. Look past whitespace without consuming that value.
+                output.push_str(suffix);
+                for separator in tokens.by_ref() {
+                    output.push_str(separator);
+                    if !separator.trim().is_empty() {
+                        break;
+                    }
+                }
+                redact_next = true;
+                continue;
+            }
         }
         output.push_str(suffix);
     }
@@ -1067,7 +1110,11 @@ fn truncate_utf8(value: &str, maximum: usize) -> String {
     }
     const NOTE: &str = "… [truncated]";
     if maximum <= NOTE.len() {
-        return NOTE[..maximum].to_owned();
+        let mut end = maximum;
+        while !NOTE.is_char_boundary(end) {
+            end -= 1;
+        }
+        return NOTE[..end].to_owned();
     }
     let mut end = maximum - NOTE.len();
     while !value.is_char_boundary(end) {
@@ -1241,6 +1288,57 @@ mod tests {
     fn json_artifact(artifact: GeneratedArtifact) -> Value {
         assert_eq!(artifact.content_type, "application/json");
         serde_json::from_slice(&artifact.body).unwrap()
+    }
+
+    #[test]
+    fn generated_integrations_redact_spaced_secret_values() {
+        for text in [
+            "Authorization: Bearer confidential-value retry",
+            "failed token: confidential-value retry",
+            "failed password = confidential-value retry",
+            "failed password  =  confidential-value retry",
+            "failed token : confidential-value retry",
+            "failed token:   confidential-value retry",
+            "failed api_key= confidential-value retry",
+        ] {
+            let mut finding = finding(
+                "sensitive",
+                FindingKind::Vulnerability,
+                Severity::High,
+                false,
+            );
+            finding.summary = Some(text.into());
+            finding.details = Some(text.into());
+            let artifact = generator(10).github_sarif(&report(vec![finding])).unwrap();
+            assert!(
+                !artifact.text().unwrap().contains("confidential-value"),
+                "{text}"
+            );
+            assert!(artifact.text().unwrap().contains("retry"));
+        }
+    }
+
+    #[test]
+    fn tiny_text_limits_preserve_utf8_without_panicking() {
+        for maximum in 1..=16 {
+            let generator = IntegrationGenerator::new(IntegrationLimits {
+                max_text_bytes: maximum,
+                ..IntegrationLimits::default()
+            })
+            .unwrap();
+            let artifact = generator
+                .github_sarif(&report(vec![finding(
+                    "long-message",
+                    FindingKind::Vulnerability,
+                    Severity::High,
+                    false,
+                )]))
+                .unwrap();
+            let value = json_artifact(artifact);
+            for result in value["runs"][0]["results"].as_array().unwrap() {
+                assert!(result["message"]["text"].as_str().unwrap().len() <= maximum);
+            }
+        }
     }
 
     #[test]

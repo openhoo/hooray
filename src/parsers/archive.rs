@@ -170,7 +170,13 @@ fn read_zip<R: Read + io::Seek>(
         }
         let expected = entry.size();
         let bytes = read_entry_bounded(&mut entry, expected, &path, "ZIP", config, &mut expanded)?;
-        files.insert(path, bytes);
+        if files.insert(path.clone(), bytes).is_some() {
+            return Err(malformed_msg(
+                path,
+                "ZIP",
+                "duplicate normalized entry path",
+            ));
+        }
     }
     Ok(files)
 }
@@ -284,7 +290,13 @@ pub(crate) fn read_tar_with_expanded<R: Read>(
         }
         let expected = entry.size();
         let bytes = read_entry_bounded(&mut entry, expected, &path, "TAR", config, expanded)?;
-        files.insert(path, bytes);
+        if files.insert(path.clone(), bytes).is_some() {
+            return Err(malformed_msg(
+                path,
+                "TAR",
+                "duplicate normalized entry path",
+            ));
+        }
     }
     Ok(files)
 }
@@ -360,6 +372,33 @@ mod tests {
             Err(InputError::PathTraversal(_))
         ));
     }
+    #[test]
+    fn archive_duplicate_normalized_members_fail_closed() {
+        let tar = tar_bytes(&[
+            ("requirements.txt", b"vulnerable==1\n"),
+            ("./requirements.txt", b"safe==2\n"),
+        ]);
+        assert!(matches!(
+            read_tar(Cursor::new(tar), &config()),
+            Err(InputError::Malformed { .. })
+        ));
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, content) in [
+            ("requirements.txt", "vulnerable==1\n"),
+            ("./requirements.txt", "safe==2\n"),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        let zip = writer.finish().unwrap().into_inner();
+        assert!(matches!(
+            read_zip(Cursor::new(zip), &config()),
+            Err(InputError::Malformed { .. })
+        ));
+    }
+
     #[test]
     fn skips_curdir_root_entries_and_still_rejects_traversal() {
         // `tar -cf out.tar -C dir .` emits a `./` root directory entry and

@@ -313,7 +313,7 @@ impl Store {
             "retention:{}:{}:{}",
             occurred_at,
             timestamp,
-            crate::util::sha256_hex(format!("{occurred_at}:{timestamp}:{deleted}").as_bytes())
+            uuid::Uuid::new_v4()
         );
         transaction.execute("INSERT INTO retention_events(occurred_at,cutoff_at,deleted_runs,details_json) VALUES (?1,?2,?3,'{}')", params![occurred_at, timestamp, i64::try_from(deleted).unwrap_or(i64::MAX)])?;
         transaction.execute("INSERT INTO audit_events(event_id,occurred_at,actor,action,resource_type,resource_id,details_json) VALUES (?1,?2,'system','retention.delete','scan_run',?3,json_object('deleted_runs',?4))", params![event_id, occurred_at, timestamp, i64::try_from(deleted).unwrap_or(i64::MAX)])?;
@@ -906,6 +906,22 @@ mod tests {
                 "inventory filter mask {mask}"
             );
         }
+    }
+
+    #[test]
+    fn repeated_retention_calls_record_distinct_audit_events() {
+        let mut store = Store::open_memory().unwrap();
+        for _ in 0..100 {
+            assert_eq!(store.delete_before("2026-01-01T00:00:00Z").unwrap(), 0);
+        }
+        assert_eq!(store.list_audit_events(100, 0).unwrap().len(), 100);
+        let retained: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM retention_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained, 100);
     }
 
     #[test]
