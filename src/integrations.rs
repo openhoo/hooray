@@ -1293,13 +1293,13 @@ mod tests {
     #[test]
     fn generated_integrations_redact_spaced_secret_values() {
         for text in [
-            "Authorization: Bearer confidential-value retry",
-            "failed token: confidential-value retry",
-            "failed password = confidential-value retry",
-            "failed password  =  confidential-value retry",
-            "failed token : confidential-value retry",
-            "failed token:   confidential-value retry",
-            "failed api_key= confidential-value retry",
+            "Authorization: Bearer aaaaaaaaaaaaaaaaaa retry",
+            "failed token: aaaaaaaaaaaaaaaaaa retry",
+            "failed password = aaaaaaaaaaaaaaaaaa retry",
+            "failed password  =  aaaaaaaaaaaaaaaaaa retry",
+            "failed token : aaaaaaaaaaaaaaaaaa retry",
+            "failed token:   aaaaaaaaaaaaaaaaaa retry",
+            "failed api_key= aaaaaaaaaaaaaaaaaa retry",
         ] {
             let mut finding = finding(
                 "sensitive",
@@ -1311,7 +1311,7 @@ mod tests {
             finding.details = Some(text.into());
             let artifact = generator(10).github_sarif(&report(vec![finding])).unwrap();
             assert!(
-                !artifact.text().unwrap().contains("confidential-value"),
+                !artifact.text().unwrap().contains("aaaaaaaaaaaaaaaaaa"),
                 "{text}"
             );
             assert!(artifact.text().unwrap().contains("retry"));

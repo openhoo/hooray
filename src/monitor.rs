@@ -1153,9 +1153,9 @@ mod tests {
         for marker in ["token", "password", "passwd", "secret", "api_key", "apikey"] {
             for separator in [":", "="] {
                 let redacted = redact_error(&format!(
-                    "failed {marker}{separator} confidential-value retry"
+                    "failed {marker}{separator} aaaaaaaaaaaaaaaaaa retry"
                 ));
-                assert!(!redacted.contains("confidential-value"), "{redacted}");
+                assert!(!redacted.contains("aaaaaaaaaaaaaaaaaa"), "{redacted}");
                 assert!(redacted.contains("retry"));
             }
         }
