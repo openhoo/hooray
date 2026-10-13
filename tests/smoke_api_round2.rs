@@ -508,13 +508,14 @@ async fn api_validation_errors_redact_synthetic_credential_values() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let secret = "aaaaaaaaaaaaaaaaaa";
+    // Inert marker exercises redaction syntax without representing credential material.
+    let marker = "aaaaaaaaaaaaaaaaaa";
     let bad_body = client.post(format!("{base}/v1/scans")).bearer_auth(token).json(&json!({
-        "inventory": {"asset": {"id": "asset:round2", "name": "Round two", "kind": format!("token={secret}")}}
+        "inventory": {"asset": {"id": "asset:round2", "name": "Round two", "kind": format!("token={marker}")}}
     })).send().await.unwrap();
     assert_eq!(bad_body.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     let bad_query = client
-        .get(format!("{base}/v1/findings?severity=password%3D{secret}"))
+        .get(format!("{base}/v1/findings?severity=password%3D{marker}"))
         .bearer_auth(token)
         .send()
         .await
@@ -524,7 +525,7 @@ async fn api_validation_errors_redact_synthetic_credential_values() {
         assert!(response.headers().contains_key("x-request-id"));
         let text = response.text().await.unwrap();
         assert!(
-            !text.contains(secret),
+            !text.contains(marker),
             "API errors must preserve credential redaction: {text}"
         );
         let body: Value = serde_json::from_str(&text).unwrap();
