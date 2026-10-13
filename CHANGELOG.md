@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.10.0 (2026-10-13)
+
+### Features
+
+- **integrations:** add reusable CI reports and tooling exports (#356) (0361fda)
+
+### Bug Fixes
+
+- **parsers:** resolve pnpm workspace deps against ancestor lockfile (#340) (55b25be)
+- harden scanner correctness, policy enforcement, and integrations (#353) (388948b)
+- harden scanner, parsers, reports, and monitoring (#354) (0fd9d77)
+
+### Other Changes
+
+- **hooray:** add contributor and user agent skills (#345) (b641700)
+
 ## 0.9.0 (2026-09-22)
 
 ### Features
