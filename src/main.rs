@@ -63,7 +63,7 @@ enum Command {
     Serve(ServeArgs),
     /// Watch registered targets and notify when findings change
     Monitor(MonitorArgs),
-    /// Generate pre-commit, GitHub Actions, or GitLab CI configuration
+    /// Generate CI configuration or export stored scans for developer tools
     Integrations(IntegrationsArgs),
 }
 
@@ -270,7 +270,10 @@ struct IntegrationsArgs {
 
 #[derive(Debug, Subcommand)]
 enum IntegrationsCommand {
+    /// Generate a CI or pre-commit configuration template
     Generate(IntegrationGenerateArgs),
+    /// Export a stored scan as a bounded integration payload (no delivery)
+    Export(IntegrationExportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -287,6 +290,49 @@ enum IntegrationKind {
     GithubActions,
     GitlabCi,
     GitlabSecurity,
+    AzurePipelines,
+    Jenkins,
+}
+
+#[derive(Debug, Args)]
+struct IntegrationExportArgs {
+    #[arg(value_name = "RUN_ID")]
+    run_id: RunId,
+    #[arg(long, value_enum)]
+    kind: IntegrationExportKind,
+    /// Commit SHA for a GitHub create-check-run payload
+    #[arg(long, value_name = "SHA", required_if_eq("kind", "github-check"))]
+    head_sha: Option<String>,
+    /// HTTPS report link for GitHub Checks or Slack
+    #[arg(long, value_name = "URL")]
+    details_url: Option<String>,
+    /// Exact file:// URI for LSP publishDiagnostics
+    #[arg(long, value_name = "URI", required_if_eq("kind", "lsp"))]
+    document_uri: Option<String>,
+    /// Explicit absolute workspace directory for repository-relative editor locations
+    #[arg(long, value_name = "DIR")]
+    workspace_root: Option<PathBuf>,
+    /// Jira project key for the REST v2 create-issue payload
+    #[arg(long, value_name = "KEY", required_if_eq("kind", "jira"))]
+    project_key: Option<String>,
+    /// Compare against a stored scan of the same asset for the new-finding gate
+    #[arg(long, value_name = "RUN_ID", required_if_eq("kind", "pr-gate"))]
+    baseline: Option<RunId>,
+    /// Maximum findings selected for provider payloads; omissions are reported
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    max_items: u32,
+    #[arg(long, default_value = "-", value_name = "FILE")]
+    output: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum IntegrationExportKind {
+    GithubCheck,
+    Slack,
+    Vscode,
+    Lsp,
+    Jira,
+    PrGate,
 }
 
 #[derive(Debug, Args)]
@@ -306,6 +352,7 @@ enum OutputFormat {
     GitlabSarif,
     Junit,
     Html,
+    Markdown,
     #[value(name = "cyclonedx-vex", alias = "cyclone-dx-vex")]
     CycloneDxVex,
     GitlabCyclonedx,
@@ -376,6 +423,7 @@ impl TryFrom<OutputFormat> for ReportFormat {
             OutputFormat::GitlabSarif => Ok(Self::GitLabSarif),
             OutputFormat::Junit => Ok(Self::Junit),
             OutputFormat::Html => Ok(Self::Html),
+            OutputFormat::Markdown => Ok(Self::Markdown),
             OutputFormat::CycloneDxVex => Ok(Self::CycloneDxVex),
             OutputFormat::GitlabCyclonedx => Ok(Self::GitLabCycloneDx),
             OutputFormat::Spdx => Ok(Self::Spdx),
@@ -423,7 +471,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome> {
         Command::Report(args) => run_report(&config, args),
         Command::Serve(args) => run_serve(config, args).await,
         Command::Monitor(args) => run_monitor(&config, args).await,
-        Command::Integrations(args) => run_integrations(args),
+        Command::Integrations(args) => run_integrations(&config, args),
     }
 }
 
@@ -951,17 +999,252 @@ fn read_bounded(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn run_integrations(args: IntegrationsArgs) -> Result<CommandOutcome> {
-    let IntegrationsCommand::Generate(args) = args.command;
+fn run_integrations(config: &Config, args: IntegrationsArgs) -> Result<CommandOutcome> {
+    match args.command {
+        IntegrationsCommand::Generate(args) => run_integration_generate(args),
+        IntegrationsCommand::Export(args) => run_integration_export(config, args),
+    }
+}
+
+fn run_integration_generate(args: IntegrationGenerateArgs) -> Result<CommandOutcome> {
     let generator = IntegrationGenerator::new(IntegrationLimits::default())?;
     let artifact = match args.kind {
         IntegrationKind::PreCommit => generator.pre_commit_config()?,
         IntegrationKind::GithubActions => generator.github_actions_workflow()?,
         IntegrationKind::GitlabCi => generator.gitlab_ci_include()?,
         IntegrationKind::GitlabSecurity => generator.gitlab_security_ci_include()?,
+        IntegrationKind::AzurePipelines => generator.azure_pipelines_yaml()?,
+        IntegrationKind::Jenkins => generator.jenkins_pipeline()?,
     };
     write_bytes(&artifact.body, &args.output)?;
     Ok(CommandOutcome::Passed)
+}
+
+fn validate_export_options(args: &IntegrationExportArgs) -> Result<()> {
+    for (name, present, supported) in [
+        (
+            "--head-sha",
+            args.head_sha.is_some(),
+            args.kind == IntegrationExportKind::GithubCheck,
+        ),
+        (
+            "--details-url",
+            args.details_url.is_some(),
+            matches!(
+                args.kind,
+                IntegrationExportKind::GithubCheck | IntegrationExportKind::Slack
+            ),
+        ),
+        (
+            "--document-uri",
+            args.document_uri.is_some(),
+            args.kind == IntegrationExportKind::Lsp,
+        ),
+        (
+            "--project-key",
+            args.project_key.is_some(),
+            args.kind == IntegrationExportKind::Jira,
+        ),
+        (
+            "--workspace-root",
+            args.workspace_root.is_some(),
+            matches!(
+                args.kind,
+                IntegrationExportKind::Lsp | IntegrationExportKind::Vscode
+            ),
+        ),
+        (
+            "--baseline",
+            args.baseline.is_some(),
+            args.kind == IntegrationExportKind::PrGate,
+        ),
+    ] {
+        if present && !supported {
+            bail!("{name} is not supported for the selected integration kind");
+        }
+    }
+    if let Some(root) = &args.workspace_root
+        && (!root.is_absolute()
+            || root.to_str().is_none()
+            || root.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+            || root
+                .as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .any(|byte| byte.is_ascii_control()))
+    {
+        bail!(
+            "--workspace-root must be an absolute UTF-8 directory path without parent traversal or controls"
+        );
+    }
+    match args.kind {
+        IntegrationExportKind::GithubCheck => {
+            let sha = args
+                .head_sha
+                .as_deref()
+                .context("--head-sha is required for github-check")?;
+            if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("--head-sha must contain exactly 40 hexadecimal characters");
+            }
+        }
+        IntegrationExportKind::Lsp => {
+            args.document_uri
+                .as_deref()
+                .context("--document-uri is required for lsp")?;
+        }
+        IntegrationExportKind::Jira => {
+            let key = args
+                .project_key
+                .as_deref()
+                .context("--project-key is required for jira")?;
+            if key.is_empty()
+                || key.len() > 255
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            {
+                bail!(
+                    "--project-key must be a 1-255 byte identifier containing only letters, numbers, '_' or '-'"
+                );
+            }
+        }
+        IntegrationExportKind::PrGate => {
+            args.baseline
+                .as_ref()
+                .context("--baseline is required for pr-gate")?;
+        }
+        IntegrationExportKind::Slack | IntegrationExportKind::Vscode => {}
+    }
+    Ok(())
+}
+
+fn run_integration_export(config: &Config, args: IntegrationExportArgs) -> Result<CommandOutcome> {
+    validate_export_options(&args)?;
+    let limits = IntegrationLimits {
+        max_annotations: args.max_items as usize,
+        ..IntegrationLimits::default()
+    };
+    let generator = IntegrationGenerator::new(limits)?;
+    let store = open_store(config)?;
+    let report = required_run(&store, &args.run_id)?;
+    report.validate()?;
+    let projected = args
+        .workspace_root
+        .as_deref()
+        .map(|root| editor_report(&report, root));
+    let editor_report = projected.as_ref().unwrap_or(&report);
+    let mut outcome = classify_report(&report);
+    let payload = match args.kind {
+        IntegrationExportKind::GithubCheck => {
+            let artifact = generator.github_check_run(&report, args.details_url.as_deref())?;
+            let mut payload: serde_json::Value = serde_json::from_slice(&artifact.body)?;
+            payload["head_sha"] = serde_json::json!(args.head_sha);
+            payload["external_id"] = serde_json::json!(report.run.id);
+            payload
+        }
+        IntegrationExportKind::Slack => serde_json::from_slice(
+            &generator
+                .slack_summary(&report, args.details_url.as_deref())?
+                .body,
+        )?,
+        IntegrationExportKind::Vscode => {
+            serde_json::from_slice(&generator.vscode_diagnostics(editor_report)?.body)?
+        }
+        IntegrationExportKind::Lsp => serde_json::from_slice(
+            &generator
+                .lsp_publish_diagnostics(
+                    editor_report,
+                    args.document_uri
+                        .as_deref()
+                        .context("--document-uri is required for lsp")?,
+                )?
+                .body,
+        )?,
+        IntegrationExportKind::Jira => {
+            let mut payload = generator.jira_issue(&report);
+            payload["fields"]["project"] = serde_json::json!({"key": args.project_key});
+            payload
+        }
+        IntegrationExportKind::PrGate => {
+            let baseline = args
+                .baseline
+                .as_ref()
+                .context("--baseline is required for pr-gate")?;
+            let previous = required_run(&store, baseline)?;
+            previous.validate()?;
+            if previous.inventory.asset.id != report.inventory.asset.id {
+                bail!("baseline and current scan must refer to the same asset");
+            }
+            let diff = store.diff_runs(baseline, &args.run_id)?;
+            let gate = generator.pull_request_gate(&diff, &report);
+            outcome = if gate.passed {
+                CommandOutcome::Passed
+            } else {
+                CommandOutcome::PolicyDenied
+            };
+            let mut payload = serde_json::to_value(gate)?;
+            payload["schema_version"] = serde_json::json!("1");
+            payload["baseline_run_id"] = serde_json::json!(baseline);
+            payload["run_id"] = serde_json::json!(report.run.id);
+            payload["resolved_findings"] = serde_json::json!(diff.resolved.len());
+            payload["unchanged_findings"] = serde_json::json!(diff.unchanged.len());
+            payload
+        }
+    };
+    // Provider payloads and final CLI additions share the same budget. Do not
+    // write partial JSON if a project key or external ID takes us over it.
+    let mut bytes = serde_json::to_vec(&payload)?;
+    // Release the potentially large temporary JSON before performing I/O.
+    drop(payload);
+    bytes.push(b'\n');
+    if bytes.len() > limits.max_payload_bytes {
+        bail!(
+            "generated payload exceeds {} bytes",
+            limits.max_payload_bytes
+        );
+    }
+    write_bytes(&bytes, &args.output)?;
+    Ok(outcome)
+}
+
+/// Resolve safe repository paths only when the caller explicitly supplies a
+/// workspace root. Never invent an absolute filesystem location by default.
+fn editor_report(report: &ScanReport, root: &Path) -> ScanReport {
+    let project = |location: &hooray::model::Location| {
+        let mut location = location.clone();
+        let path = Path::new(&location.path);
+        if !path.is_absolute()
+            && !location.path.contains(['\\', ':'])
+            && !location.path.chars().any(char::is_control)
+            && path.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            let absolute: PathBuf = root
+                .components()
+                .chain(
+                    path.components()
+                        .filter(|component| matches!(component, std::path::Component::Normal(_))),
+                )
+                .collect();
+            location.path = absolute.to_string_lossy().into_owned();
+        }
+        location
+    };
+    let mut projected = report.clone();
+    projected.inventory.locations = report.inventory.locations.iter().map(project).collect();
+    for component in projected.inventory.components.values_mut() {
+        component.locations = component.locations.iter().map(project).collect();
+    }
+    projected
 }
 
 fn open_store(config: &Config) -> Result<Store> {
@@ -1438,6 +1721,7 @@ mod tests {
     #[test]
     fn integrations_generate_supported_artifacts_with_parseable_cli_commands() {
         let temp = TempDir::new().unwrap();
+        let config = config(&temp);
         for (kind, marker) in [
             (IntegrationKind::PreCommit, "repos:"),
             (
@@ -1449,12 +1733,15 @@ mod tests {
         ] {
             let destination = temp.path().join(format!("{kind:?}.yaml"));
             assert_eq!(
-                run_integrations(IntegrationsArgs {
-                    command: IntegrationsCommand::Generate(IntegrationGenerateArgs {
-                        kind,
-                        output: destination.clone()
-                    })
-                })
+                run_integrations(
+                    &config,
+                    IntegrationsArgs {
+                        command: IntegrationsCommand::Generate(IntegrationGenerateArgs {
+                            kind,
+                            output: destination.clone()
+                        })
+                    }
+                )
                 .unwrap(),
                 CommandOutcome::Passed
             );

@@ -24,6 +24,10 @@ use crate::util::{is_path_uri_byte, percent_encode, sanitize_cell_text, sha256_h
 
 pub const CANONICAL_REPORT_VERSION: &str = "1.0.0";
 pub const MAX_REPORT_BYTES: usize = 64 * 1024 * 1024;
+/// Portable summaries remain within GitHub/GitLab discussion and CI summary budgets.
+pub const MAX_MARKDOWN_BYTES: usize = 64 * 1024;
+const MAX_MARKDOWN_FINDINGS: usize = 50;
+const MAX_MARKDOWN_POLICIES: usize = 20;
 const MAX_ITEMS: usize = 1_000_000;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const REDACTED: &str = "[REDACTED]";
@@ -33,6 +37,7 @@ pub enum ReportFormat {
     Json,
     Yaml,
     Table,
+    Markdown,
     Sarif,
     GitLabSarif,
     Junit,
@@ -46,10 +51,11 @@ pub enum ReportFormat {
 }
 
 impl ReportFormat {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Json,
         Self::Yaml,
         Self::Table,
+        Self::Markdown,
         Self::Sarif,
         Self::GitLabSarif,
         Self::Junit,
@@ -67,6 +73,7 @@ impl ReportFormat {
             Self::Json => "json",
             Self::Yaml => "yaml",
             Self::Table => "table",
+            Self::Markdown => "markdown",
             Self::Sarif => "sarif",
             Self::GitLabSarif => "gitlab-sarif",
             Self::Junit => "junit",
@@ -85,6 +92,7 @@ impl ReportFormat {
             Self::Json | Self::Spdx | Self::GitLabCodeQuality => "json",
             Self::Yaml => "yaml",
             Self::Table => "txt",
+            Self::Markdown => "md",
             Self::Sarif | Self::GitLabSarif => "sarif",
             Self::Junit => "xml",
             Self::Html => "html",
@@ -99,6 +107,7 @@ impl ReportFormat {
             Self::Json | Self::Spdx | Self::GitLabCodeQuality => "application/json",
             Self::Yaml => "application/yaml",
             Self::Table => "text/plain; charset=utf-8",
+            Self::Markdown => "text/markdown; charset=utf-8",
             Self::Sarif => "application/sarif+json",
             Self::GitLabSarif => "application/sarif+json",
             Self::Junit => "application/xml",
@@ -125,6 +134,7 @@ impl FromStr for ReportFormat {
             "json" => Ok(Self::Json),
             "yaml" | "yml" => Ok(Self::Yaml),
             "table" | "text" => Ok(Self::Table),
+            "markdown" | "md" => Ok(Self::Markdown),
             "sarif" | "sarif-2.1.0" => Ok(Self::Sarif),
             "gitlab-sarif" | "gitlab-sarif-2.1.0" => Ok(Self::GitLabSarif),
             "junit" | "junit-xml" => Ok(Self::Junit),
@@ -240,6 +250,7 @@ fn render_with_limit(
         ReportFormat::Json => render_json(report, limit),
         ReportFormat::Yaml => render_yaml(report, limit),
         ReportFormat::Table => render_table(report, limit, &index),
+        ReportFormat::Markdown => render_markdown(report, limit, &index),
         ReportFormat::Sarif => render_sarif(report, limit, &index),
         ReportFormat::GitLabSarif => render_gitlab_sarif(report, limit, &index),
         ReportFormat::Junit => render_junit(report, limit, &index),
@@ -709,9 +720,394 @@ fn render_table(
     output.finish()
 }
 
+/// Display untrusted text literally, on one line, without terminal controls or
+/// direction overrides. The character bound precedes escaping, so one hostile
+/// field cannot exhaust a portable summary's byte budget.
+fn display_text(value: &str, max_chars: usize) -> String {
+    let mut text = String::new();
+    let mut count = 0;
+    for character in value.chars() {
+        if is_direction_control(character) || character.is_control() && !character.is_whitespace() {
+            continue;
+        }
+        if count >= max_chars {
+            text.push('…');
+            break;
+        }
+        text.push(if character.is_whitespace() {
+            ' '
+        } else {
+            character
+        });
+        count += 1;
+    }
+    text
+}
+
+fn is_direction_control(character: char) -> bool {
+    matches!(character as u32, 0x061c | 0x200b..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069 | 0xfeff)
+}
+
+/// Code spans keep user text literal, including GitHub's mention processing
+/// after entity decoding. Dynamic delimiters protect embedded backticks;
+/// GFM requires escaping pipes even inside a code span in a table cell.
+fn markdown_text(value: &str, max_chars: usize) -> String {
+    let text = display_text(value, max_chars);
+    let longest_ticks = text
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_ticks + 1);
+    // Padding protects fields that begin or end with a backtick. CommonMark
+    // removes one space at each end of a non-whitespace-only code span.
+    format!("{fence} {} {fence}", text.replace('|', "\\|"))
+}
+
+fn finding_policy(index: &ReportIndex<'_>, finding: &Finding) -> Option<PolicyOutcome> {
+    index
+        .policies(&finding.id)
+        .iter()
+        .map(|decision| decision.outcome)
+        .max()
+}
+
+fn finding_policy_label(index: &ReportIndex<'_>, finding: &Finding) -> &'static str {
+    finding_policy(index, finding).map_or("not-evaluated", policy_outcome)
+}
+
+fn prioritized_findings<'a>(report: &'a ScanReport, index: &ReportIndex<'_>) -> Vec<&'a Finding> {
+    let mut findings: Vec<_> = report.findings.values().collect();
+    findings.sort_by(|left, right| {
+        finding_policy(index, right)
+            .cmp(&finding_policy(index, left))
+            .then_with(|| {
+                (left.status == FindingStatus::Resolved)
+                    .cmp(&(right.status == FindingStatus::Resolved))
+            })
+            .then_with(|| right.severity.cmp(&left.severity))
+            .then_with(|| {
+                right
+                    .risk
+                    .as_ref()
+                    .map(|risk| risk.score())
+                    .cmp(&left.risk.as_ref().map(|risk| risk.score()))
+            })
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    findings
+}
+
+fn component_display(report: &ScanReport, finding: &Finding) -> String {
+    finding
+        .component_id
+        .as_ref()
+        .and_then(|id| report.inventory.components.get(id))
+        .map_or_else(
+            || "No component".to_owned(),
+            |component| {
+                format!(
+                    "{}@{}",
+                    display_text(&component.name, 160),
+                    display_text(&component.version, 80)
+                )
+            },
+        )
+}
+
+fn location_display(report: &ScanReport, index: &ReportIndex<'_>, finding: &Finding) -> String {
+    for id in finding.location_id.iter().chain(
+        finding
+            .evidence
+            .iter()
+            .flat_map(|evidence| evidence.locations.iter()),
+    ) {
+        let Some(location) = index.locations.get(id) else {
+            continue;
+        };
+        let Some(path) = repository_relative_path(&location.path) else {
+            continue;
+        };
+        let path = display_text(&path, 240);
+        return location.start.map_or_else(
+            || format!("{path} (line not recorded)"),
+            |position| format!("{path}:{}", position.line),
+        );
+    }
+    finding
+        .component_id
+        .as_ref()
+        .and_then(|id| report.inventory.components.get(id))
+        .and_then(gitlab_component_input_file)
+        .map_or_else(
+            || "No repository location".to_owned(),
+            |path| {
+                format!(
+                    "{} (component input; line not recorded)",
+                    display_text(&path, 220)
+                )
+            },
+        )
+}
+
+fn remediation_display(finding: &Finding) -> String {
+    let Some(remediation) = &finding.remediation else {
+        return "No remediation recorded; investigate before choosing a fix.".to_owned();
+    };
+    let mut text = display_text(&remediation.description, 300);
+    if !remediation.fixed_versions.is_empty() {
+        text.push_str(" Fixed versions: ");
+        text.push_str(
+            &remediation
+                .fixed_versions
+                .iter()
+                .take(5)
+                .map(|version| display_text(version, 80))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        if remediation.fixed_versions.len() > 5 {
+            let _ = write!(
+                text,
+                " ({} more in full report)",
+                remediation.fixed_versions.len() - 5
+            );
+        }
+        text.push('.');
+    }
+    text
+}
+
+fn assessment_note(report: &ScanReport) -> &'static str {
+    match report.run.metadata.get("offline").and_then(Value::as_bool) {
+        Some(true) => {
+            "Offline scan: OSV vulnerability queries were skipped. Configured local checks may still produce findings; zero findings do not establish vulnerability absence."
+        }
+        Some(false) => {
+            "Online scan: findings reflect the recorded checks. Missing severity, applicability, or remediation remains unknown."
+        }
+        None => {
+            "Network assessment coverage is not recorded. Zero findings do not establish vulnerability absence."
+        }
+    }
+}
+
+fn policy_state(report: &ScanReport) -> &'static str {
+    if report.policy_summary.denied > 0 {
+        "DENIED"
+    } else if report.policy_summary.warned > 0 {
+        "WARNINGS"
+    } else if report.policy_decisions.is_empty() {
+        "NOT EVALUATED"
+    } else {
+        "ALLOWED"
+    }
+}
+
+fn markdown_header(report: &ScanReport) -> String {
+    let mut output = format!(
+        "# Hooray security report\n\n**Policy: {}** — {} allow / {} warn / {} deny decisions.\n\n| Scan | Value |\n| --- | --- |\n| Asset | {} |\n| Run | {} |\n| Started | {} |\n| Inventory | {} components / {} dependency edges |\n| Findings | {} total |\n\n",
+        policy_state(report),
+        report.policy_summary.allowed,
+        report.policy_summary.warned,
+        report.policy_summary.denied,
+        markdown_text(&report.inventory.asset.name, 200),
+        markdown_text(report.run.id.as_str(), 200),
+        markdown_text(&report.run.started_at, 80),
+        report.inventory.components.len(),
+        report.inventory.dependencies.len(),
+        report.findings.len(),
+    );
+    output.push_str("| Severity | Critical | High | Medium | Low | Unknown |\n| --- | ---: | ---: | ---: | ---: | ---: |\n| Findings |");
+    for severity in [
+        Severity::Critical,
+        Severity::High,
+        Severity::Medium,
+        Severity::Low,
+        Severity::Unknown,
+    ] {
+        let _ = write!(
+            output,
+            " {} |",
+            report
+                .findings
+                .values()
+                .filter(|finding| finding.severity == severity)
+                .count()
+        );
+    }
+    output.push_str("\n\n");
+    let statuses: Vec<_> = [
+        FindingStatus::Open,
+        FindingStatus::Suppressed,
+        FindingStatus::Resolved,
+        FindingStatus::Unknown,
+    ]
+    .iter()
+    .map(|status| {
+        format!(
+            "{} {}",
+            report
+                .findings
+                .values()
+                .filter(|finding| finding.status == *status)
+                .count(),
+            enum_label(status)
+        )
+    })
+    .collect();
+    let unassessed = report
+        .findings
+        .values()
+        .filter(|finding| {
+            finding.applicability.as_ref().is_none_or(|item| {
+                matches!(
+                    item.status,
+                    ApplicabilityStatus::Unknown | ApplicabilityStatus::UnderInvestigation
+                )
+            })
+        })
+        .count();
+    let _ = write!(
+        output,
+        "Status: {}. Applicability unknown or under investigation: {}.\n\n{}\n\n",
+        statuses.join(" / "),
+        unassessed,
+        assessment_note(report)
+    );
+    if report
+        .run
+        .metadata
+        .get("new_findings_only")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        output
+            .push_str("This scan contains new findings only; baseline findings may be absent.\n\n");
+    }
+    output
+}
+
+fn render_markdown(
+    report: &ScanReport,
+    limit: usize,
+    index: &ReportIndex<'_>,
+) -> Result<Vec<u8>, ReportError> {
+    let limit = limit.min(MAX_MARKDOWN_BYTES);
+    let mut header = markdown_header(report);
+    let mut global: Vec<_> = report
+        .policy_decisions
+        .iter()
+        .filter(|decision| decision.finding_id.is_none())
+        .collect();
+    global.sort_by(|left, right| {
+        right
+            .outcome
+            .cmp(&left.outcome)
+            .then_with(|| left.cmp(right))
+    });
+    if !global.is_empty() {
+        header.push_str(
+            "## Scan policy decisions\n\n| Policy | Outcome | Reason |\n| --- | --- | --- |\n",
+        );
+        for decision in global.iter().take(MAX_MARKDOWN_POLICIES) {
+            let _ = writeln!(
+                header,
+                "| {} | {} | {} |",
+                markdown_text(decision.policy_id.as_str(), 100),
+                policy_outcome(decision.outcome),
+                markdown_text(&decision.reason, 240)
+            );
+        }
+        if global.len() > MAX_MARKDOWN_POLICIES {
+            let _ = writeln!(
+                header,
+                "\n{} additional scan policy decisions omitted; full policy totals are shown above.",
+                global.len() - MAX_MARKDOWN_POLICIES
+            );
+        }
+        header.push('\n');
+    }
+    header.push_str("## Prioritized findings\n\nDeny decisions first, then unresolved findings, severity, risk score, and stable finding ID. Status and policy remain separate assessments.\n\n");
+    if report.findings.is_empty() {
+        header.push_str("No findings recorded. Review assessment coverage above.\n\n");
+    } else {
+        header.push_str("| Severity / kind | Finding | Component / location | Policy / status | Remediation |\n| --- | --- | --- | --- | --- |\n");
+    }
+    let findings = prioritized_findings(report, index);
+    let rows: Vec<_> = findings
+        .iter()
+        .take(MAX_MARKDOWN_FINDINGS)
+        .map(|finding| {
+            let policy_reason = index
+                .policies(&finding.id)
+                .iter()
+                .max_by(|left, right| {
+                    left.outcome
+                        .cmp(&right.outcome)
+                        .then_with(|| right.cmp(left))
+                })
+                .map(|decision| format!(" — {}", markdown_text(&decision.reason, 180)))
+                .unwrap_or_default();
+            format!(
+                "| {} / {} | {}<br>{} | {}<br>{} | {}{} / {} | {} |\n",
+                finding.severity.as_str(),
+                finding.kind.as_str(),
+                markdown_text(
+                    finding
+                        .summary
+                        .as_deref()
+                        .or(finding.details.as_deref())
+                        .unwrap_or(finding.rule_id.as_str()),
+                    240
+                ),
+                markdown_text(finding.id.as_str(), 160),
+                markdown_text(&component_display(report, finding), 250),
+                markdown_text(&location_display(report, index, finding), 260),
+                finding_policy_label(index, finding),
+                policy_reason,
+                enum_label(finding.status),
+                markdown_text(&remediation_display(finding), 760)
+            )
+        })
+        .collect();
+    let footer = |count: usize| {
+        format!(
+            "\nShowing {} of {} findings; {} omitted from this summary. Full report totals and policy outcome are unchanged. Field text may be shortened with an ellipsis; use JSON/SARIF for complete evidence.\n\nHooray canonical format v{}.\n",
+            count,
+            findings.len(),
+            findings.len().saturating_sub(count),
+            CANONICAL_REPORT_VERSION
+        )
+    };
+    let mut output = header;
+    if output.len().saturating_add(footer(0).len()) > limit {
+        return Err(report_limit(limit));
+    }
+    let mut included = 0;
+    for row in rows {
+        if output
+            .len()
+            .saturating_add(row.len())
+            .saturating_add(footer(included + 1).len())
+            > limit
+        {
+            break;
+        }
+        output.push_str(&row);
+        included += 1;
+    }
+    output.push_str(&footer(included));
+    if output.len() > limit {
+        return Err(report_limit(limit));
+    }
+    Ok(output.into_bytes())
+}
+
 pub(crate) struct ReportIndex<'a> {
     roots: BTreeSet<&'a ComponentId>,
     adjacency: BTreeMap<&'a ComponentId, Vec<&'a ComponentId>>,
+    parents: BTreeMap<&'a ComponentId, Vec<&'a ComponentId>>,
     locations: BTreeMap<&'a LocationId, &'a Location>,
     policies: BTreeMap<&'a FindingId, Vec<&'a PolicyDecision>>,
 }
@@ -725,9 +1121,11 @@ impl<'a> ReportIndex<'a> {
             .keys()
             .map(|id| (id, Vec::new()))
             .collect();
+        let mut parents: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for edge in &report.inventory.dependencies {
             roots.remove(&edge.to);
             adjacency.entry(&edge.from).or_default().push(&edge.to);
+            parents.entry(&edge.to).or_default().push(&edge.from);
         }
         if roots.is_empty() {
             roots.extend(report.inventory.components.keys());
@@ -754,6 +1152,7 @@ impl<'a> ReportIndex<'a> {
         Self {
             roots,
             adjacency,
+            parents,
             locations,
             policies,
         }
@@ -770,9 +1169,26 @@ impl<'a> ReportIndex<'a> {
         let Some(target) = finding.component_id.as_ref() else {
             return Vec::new();
         };
+        // A branch that cannot reach this target must not spend the DFS
+        // budget or hide a valid path. Reverse traversal visits each ancestor
+        // once, even with cycles, before the bounded simple-path enumeration.
+        let mut ancestors = BTreeSet::from([target]);
+        let mut pending = vec![target];
+        while let Some(node) = pending.pop() {
+            if let Some(parents) = self.parents.get(node) {
+                for parent in parents {
+                    if ancestors.insert(*parent) {
+                        pending.push(*parent);
+                    }
+                }
+            }
+        }
         let mut paths = Vec::new();
         let mut steps = 0_usize;
         'roots: for root in &self.roots {
+            if !ancestors.contains(root) {
+                continue;
+            }
             let mut stack = vec![(*root, vec![*root], BTreeSet::from([*root]))];
             while let Some((node, path, visited)) = stack.pop() {
                 steps += 1;
@@ -791,7 +1207,7 @@ impl<'a> ReportIndex<'a> {
                 }
                 if let Some(children) = self.adjacency.get(node) {
                     for child in children.iter().rev() {
-                        if !visited.contains(child) {
+                        if ancestors.contains(child) && !visited.contains(child) {
                             let mut next_path = path.clone();
                             next_path.push(child);
                             let mut next_visited = visited.clone();
@@ -960,7 +1376,16 @@ fn render_sarif(
         .collect();
 
     let results: Vec<Value> = report.findings.values().map(|finding| {
-        let locations = sarif_locations(index, finding);
+        let mut locations = sarif_locations(index, finding);
+        if locations.is_empty()
+            && let Some(path) = finding.component_id.as_ref()
+                .and_then(|id| report.inventory.components.get(id))
+                .and_then(gitlab_component_input_file)
+        {
+                // A manifest/lockfile provenance records the input file, not
+                // the dependency's exact line. Preserve that distinction.
+                locations.push(json!({"physicalLocation": {"artifactLocation": {"uri": path_uri(&path)}}, "properties": {"hoorayLocationSource": "component-provenance"}}));
+        }
         let paths = index.paths(finding);
         let evidence: Vec<Value> = finding.evidence.iter().map(|item| json!({
             "description": item.description,
@@ -984,6 +1409,7 @@ fn render_sarif(
             "partialFingerprints": {"primaryLocationLineHash": finding.id.as_str()},
             "properties": {
                 "findingId": finding.id.as_str(), "kind": finding.kind.as_str(),
+                "status": enum_label(finding.status),
                 "severity": finding.severity.as_str(), "componentId": finding.component_id.as_ref().map(|id| id.as_str()),
                 "dependencyPaths": paths, "remediation": remediation, "policyOutcomes": policies,
                 "evidence": evidence, "applicability": finding.applicability
@@ -1461,15 +1887,25 @@ fn render_junit(
     limit: usize,
     index: &ReportIndex<'_>,
 ) -> Result<Vec<u8>, ReportError> {
+    let scan_policies: Vec<_> = report
+        .policy_decisions
+        .iter()
+        .filter(|decision| decision.finding_id.is_none())
+        .collect();
+    let tests = report.findings.len() + scan_policies.len();
     let failures = report
         .findings
         .values()
         .filter(|finding| finding.status != crate::model::FindingStatus::Resolved)
-        .count();
+        .count()
+        + scan_policies
+            .iter()
+            .filter(|decision| decision.outcome == PolicyOutcome::Deny)
+            .count();
     let mut output = BoundedText::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n", limit);
     output.push_str(&format!(
         "<testsuites name=\"hooray\" tests=\"{}\" failures=\"{}\">\n  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" timestamp=\"{}\">\n",
-        report.findings.len(), failures, xml_attr(&report.inventory.asset.name), report.findings.len(), failures,
+        tests, failures, xml_attr(&report.inventory.asset.name), tests, failures,
         xml_attr(&report.run.started_at)
     ));
     for finding in report.findings.values() {
@@ -1498,6 +1934,29 @@ fn render_junit(
         }
         output.push_str("    </testcase>\n");
     }
+    // Scan-level decisions have no finding to carry them. Keep them visible
+    // as independent tests, including a denial when the findings set is empty.
+    for (ordinal, decision) in scan_policies.iter().enumerate() {
+        output.push_str(&format!(
+            "    <testcase classname=\"hooray.policy\" name=\"{}\">\n",
+            xml_attr(&format!(
+                "Scan policy {} #{}",
+                decision.policy_id,
+                ordinal + 1
+            ))
+        ));
+        if decision.outcome == PolicyOutcome::Deny {
+            output.push_str(&format!(
+                "      <failure type=\"policy-deny\" message=\"{}\">{}</failure>\n",
+                xml_attr(&decision.reason),
+                xml_text(&format!(
+                    "Policy {}: deny — {}",
+                    decision.policy_id, decision.reason
+                ))
+            ));
+        }
+        output.push_str("    </testcase>\n");
+    }
     // The JUnit XSD places system-out under <testsuite>, not <testcase>;
     // strict parsers reject testcase-level placement, so the per-finding
     // detail text is emitted once as suite-level output.
@@ -1505,6 +1964,14 @@ fn render_junit(
     for finding in report.findings.values() {
         output.push_str(&xml_text(&finding_detail_text(index, finding)));
         output.push_str("\n");
+    }
+    for decision in scan_policies {
+        output.push_str(&xml_text(&format!(
+            "Scan policy {}: {} — {}\n",
+            decision.policy_id,
+            policy_outcome(decision.outcome),
+            decision.reason
+        )));
     }
     output.push_str("</system-out>\n");
     output.push_str("  </testsuite>\n</testsuites>\n");
@@ -1517,14 +1984,15 @@ fn render_html(
     index: &ReportIndex<'_>,
 ) -> Result<Vec<u8>, ReportError> {
     let mut rows = BoundedText::new(limit);
-    for finding in report.findings.values() {
+    for finding in prioritized_findings(report, index) {
         let details = finding_detail_text(index, finding);
         rows.push_str(&format!(
-            "<tr><td><span class=\"severity {}\">{}</span></td><td>{}</td><td><code>{}</code></td><td>{}</td><td><details><summary>{}</summary><pre>{}</pre></details></td></tr>",
-            finding.severity.as_str(), html_text(finding.severity.as_str()), html_text(finding.kind.as_str()),
-            html_text(finding.id.as_str()),
-            html_text(finding.component_id.as_ref().map_or("-", |id| id.as_str())),
-            html_text(finding.summary.as_deref().unwrap_or(finding.rule_id.as_str())), html_text(&details)
+            "<tr data-severity=\"{}\" data-policy=\"{}\" data-kind=\"{}\"><td><span class=\"severity {}\">{}</span><br><span class=\"muted\">{}</span></td><td><details><summary>{}</summary><pre>{}</pre></details><code class=\"muted finding-id\">{}</code></td><td><strong>{}</strong><br><code>{}</code></td><td><span class=\"policy {}\">{}</span><br><span class=\"muted\">{}</span></td><td>{}</td></tr>",
+            finding.severity.as_str(), finding_policy_label(index, finding), finding.kind.as_str(),
+            finding.severity.as_str(), finding.severity.as_str(), finding.kind.as_str(),
+            html_text(&display_text(finding.summary.as_deref().or(finding.details.as_deref()).unwrap_or(finding.rule_id.as_str()), 300)), html_text(&details),
+            html_text(&display_text(finding.id.as_str(), 160)), html_text(&component_display(report, finding)), html_text(&location_display(report, index, finding)),
+            finding_policy_label(index, finding), finding_policy_label(index, finding), enum_label(finding.status), html_text(&remediation_display(finding)),
         ));
     }
     // Abort at the rows output bound like every other renderer: push_str
@@ -1534,17 +2002,102 @@ fn render_html(
     if rows.exceeded {
         return Err(report_limit(limit));
     }
+    let mut controls = String::new();
+    let mut filter_styles = String::new();
+    for (group, label, values) in [
+        (
+            "severity",
+            "Severity",
+            &[
+                ("critical", "Critical"),
+                ("high", "High"),
+                ("medium", "Medium"),
+                ("low", "Low"),
+                ("unknown", "Unknown"),
+            ][..],
+        ),
+        (
+            "policy",
+            "Policy",
+            &[
+                ("deny", "Deny"),
+                ("warn", "Warn"),
+                ("allow", "Allow"),
+                ("not-evaluated", "Not evaluated"),
+            ][..],
+        ),
+        (
+            "kind",
+            "Kind",
+            &[
+                ("vulnerability", "Vulnerability"),
+                ("secret", "Secret"),
+                ("sast", "SAST"),
+                ("iac", "IaC"),
+                ("license", "License"),
+                ("malware", "Malware"),
+                ("operational-risk", "Operational risk"),
+            ][..],
+        ),
+    ] {
+        let _ = write!(
+            controls,
+            "<fieldset><legend>{label}</legend><label><input type=\"radio\" name=\"{group}\" id=\"{group}-all\" checked>All</label>"
+        );
+        for (value, title) in values {
+            let _ = write!(
+                controls,
+                "<label><input type=\"radio\" name=\"{group}\" id=\"{group}-{value}\">{title}</label>"
+            );
+            let _ = write!(
+                filter_styles,
+                "body:has(#{group}-{value}:checked) tr[data-{group}]:not([data-{group}=\"{value}\"]){{display:none}}"
+            );
+        }
+        controls.push_str("</fieldset>");
+    }
+    let mut policy_details = BoundedText::new(limit);
+    for decision in report
+        .policy_decisions
+        .iter()
+        .filter(|decision| decision.finding_id.is_none())
+    {
+        policy_details.push_str(&format!(
+            "<li><strong>{}</strong> <code>{}</code>: {}</li>",
+            policy_outcome(decision.outcome),
+            html_text(decision.policy_id.as_str()),
+            html_text(&decision.reason)
+        ));
+    }
+    if policy_details.exceeded {
+        return Err(report_limit(limit));
+    }
+    let global = if policy_details.text.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section aria-labelledby=\"scan-policy-title\"><h2 id=\"scan-policy-title\">Scan policy decisions</h2><ul>{}</ul></section>",
+            policy_details.text
+        )
+    };
+    let empty = if report.findings.is_empty() {
+        "<p class=\"empty\">No findings recorded. Review assessment coverage above.</p>"
+    } else {
+        ""
+    };
     let mut output = BoundedText::new(limit);
     let _ = write!(
         output,
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\"><title>Hooray security report</title><style>:root{{color-scheme:light dark;font-family:system-ui,sans-serif}}body{{max-width:1200px;margin:auto;padding:2rem}}header{{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:1rem}}.card{{border:1px solid #7777;border-radius:.5rem;padding:1rem}}table{{border-collapse:collapse;width:100%;margin-top:2rem}}th,td{{padding:.65rem;border-bottom:1px solid #7777;text-align:left;vertical-align:top}}code,pre{{white-space:pre-wrap;overflow-wrap:anywhere}}.severity{{font-weight:700}}</style></head><body><h1>Hooray security report</h1><header><div class=\"card\"><b>Run</b><br><code>{}</code></div><div class=\"card\"><b>Asset</b><br>{}</div><div class=\"card\"><b>Inventory</b><br>{} components</div><div class=\"card\"><b>Findings</b><br>{}</div><div class=\"card\"><b>Policy</b><br>{} allow / {} warn / {} deny</div></header><table><thead><tr><th>Severity</th><th>Kind</th><th>Finding</th><th>Component</th><th>Summary and evidence</th></tr></thead><tbody>{}</tbody></table><footer>Hooray canonical format v{}</footer></body></html>",
-        html_text(report.run.id.as_str()),
-        html_text(&report.inventory.asset.name),
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\"><title>Hooray security report</title><style>:root{{color-scheme:light dark;font-family:system-ui,sans-serif;line-height:1.5}}body{{max-width:1440px;margin:auto;padding:2rem}}header{{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:1rem}}.card,.coverage,fieldset{{border:1px solid #7777;border-radius:.6rem;padding:1rem}}.coverage{{margin-top:1rem}}.filters{{display:grid;gap:.6rem;margin:1rem 0}}fieldset{{margin:0}}legend{{font-weight:700}}label{{display:inline-flex;align-items:center;gap:.3rem;margin-right:1rem;padding:.2rem 0;cursor:pointer}}input{{accent-color:#326aca}}.table-scroll{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;min-width:860px}}th,td{{padding:.75rem;border-bottom:1px solid #7777;text-align:left;vertical-align:top}}th{{font-size:.9rem}}td:nth-child(2){{min-width:13rem}}td:last-child{{min-width:13rem}}code,pre{{white-space:pre-wrap;overflow-wrap:anywhere}}summary{{cursor:pointer;font-weight:600}}pre{{font-size:.85rem;border-left:3px solid #7777;padding-left:.75rem}}.severity,.policy{{font-weight:700}}.critical,.high,.deny{{color:light-dark(#ad1d27,#ff9393)}}.medium,.warn{{color:light-dark(#855700,#ffd077)}}.allow{{color:light-dark(#18613a,#86d7aa)}}.muted{{font-size:.85rem;opacity:.8}}.finding-id{{display:block;margin-top:.5rem}}footer{{border-top:1px solid #7777;margin-top:2rem;padding-top:1rem;font-size:.85rem}}:focus-visible{{outline:3px solid #538cff;outline-offset:3px}}@media(max-width:600px){{body{{padding:1rem}}header{{grid-template-columns:1fr 1fr}}label{{margin-right:.65rem}}}}{filter_styles}</style></head><body><h1>Hooray security report</h1><header><div class=\"card\"><b>Run</b><br><code>{}</code></div><div class=\"card\"><b>Asset</b><br>{}</div><div class=\"card\"><b>Inventory</b><br>{} components</div><div class=\"card\"><b>Findings</b><br>{}</div><div class=\"card\"><b>Policy: {}</b><br>{} allow / {} warn / {} deny</div></header><section class=\"coverage\" aria-label=\"Assessment coverage\"><strong>Assessment coverage</strong><p>{}</p><p>Policy decisions and finding status are separate assessments. Totals include resolved and suppressed findings. Text in the summary may be shortened; expand each finding for complete evidence.</p></section>{global}<section aria-labelledby=\"findings-title\"><h2 id=\"findings-title\">Prioritized findings</h2><p class=\"muted\">Deny decisions first, then unresolved findings, severity, risk score, and stable finding ID. Filters affect the table; overall totals remain unchanged.</p><div class=\"filters\" role=\"group\" aria-label=\"Filter findings\">{controls}</div>{empty}<div class=\"table-scroll\" role=\"region\" aria-label=\"Finding details\" tabindex=\"0\"><table><caption class=\"muted\">Recorded findings, policy, repository locations and remediation</caption><thead><tr><th scope=\"col\">Severity / kind</th><th scope=\"col\">Finding and evidence</th><th scope=\"col\">Component / location</th><th scope=\"col\">Policy / status</th><th scope=\"col\">Remediation</th></tr></thead><tbody>{}</tbody></table></div></section><footer>Hooray canonical format v{}</footer></body></html>",
+        html_text(&display_text(report.run.id.as_str(), 200)),
+        html_text(&display_text(&report.inventory.asset.name, 200)),
         report.inventory.components.len(),
         report.findings.len(),
+        policy_state(report),
         report.policy_summary.allowed,
         report.policy_summary.warned,
         report.policy_summary.denied,
+        assessment_note(report),
         rows.text,
         CANONICAL_REPORT_VERSION
     );
@@ -2322,7 +2875,12 @@ fn xml_attr(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 fn html_text(value: &str) -> String {
-    xml_attr(value)
+    xml_attr(
+        &value
+            .chars()
+            .filter(|character| !is_direction_control(*character))
+            .collect::<String>(),
+    )
 }
 
 fn is_valid_xml_char(character: char) -> bool {
@@ -2375,8 +2933,8 @@ mod tests {
     use super::*;
     use crate::model::{
         Applicability, Asset, AssetId, AssetKind, Component, ComponentId, Confidence,
-        DependencyEdge, Evidence, FindingKind, FindingStatus, Inventory, LocationId, Position,
-        Remediation, Risk, RuleId, RunId, RunMetadata, Scope,
+        DependencyEdge, Evidence, FindingKind, FindingStatus, Inventory, LocationId, PolicySummary,
+        Position, Remediation, Risk, RuleId, RunId, RunMetadata, Scope,
     };
 
     fn fixture() -> ScanReport {
@@ -2495,6 +3053,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn report_paths_do_not_lose_target_behind_unrelated_dense_branch() {
+        let mut report = fixture();
+        let root = ComponentId::new("component:root").unwrap();
+        let target = ComponentId::new("component:dep").unwrap();
+        let template = report.inventory.components[&root].clone();
+        let layers: Vec<Vec<ComponentId>> = (0..12)
+            .map(|layer| {
+                (0..4)
+                    .map(|column| {
+                        let name = format!("a-decoy-{layer:02}-{column}");
+                        let id = ComponentId::new(format!("component:{name}")).unwrap();
+                        let mut component = template.clone();
+                        component.identity = id.clone();
+                        component.name = name.clone();
+                        component.purl = format!("pkg:cargo/{name}@1.0.0");
+                        report.inventory.components.insert(id.clone(), component);
+                        id
+                    })
+                    .collect()
+            })
+            .collect();
+        let edge = |from: &ComponentId, to: &ComponentId| DependencyEdge {
+            from: from.clone(),
+            to: to.clone(),
+            scope: Scope::Runtime,
+            optional: false,
+        };
+        for child in &layers[0] {
+            report.inventory.dependencies.insert(edge(&root, child));
+        }
+        for pair in layers.windows(2) {
+            for from in &pair[0] {
+                for to in &pair[1] {
+                    report.inventory.dependencies.insert(edge(from, to));
+                }
+            }
+        }
+        report.validate().unwrap();
+        let index = ReportIndex::new(&report);
+        let finding = report.findings.values().next().unwrap();
+        assert_eq!(
+            index.paths(finding),
+            vec![vec![root.as_str(), target.as_str()]],
+            "an unrelated exponential branch must not consume the target path's work budget"
+        );
+    }
+
+    #[test]
+    fn report_paths_preserve_simple_cycles_and_multiple_roots() {
+        let mut report = fixture();
+        let root = ComponentId::new("component:root").unwrap();
+        let target = ComponentId::new("component:dep").unwrap();
+        let template = report.inventory.components[&root].clone();
+        let ids: Vec<_> = ["mid-a", "mid-b", "other-root"]
+            .into_iter()
+            .map(|name| {
+                let id = ComponentId::new(format!("component:{name}")).unwrap();
+                let mut component = template.clone();
+                component.identity = id.clone();
+                component.name = name.into();
+                component.purl = format!("pkg:cargo/{name}@1.0.0");
+                report.inventory.components.insert(id.clone(), component);
+                id
+            })
+            .collect();
+        let (a, b, other) = (&ids[0], &ids[1], &ids[2]);
+        for (from, to) in [
+            (&root, a),
+            (&root, b),
+            (a, b),
+            (b, a),
+            (a, &target),
+            (b, &target),
+            (other, &target),
+        ] {
+            report.inventory.dependencies.insert(DependencyEdge {
+                from: from.clone(),
+                to: to.clone(),
+                scope: Scope::Runtime,
+                optional: false,
+            });
+        }
+        report.validate().unwrap();
+        let index = ReportIndex::new(&report);
+        let finding = report.findings.values().next().unwrap();
+        let mut expected = vec![
+            vec![root.as_str(), target.as_str()],
+            vec![root.as_str(), a.as_str(), target.as_str()],
+            vec![root.as_str(), a.as_str(), b.as_str(), target.as_str()],
+            vec![root.as_str(), b.as_str(), target.as_str()],
+            vec![root.as_str(), b.as_str(), a.as_str(), target.as_str()],
+            vec![other.as_str(), target.as_str()],
+        ];
+        expected.sort();
+        assert_eq!(index.paths(finding), expected);
+    }
+
     fn parse_csv(text: &str) -> Vec<Vec<String>> {
         let mut rows = Vec::new();
         let mut row = Vec::new();
@@ -2527,6 +3183,231 @@ mod tests {
         assert_eq!(ReportFormat::Csv.as_str(), "csv");
         assert_eq!(ReportFormat::Csv.extension(), "csv");
         assert_eq!(ReportFormat::Csv.media_type(), "text/csv; charset=utf-8");
+    }
+
+    #[test]
+    fn markdown_format_metadata_and_actionable_summary() {
+        assert_eq!(
+            "md".parse::<ReportFormat>().unwrap(),
+            ReportFormat::Markdown
+        );
+        assert_eq!(ReportFormat::Markdown.extension(), "md");
+        assert_eq!(
+            ReportFormat::Markdown.media_type(),
+            "text/markdown; charset=utf-8"
+        );
+        let report = fixture();
+        let text = render_to_string(&report, ReportFormat::Markdown).unwrap();
+        assert!(text.contains("**Policy: DENIED** — 0 allow / 0 warn / 1 deny decisions."));
+        assert!(text.contains("` unsafe <dep>@1.2.3 `"));
+        assert!(text.contains("` src/a & b.rs:7 `"));
+        assert!(text.contains("Fixed versions: 2.0.0."));
+        assert!(text.contains("Showing 1 of 1 findings; 0 omitted"));
+        assert!(text.contains("Network assessment coverage is not recorded"));
+        assert!(!text.contains("never-print-me"));
+    }
+
+    #[test]
+    fn markdown_keeps_policy_coverage_and_status_honest() {
+        let mut report = fixture();
+        report.findings.clear();
+        report.policy_decisions.clear();
+        report.policy_summary = PolicySummary::default();
+        report.run.metadata.insert("offline".into(), json!(true));
+        report
+            .run
+            .metadata
+            .insert("new_findings_only".into(), json!(true));
+        let text = render_to_string(&report, ReportFormat::Markdown).unwrap();
+        assert!(text.contains("Policy: NOT EVALUATED"));
+        assert!(text.contains("OSV vulnerability queries were skipped"));
+        assert!(text.contains("contains new findings only"));
+        assert!(text.contains("No findings recorded"));
+        let global = PolicyDecision {
+            policy_id: crate::model::PolicyId::new("policy:coverage").unwrap(),
+            finding_id: None,
+            outcome: PolicyOutcome::Deny,
+            reason: "coverage incomplete".into(),
+            exception_id: None,
+        };
+        report.policy_decisions.insert(global);
+        report.policy_summary = PolicySummary::from_decisions(&report.policy_decisions);
+        let text = render_to_string(&report, ReportFormat::Markdown).unwrap();
+        assert!(text.contains("Policy: DENIED"));
+        assert!(text.contains("## Scan policy decisions"));
+        assert!(text.contains("coverage incomplete"));
+        assert!(text.contains("Showing 0 of 0 findings"));
+    }
+
+    #[test]
+    fn markdown_prioritizes_denials_without_conflating_resolved_or_allowed() {
+        let mut report = fixture();
+        let mut critical = report.findings.values().next().unwrap().clone();
+        critical.id = FindingId::new("finding:critical-allow").unwrap();
+        critical.severity = Severity::Critical;
+        critical.summary = Some("Critical allowed".into());
+        report
+            .findings
+            .insert(critical.id.clone(), critical.clone());
+        report.policy_decisions.insert(PolicyDecision {
+            policy_id: crate::model::PolicyId::new("policy:exception").unwrap(),
+            finding_id: Some(critical.id),
+            outcome: PolicyOutcome::Allow,
+            reason: "temporary exception".into(),
+            exception_id: Some("exception:tracked".into()),
+        });
+        report.policy_summary = PolicySummary::from_decisions(&report.policy_decisions);
+        report
+            .findings
+            .values_mut()
+            .find(|finding| finding.severity == Severity::High)
+            .unwrap()
+            .status = FindingStatus::Resolved;
+        let text = render_to_string(&report, ReportFormat::Markdown).unwrap();
+        assert!(
+            text.find("` finding:stable-1 `").unwrap()
+                < text.find("` finding:critical-allow `").unwrap()
+        );
+        assert!(text.contains("deny — ` high risk <blocked> ` / resolved"));
+        assert!(text.contains("allow — ` temporary exception ` / open"));
+        assert!(text.contains("1 open / 0 suppressed / 1 resolved / 0 unknown"));
+    }
+
+    #[test]
+    fn markdown_literal_text_rejects_html_links_table_and_control_injection() {
+        let mut report = fixture();
+        report.findings.values_mut().next().unwrap().summary = Some(
+            "<script>alert(1)</script> | [click](javascript:evil) ![image](https://evil.invalid) @someone www.evil.invalid `x`\n# forged\x1b\x07\u{202e}reversed".into(),
+        );
+        let text = render_to_string(&report, ReportFormat::Markdown).unwrap();
+        for forbidden in ["\n# forged", "\x1b", "\x07", "\u{202e}"] {
+            assert!(!text.contains(forbidden), "{forbidden:?}");
+        }
+        assert!(text.contains("`` <script>alert(1)</script> \\| [click](javascript:evil) ![image](https://evil.invalid) @someone www.evil.invalid `x` # forgedreversed ``"));
+        assert_eq!(markdown_text("`\\|@someone`", 100), "`` `\\\\|@someone` ``");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("| high / vulnerability"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            text,
+            render_to_string(&report, ReportFormat::Markdown).unwrap()
+        );
+    }
+
+    #[test]
+    fn markdown_caps_count_bytes_and_preserves_complete_policy_totals() {
+        let mut report = fixture();
+        let mut template = report.findings.values().next().unwrap().clone();
+        template.summary = Some("`".repeat(1000));
+        template.remediation.as_mut().unwrap().description = "`".repeat(300);
+        template.remediation.as_mut().unwrap().fixed_versions = BTreeSet::from(["_".repeat(80); 1]);
+        for ordinal in 0..120 {
+            let mut finding = template.clone();
+            finding.id = FindingId::new(format!("finding:{ordinal:03}")).unwrap();
+            report.findings.insert(finding.id.clone(), finding);
+        }
+        let bytes = render(&report, ReportFormat::Markdown).unwrap();
+        assert!(bytes.len() <= MAX_MARKDOWN_BYTES);
+        let text = String::from_utf8(bytes).unwrap();
+        let included = text
+            .lines()
+            .filter(|line| line.starts_with("| high / vulnerability"))
+            .count();
+        assert!(included > 0 && included < MAX_MARKDOWN_FINDINGS);
+        assert!(text.contains(&format!(
+            "Showing {included} of 121 findings; {} omitted",
+            121 - included
+        )));
+        assert!(text.contains("Policy: DENIED** — 0 allow / 0 warn / 1 deny"));
+        assert_eq!(
+            text,
+            render_to_string(&report, ReportFormat::Markdown).unwrap()
+        );
+        assert!(matches!(
+            render_with_limit(&report, ReportFormat::Markdown, 64),
+            Err(ReportError::Limit(_))
+        ));
+    }
+
+    #[test]
+    fn markdown_count_limit_and_utf8_truncation_are_explicit() {
+        let mut report = fixture();
+        let template = report.findings.values().next().unwrap().clone();
+        for ordinal in 0..70 {
+            let mut finding = template.clone();
+            finding.id = FindingId::new(format!("finding:{ordinal:03}")).unwrap();
+            finding.summary = Some("界".repeat(250));
+            report.findings.insert(finding.id.clone(), finding);
+        }
+        let text = render_to_string(&report, ReportFormat::Markdown).unwrap();
+        assert!(text.contains("Showing 50 of 71 findings; 21 omitted"));
+        assert!(text.contains('…'));
+        assert!(text.len() <= MAX_MARKDOWN_BYTES);
+    }
+
+    #[test]
+    fn markdown_bounds_global_decision_details_without_changing_totals() {
+        let mut report = fixture();
+        for ordinal in 0..30 {
+            report.policy_decisions.insert(PolicyDecision {
+                policy_id: crate::model::PolicyId::new(format!("policy:coverage-{ordinal:02}"))
+                    .unwrap(),
+                finding_id: None,
+                outcome: PolicyOutcome::Warn,
+                reason: "Assessment needs review.".into(),
+                exception_id: None,
+            });
+        }
+        report.policy_summary = PolicySummary::from_decisions(&report.policy_decisions);
+        let text = render_to_string(&report, ReportFormat::Markdown).unwrap();
+        assert!(text.contains("0 allow / 30 warn / 1 deny decisions"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("| ` policy:coverage-"))
+                .count(),
+            20
+        );
+        assert!(text.contains("10 additional scan policy decisions omitted"));
+    }
+
+    #[test]
+    fn html_filters_remain_script_free_and_show_actionable_context() {
+        let text = render_to_string(&fixture(), ReportFormat::Html).unwrap();
+        assert!(text.contains("body:has(#severity-high:checked)"));
+        assert!(text.contains("body:has(#policy-deny:checked)"));
+        assert!(text.contains("body:has(#kind-sast:checked)"));
+        assert!(text.contains("<legend>Severity</legend>"));
+        assert!(text.contains("data-policy=\"deny\""));
+        assert!(text.contains("unsafe &lt;dep&gt;@1.2.3"));
+        assert!(text.contains("src/a &amp; b.rs:7"));
+        assert!(text.contains("Fixed versions: 2.0.0."));
+        assert!(text.contains("Policy: DENIED"));
+        assert!(!text.contains("<script>"));
+        assert!(!text.contains("onclick="));
+    }
+
+    #[test]
+    fn human_reports_do_not_invent_lines_for_unpositioned_locations() {
+        let mut report = fixture();
+        for component in report.inventory.components.values_mut() {
+            component.locations = std::mem::take(&mut component.locations)
+                .into_iter()
+                .map(|mut location| {
+                    location.start = None;
+                    location.end = None;
+                    location
+                })
+                .collect();
+        }
+        let markdown = render_to_string(&report, ReportFormat::Markdown).unwrap();
+        let html = render_to_string(&report, ReportFormat::Html).unwrap();
+        assert!(markdown.contains("` src/a & b.rs (line not recorded) `"));
+        assert!(html.contains("src/a &amp; b.rs (line not recorded)"));
+        assert!(!markdown.contains("src/a & b.rs:1"));
+        assert!(!html.contains("src/a &amp; b.rs:1"));
     }
 
     #[test]
@@ -2704,6 +3585,49 @@ mod tests {
     }
 
     #[test]
+    fn sarif_retains_status_and_manifest_provenance_without_inventing_a_line() {
+        let mut report = fixture();
+        let finding = report.findings.values_mut().next().unwrap();
+        finding.location_id = None;
+        finding.evidence.clear();
+        finding.status = FindingStatus::Suppressed;
+        let component = report
+            .inventory
+            .components
+            .get_mut(finding.component_id.as_ref().unwrap())
+            .unwrap();
+        component.locations.clear();
+        component.provenance.insert(crate::model::Source {
+            kind: SourceKind::Lockfile,
+            locator: "Cargo.lock".into(),
+            digest: None,
+        });
+        let value: Value =
+            serde_json::from_slice(&render(&report, ReportFormat::Sarif).unwrap()).unwrap();
+        let result = &value["runs"][0]["results"][0];
+        assert_eq!(result["properties"]["status"], "suppressed");
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "Cargo.lock"
+        );
+        assert!(
+            result["locations"][0]["physicalLocation"]
+                .get("region")
+                .is_none()
+        );
+        assert_eq!(
+            result["locations"][0]["properties"]["hoorayLocationSource"],
+            "component-provenance"
+        );
+        let markdown = render_to_string(&report, ReportFormat::Markdown).unwrap();
+        let html = render_to_string(&report, ReportFormat::Html).unwrap();
+        assert!(markdown.contains("` Cargo.lock (component input; line not recorded) `"));
+        assert!(html.contains("Cargo.lock (component input; line not recorded)"));
+        assert!(!markdown.contains("Cargo.lock:1"));
+        assert!(!html.contains("Cargo.lock:1"));
+    }
+
+    #[test]
     fn junit_is_well_formed_by_construction_and_escapes_payloads() {
         let text = render_to_string(&fixture(), ReportFormat::Junit).unwrap();
         assert!(text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
@@ -2717,6 +3641,118 @@ mod tests {
     }
 
     #[test]
+    fn junit_reports_scan_denial_even_without_findings() {
+        let mut report = fixture();
+        report.findings.clear();
+        report.policy_decisions = BTreeSet::from([PolicyDecision {
+            policy_id: crate::model::PolicyId::new("policy:coverage").unwrap(),
+            finding_id: None,
+            outcome: PolicyOutcome::Deny,
+            reason: "Assessment <incomplete>".into(),
+            exception_id: None,
+        }]);
+        report.policy_summary = PolicySummary::from_decisions(&report.policy_decisions);
+        let text = render_to_string(&report, ReportFormat::Junit).unwrap();
+        let document = roxmltree::Document::parse(&text).unwrap();
+        let root = document.root_element();
+        assert_eq!(root.attribute("tests"), Some("1"));
+        assert_eq!(root.attribute("failures"), Some("1"));
+        let case = root
+            .descendants()
+            .find(|node| node.has_tag_name("testcase"))
+            .unwrap();
+        assert_eq!(case.attribute("classname"), Some("hooray.policy"));
+        let failure = case
+            .children()
+            .find(|node| node.has_tag_name("failure"))
+            .unwrap();
+        assert_eq!(failure.attribute("type"), Some("policy-deny"));
+        assert_eq!(
+            failure.attribute("message"),
+            Some("Assessment <incomplete>")
+        );
+        assert!(!text.contains("<incomplete>"));
+    }
+
+    #[test]
+    fn junit_reconciles_finding_checks_and_unscoped_policy_checks() {
+        let mut report = fixture();
+        let template = report.findings.values().next().unwrap().clone();
+        for (id, status) in [
+            ("finding:allowed", FindingStatus::Open),
+            ("finding:resolved", FindingStatus::Resolved),
+        ] {
+            let mut finding = template.clone();
+            finding.id = FindingId::new(id).unwrap();
+            finding.status = status;
+            report.findings.insert(finding.id.clone(), finding);
+        }
+        report.policy_decisions.insert(PolicyDecision {
+            policy_id: crate::model::PolicyId::new("policy:allow").unwrap(),
+            finding_id: Some(FindingId::new("finding:allowed").unwrap()),
+            outcome: PolicyOutcome::Allow,
+            reason: "Approved exception".into(),
+            exception_id: Some("exception:tracked".into()),
+        });
+        for outcome in [
+            PolicyOutcome::Allow,
+            PolicyOutcome::Warn,
+            PolicyOutcome::Deny,
+        ] {
+            report.policy_decisions.insert(PolicyDecision {
+                policy_id: crate::model::PolicyId::new("policy:scan").unwrap(),
+                finding_id: None,
+                outcome,
+                reason: format!("Scan decision {}", policy_outcome(outcome)),
+                exception_id: None,
+            });
+        }
+        report.policy_summary = PolicySummary::from_decisions(&report.policy_decisions);
+        let text = render_to_string(&report, ReportFormat::Junit).unwrap();
+        let document = roxmltree::Document::parse(&text).unwrap();
+        let root = document.root_element();
+        let cases: Vec<_> = root
+            .descendants()
+            .filter(|node| node.has_tag_name("testcase"))
+            .collect();
+        let failures = root
+            .descendants()
+            .filter(|node| node.has_tag_name("failure"))
+            .count();
+        assert_eq!(root.attribute("tests"), Some("6"));
+        assert_eq!(root.attribute("failures"), Some("3"));
+        assert_eq!(cases.len(), 6);
+        assert_eq!(failures, 3);
+        let names: BTreeSet<_> = cases
+            .iter()
+            .map(|node| {
+                (
+                    node.attribute("classname").unwrap(),
+                    node.attribute("name").unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(names.len(), 6);
+        let resolved = cases
+            .iter()
+            .find(|node| node.attribute("name") == Some("finding:resolved"))
+            .unwrap();
+        assert!(!resolved.children().any(|node| node.has_tag_name("failure")));
+        let allowed = cases
+            .iter()
+            .find(|node| node.attribute("name") == Some("finding:allowed"))
+            .unwrap();
+        assert!(
+            allowed.children().any(|node| node.has_tag_name("failure")),
+            "Finding checks retain unresolved-finding semantics"
+        );
+        assert_eq!(
+            text,
+            render_to_string(&report, ReportFormat::Junit).unwrap()
+        );
+    }
+
+    #[test]
     fn html_is_self_contained_csp_hardened_and_escaped() {
         let text = render_to_string(&fixture(), ReportFormat::Html).unwrap();
         assert!(text.starts_with("<!doctype html>"));
@@ -2724,6 +3760,13 @@ mod tests {
         assert!(!text.contains("<script>alert(1)</script>"));
         assert!(text.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!text.contains("src=\"http"));
+        let mut report = fixture();
+        report.findings.values_mut().next().unwrap().summary =
+            Some("<img src=x onerror=alert(1)>\u{202e}hidden\u{061c}".into());
+        let text = render_to_string(&report, ReportFormat::Html).unwrap();
+        assert!(!text.contains("<img src=x"));
+        assert!(!text.contains('\u{202e}'));
+        assert!(!text.contains('\u{061c}'));
     }
 
     #[test]

@@ -330,13 +330,15 @@ proxy when exposing the service beyond a host boundary.
 ### Integrations
 
 The CLI generates bounded templates for pre-commit, GitHub Actions, universal
-GitLab CI, and GitLab 19.2+ Ultimate security ingestion:
+GitLab CI, GitLab 19.2+ Ultimate security ingestion, Azure Pipelines, and Jenkins:
 
 ```bash
 hooray integrations generate pre-commit --output .pre-commit-config.yaml
 hooray integrations generate github-actions --output hooray.yml
 hooray integrations generate gitlab-ci --output hooray.gitlab-ci.yml
 hooray integrations generate gitlab-security --output hooray.gitlab-security.yml
+hooray integrations generate azure-pipelines --output hooray.azure-pipelines.yml
+hooray integrations generate jenkins --output Jenkinsfile.hooray
 ```
 The generated GitHub workflow installs the verified release binary through the
 immutable `actions/setup` revision and passes the package version explicitly;
@@ -344,7 +346,10 @@ it does not use the unsupported `cargo install hooray` path. It grants
 `security-events: write`, uploads a non-empty SARIF file for scan statuses 0
 and 1, and runs a final status gate so policy denial remains exit 1.
 Operational failures remain failures and do not upload a partial or missing
-report. Regenerate the template only against a published setup-action revision
+report. Reports are also retained as a downloadable workflow artifact, and a
+job summary records scan status before the final gate. Set the repository
+variable `HOORAY_UPLOAD_SARIF=false` when code scanning is unavailable; artifact
+retention and the scan gate still run. Regenerate the template only against a published setup-action revision
 and release version.
 
 GitHub SARIF locations are repository-relative URI references, so spaces and
@@ -372,6 +377,24 @@ and `HOORAY_POLICY` to `hooray-policy.yaml`; that policy file must exist because
 the scan engine always loads policy. Set `HOORAY_DISABLED=true` to skip both
 jobs.
 
+GitLab scanner jobs remove wrapper-only `HOORAY_*` environment variables before
+starting the CLI, so they do not conflict with strict scanner configuration.
+The scanner job validates the complete report bundle and its policy artifact;
+the later gate returns `1` for a policy denial and `2` for a missing, malformed,
+or inconsistent artifact. It reads the file instead of trusting inherited
+dotenv values.
+
+Azure Pipelines and Jenkins templates require a consumer-provisioned verified
+Linux executable. Azure uses `hoorayExecutable`, `hoorayInput`, and
+`hoorayPolicy` pipeline variables, JUnit test publication and a retained pipeline
+artifact. Its pipeline artifact task targets Azure DevOps Services; Server
+users must substitute their supported build artifact task. The Jenkins
+template uses `HOORAY_EXECUTABLE`, `HOORAY_INPUT`, and `HOORAY_POLICY` parameters,
+requires Declarative Pipeline and the JUnit plugin, archives reports, and
+enforces scan status after publication. Both produce one scan and preserve
+denied reports before the final gate. Provision a binary that supports the
+`gitlab-artifacts` format (`0.9.0` or a supporting source build).
+
 Review generated templates before adoption. The integration library also
 renders bounded GitHub SARIF and check-run payloads, GitLab Code Quality, Slack
 summaries, VS Code/LSP diagnostics, pull-request gates, Jira create-issue
@@ -379,6 +402,58 @@ payloads with escaped wiki markup and capped finding lists, and HTTPS-only
 signed webhooks. Webhook signatures are versioned, secrets must be 16–4,096
 bytes, URLs cannot contain credentials, and verification uses constant-time
 comparison.
+
+#### Export a scan for developer tools
+
+Export integration payloads directly from persisted history without rescanning
+or contacting a provider. Use the same database and an actual run ID from
+`hooray history list`:
+
+```bash
+hooray report 'run:UUID' --format markdown --output hooray-summary.md
+hooray integrations export 'run:UUID' --kind github-check --head-sha "$GITHUB_SHA" --output check-run.json
+hooray integrations export 'run:UUID' --kind slack --details-url https://security.example.com/report --output slack-summary.json
+hooray integrations export 'run:UUID' --kind vscode --output diagnostics.json
+hooray integrations export 'run:UUID' --kind lsp --workspace-root /workspace --document-uri file:///workspace/src/example.py --output publish-diagnostics.json
+hooray integrations export 'run:UUID' --kind jira --project-key SEC --output jira-issue.json
+hooray integrations export 'run:CURRENT' --kind pr-gate --baseline 'run:BASELINE' --output gate.json
+```
+
+| Kind | Payload and required options |
+| --- | --- |
+| `github-check` | GitHub create-check-run JSON, with a required 40-character hexadecimal `--head-sha`, stable `external_id`, policy conclusion, and at most 50 located annotations |
+| `slack` | Slack Block Kit scan summary, optionally with an HTTPS `--details-url` |
+| `vscode` | Bounded Hooray diagnostic envelope for an editor adapter |
+| `lsp` | JSON-RPC `textDocument/publishDiagnostics` notification; `--document-uri` must exactly match a reported location through its decoded file path; explicitly set `--workspace-root` for repository-relative paths |
+| `jira` | Jira REST **v2** create-issue JSON with `--project-key`, issue type `Bug`, escaped wiki description and security labels; Jira Cloud REST v3 requires an ADF adapter |
+| `pr-gate` | Same-asset baseline comparison with introduced/resolved/unchanged counts and new denied findings; `--baseline` is required |
+
+Payloads select at most 500 findings by default (`--max-items 1..10000`), use a
+1 MiB output budget, redact secret text, and report selection omissions in
+provider metadata or descriptions. Provider-specific limits can further cap
+displayed findings. The GitHub and Slack exports accept HTTPS report links;
+unsupported options for another kind are rejected. Deliver the saved JSON
+through your authenticated automation only after review; exporting does not
+send notifications, create issues, or publish checks.
+
+Editor exports do not guess the current workspace. `vscode` keeps relative
+locations as `path` fields by default. For `vscode` or `lsp`, an explicit
+absolute `--workspace-root` projects safe repository-relative locations into
+that workspace without modifying the stored scan; traversal and URI-like
+locations are not projected. Already absolute locations keep their original
+paths. An unmatched LSP document gets an empty diagnostic list.
+
+All exports except `pr-gate` preserve the stored policy result: output is still
+written on denial, then the CLI exits `1`. The baseline gate exits `1` for new
+denied findings or any report-level denial that cannot be tied to a finding;
+existing finding denials are intentionally outside this gate. A baseline of a
+different asset is rejected. This is a new-finding policy gate, not a full
+policy reevaluation or proof that previous findings are resolved. Missing
+runs, invalid options, and output failures exit `2` with no partial JSON.
+
+Markdown reports and integration exports require a binary built from a
+revision containing these features; release `0.9.0` predates them. The source
+build instructions below produce the supporting CLI.
 
 ## Installation
 
@@ -485,7 +560,8 @@ hooray monitor [--once] [--webhook-url URL --webhook-secret-env VAR]
 hooray monitor targets add TARGET_ID --source SOURCE --interval-seconds SECONDS
 hooray monitor targets list [--limit 1..1000] [--offset N] [--format json|yaml|table] [--output FILE]
 hooray monitor targets remove TARGET_ID
-hooray integrations generate pre-commit|github-actions|gitlab-ci|gitlab-security [--output FILE]
+hooray integrations generate pre-commit|github-actions|gitlab-ci|gitlab-security|azure-pipelines|jenkins [--output FILE]
+hooray integrations export RUN_ID --kind github-check|slack|vscode|lsp|jira|pr-gate [KIND_OPTIONS] [--max-items N] [--output FILE]
 ```
 
 `INPUT` must match the selected scan subcommand. Use `-` as input only with
@@ -527,6 +603,7 @@ history, and standalone policy-evaluation commands support JSON and YAML only.
 | `gitlab-sarif` | GitLab 19.2+ SARIF 2.1.0 security ingestion |
 | `junit` | JUnit XML for CI test-report ingestion |
 | `html` | Standalone escaped HTML report |
+| `markdown` | Bounded, prioritized policy and remediation summary for CI jobs and pull/merge request discussions |
 | `cyclonedx-vex` | CycloneDX JSON with vulnerability analysis |
 | `gitlab-cyclonedx` | CycloneDX 1.6 inventory for GitLab dependency ingestion |
 | `spdx` | SPDX 2.3 JSON inventory |
@@ -544,6 +621,19 @@ Rendered reports validate model invariants, enforce item/text/output bounds, sor
 stable collections deterministically, escape format-specific content, and
 redact sensitive property names before serialization. The canonical report
 format version is `1.0.0`; scan reports currently use schema version `1`.
+
+Markdown summaries are at most 64 KiB and show at most 50 prioritized findings,
+with full totals, policy decisions, assessment coverage, status, locations,
+components, remediation and explicit omission counts. Use JSON/SARIF for full
+evidence. HTML reports include native severity/policy/kind filters and readable
+remediation context; they remain standalone and script-free. Filters change
+the visible rows without changing scan totals or policy outcome.
+
+JUnit represents findings as test cases: unresolved findings remain failures
+even if policy allows them. Scan-level policy decisions have their own cases,
+so an unscoped denial is visible even when there are no findings. Use the scan
+exit status or validated policy artifact for policy enforcement; JUnit counts
+describe the report's finding and scan-level checks.
 
 ## Configuration
 
