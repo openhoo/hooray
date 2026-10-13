@@ -100,6 +100,7 @@ pub fn nearest_fixed_version<'a>(
     let mut nearest_same_major: Option<(VersionKey, &str)> = None;
     let mut nearest_any: Option<(VersionKey, &str)> = None;
     for candidate in candidates {
+        let candidate = candidate.trim();
         let Some(key) = VersionKey::parse(ecosystem, candidate) else {
             continue;
         };
@@ -290,8 +291,37 @@ fn parse_generic(ecosystem: PackageEcosystem, value: &str) -> Option<VersionKey>
     if ecosystem == PackageEcosystem::Go {
         value = value.strip_prefix('v').unwrap_or(value);
     }
-    let value = value.split('+').next()?;
-    let (release, pre) = value.split_once(['-', '~']).unwrap_or((value, ""));
+    let value = if let Some((core, build)) = value.split_once('+') {
+        if build.split('.').any(|identifier| {
+            identifier.is_empty()
+                || !identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        }) {
+            return None;
+        }
+        core
+    } else {
+        value
+    };
+    if ecosystem != PackageEcosystem::Nuget && value.contains('~') {
+        return None;
+    }
+    let (release, pre) = if let Some((release, pre)) = value.split_once(['-', '~']) {
+        if pre.is_empty() {
+            return None;
+        }
+        (release, pre)
+    } else {
+        (value, "")
+    };
+    if ecosystem != PackageEcosystem::Nuget
+        && release
+            .split('.')
+            .any(|part| part.len() > 1 && part.starts_with('0'))
+    {
+        return None;
+    }
     let release = parse_numeric_release(release)?;
     Some(VersionKey {
         epoch: 0,
@@ -322,6 +352,9 @@ fn semver_prerelease_parts(value: &str) -> Option<Vec<VersionPart>> {
                 return None;
             }
             if identifier.bytes().all(|byte| byte.is_ascii_digit()) {
+                if identifier.len() > 1 && identifier.starts_with('0') {
+                    return None;
+                }
                 identifier.parse().ok().map(VersionPart::Number)
             } else {
                 Some(VersionPart::Text(identifier.to_owned()))

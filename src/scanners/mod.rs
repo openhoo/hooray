@@ -593,6 +593,28 @@ static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
+    let extension = Path::new(builder.path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let source_calls = matches!(
+        extension.as_str(),
+        "rs" | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "mjs"
+            | "cjs"
+            | "mts"
+            | "cts"
+            | "py"
+            | "pyi"
+            | "go"
+            | "java"
+            | "cs"
+    );
+    let mut non_code: Option<Vec<(usize, usize)>> = None;
     let package_script_values: BTreeSet<String> = if Path::new(builder.path)
         .file_name()
         .is_some_and(|name| name == "package.json")
@@ -683,6 +705,19 @@ fn scan_secrets(text: &str, builder: &mut FindingBuilder<'_>) {
                 .as_str()
                 .to_ascii_lowercase();
             if name.ends_with("_hash") || name.ends_with("-hash") {
+                continue;
+            }
+            // An unquoted source call evaluates identifiers, not credential
+            // bytes. Config scalars, quoted values and text inside source
+            // strings/comments retain the generic assignment detector.
+            if source_calls
+                && captures.get(4).is_some()
+                && looks_like_unquoted_source_call(value.as_str())
+                && !spans::offset_in_non_code_span(
+                    non_code.get_or_insert_with(|| spans::non_code_spans(text, &extension)),
+                    line_offset + assignment.start(),
+                )
+            {
                 continue;
             }
             let entropy = shannon_entropy(value.as_str()) * 1000.0;
@@ -894,6 +929,33 @@ fn looks_placeholder(value: &str) -> bool {
         || value.chars().collect::<BTreeSet<_>>().len() < 5
         || looks_sequential_or_repeated(value)
         || looks_like_pattern(value)
+}
+
+/// Recognize a complete call to an identifier path with identifier arguments.
+/// This is deliberately narrow: unsupported expression syntax remains subject
+/// to the entropy heuristic. The assignment capture bounds values to 256 bytes.
+fn looks_like_unquoted_source_call(value: &str) -> bool {
+    let value = value.strip_suffix(';').unwrap_or(value);
+    let value = value.strip_suffix('?').unwrap_or(value);
+    let Some((callee, arguments)) = value
+        .strip_suffix(')')
+        .and_then(|value| value.split_once('('))
+    else {
+        return false;
+    };
+    let identifier = |name: &str| {
+        name.as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$'))
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+    };
+    callee.replace("::", ".").split('.').all(identifier)
+        && (arguments.is_empty()
+            || arguments
+                .split(',')
+                .all(|argument| argument.split('.').all(identifier)))
 }
 
 /// These shapes belong only to the generic entropy heuristic. Specific token
@@ -1814,7 +1876,7 @@ fn scan_structured_document(
 /// the key's offset (the field's line); sequence items and the document root
 /// record the node's own offset. Returns `None` when the event parse fails.
 fn yaml_path_index(text: &str) -> Option<BTreeMap<String, usize>> {
-    let mut parser = MaybeUninit::<unsafe_libyaml::yaml_parser_t>::uninit();
+    let mut parser = MaybeUninit::<libyaml_rs::yaml_parser_t>::uninit();
     let mut index = BTreeMap::new();
     // The event walk mirrors libyaml's document structure: a stack of open
     // collections plus the JSON-pointer path of the value currently being
@@ -1868,46 +1930,45 @@ fn yaml_path_index(text: &str) -> Option<BTreeMap<String, usize>> {
     // (libyaml reads the input in place), each event is deleted after its
     // data is copied out, and the parser is deleted on every exit path.
     unsafe {
-        if unsafe_libyaml::yaml_parser_initialize(parser.as_mut_ptr()).fail {
+        if libyaml_rs::yaml_parser_initialize(parser.as_mut_ptr()).fail {
             return None;
         }
         let parser = parser.as_mut_ptr();
-        unsafe_libyaml::yaml_parser_set_encoding(parser, unsafe_libyaml::YAML_UTF8_ENCODING);
-        unsafe_libyaml::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
-        let mut event = MaybeUninit::<unsafe_libyaml::yaml_event_t>::uninit();
+        libyaml_rs::yaml_parser_set_encoding(parser, libyaml_rs::YAML_UTF8_ENCODING);
+        libyaml_rs::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
+        let mut event = MaybeUninit::<libyaml_rs::yaml_event_t>::uninit();
         loop {
-            if unsafe_libyaml::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
-                unsafe_libyaml::yaml_parser_delete(parser);
+            if libyaml_rs::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
+                libyaml_rs::yaml_parser_delete(parser);
                 return None;
             }
             let mut parsed_event = event.assume_init();
             let offset = parsed_event.start_mark.index as usize;
             match parsed_event.type_ {
-                unsafe_libyaml::YAML_STREAM_END_EVENT => {
-                    unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                libyaml_rs::YAML_STREAM_END_EVENT => {
+                    libyaml_rs::yaml_event_delete(&mut parsed_event);
                     break;
                 }
-                unsafe_libyaml::YAML_DOCUMENT_START_EVENT => {
+                libyaml_rs::YAML_DOCUMENT_START_EVENT => {
                     stack.clear();
                     path.clear();
                 }
-                unsafe_libyaml::YAML_MAPPING_START_EVENT => {
+                libyaml_rs::YAML_MAPPING_START_EVENT => {
                     begin_value(&mut stack, &mut path, &mut index, offset);
                     stack.push(Frame::Mapping {
                         expecting_key: true,
                         pending_key: None,
                     });
                 }
-                unsafe_libyaml::YAML_SEQUENCE_START_EVENT => {
+                libyaml_rs::YAML_SEQUENCE_START_EVENT => {
                     begin_value(&mut stack, &mut path, &mut index, offset);
                     stack.push(Frame::Sequence { next_index: 0 });
                 }
-                unsafe_libyaml::YAML_MAPPING_END_EVENT
-                | unsafe_libyaml::YAML_SEQUENCE_END_EVENT => {
+                libyaml_rs::YAML_MAPPING_END_EVENT | libyaml_rs::YAML_SEQUENCE_END_EVENT => {
                     stack.pop();
                     path.pop();
                 }
-                unsafe_libyaml::YAML_SCALAR_EVENT => {
+                libyaml_rs::YAML_SCALAR_EVENT => {
                     let scalar = parsed_event.data.scalar;
                     let value = std::str::from_utf8(std::slice::from_raw_parts(
                         scalar.value,
@@ -1932,15 +1993,15 @@ fn yaml_path_index(text: &str) -> Option<BTreeMap<String, usize>> {
                         }
                     }
                 }
-                unsafe_libyaml::YAML_ALIAS_EVENT => {
+                libyaml_rs::YAML_ALIAS_EVENT => {
                     begin_value(&mut stack, &mut path, &mut index, offset);
                     path.pop();
                 }
                 _ => {}
             }
-            unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+            libyaml_rs::yaml_event_delete(&mut parsed_event);
         }
-        unsafe_libyaml::yaml_parser_delete(parser);
+        libyaml_rs::yaml_parser_delete(parser);
     }
     Some(index)
 }
@@ -3474,6 +3535,39 @@ mod tests {
     }
 
     #[test]
+    fn high_entropy_assignment_distinguishes_source_calls_from_literal_credentials() {
+        for (path, prefix, call) in [
+            ("source.rs", "let", "tokens.get(index)?;"),
+            ("source.rs", "let", "Credentials::retrieve(arguments)?;"),
+            ("source.js", "const", "sessions.authenticate(context);"),
+            ("source.py", "", "authenticate(user_name)"),
+        ] {
+            let source = format!("{prefix} {} = {call}", "token");
+            assert!(
+                !has(&analyze(path, &source), "secret.high-entropy-assignment"),
+                "source expression reported as a credential: {source}"
+            );
+        }
+        let call = "tokens.get(index)?;";
+        for (path, source) in [
+            ("source.rs", format!("let {} = \"{call}\";", "token")),
+            (".env", format!("{}={call}", "TOKEN")),
+            ("config.yaml", format!("{}: {call}", "token")),
+            (
+                "source.rs",
+                format!("let description = \"{}={call}\";", "TOKEN"),
+            ),
+            ("source.rs", format!("// {}={call}", "TOKEN")),
+            ("source.sh", format!("{}={call}", "TOKEN")),
+        ] {
+            assert!(
+                has(&analyze(path, &source), "secret.high-entropy-assignment"),
+                "literal credential-shaped value suppressed: {path}: {source}"
+            );
+        }
+    }
+
+    #[test]
     fn high_entropy_assignment_matches_json_quoted_keys_and_compound_names() {
         for line in [
             r#"{"password": "B7kP9vQ2mX8cR4tN6zW3"}"#, // hooray:allow-secret
@@ -3834,6 +3928,193 @@ cp.exec(`fixed`);
             findings, 9,
             "all proven dynamic child_process sinks are reported once"
         );
+    }
+
+    #[test]
+    fn single_parameter_arrow_after_typed_arrow_shadows_receiver() {
+        let source = "const cp = require(\"child_process\");\nconst typed = (value): number => value;\nconst shadowed = cp => cp.exec(input);\ncp.exec(input);\n";
+        let output = analyze("arrows.ts", source);
+        let calls = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "arrow parameter must shadow only its own body"
+        );
+        let location = output
+            .locations
+            .iter()
+            .find(|location| Some(&location.id) == calls[0].location_id.as_ref())
+            .unwrap();
+        assert_eq!(location.start.unwrap().line, 4);
+    }
+
+    #[test]
+    fn callable_return_type_arrow_preserves_parameter_shadowing() {
+        for declaration in [
+            "const nested = cp => () => cp.exec(input);",
+            "const typed = (cp: any): () => void => () => cp.exec(input);",
+            "const typed = (cp: any): () => () => void => () => () => cp.exec(input);",
+            "const typed = (cp: any): () => Result => () => cp.exec(input);",
+            "const typed = (cp: any): <T extends { value: string }>() => T => <T extends { value: string }>() => cp.exec(input);",
+            "const typed = (other: any): unknown => cp => cp.exec(input);",
+            "const callback = [1].map((cp) => cp.exec(input));",
+            "const object = outer => ({method(cp) { return () => cp.exec(input); }});",
+        ] {
+            let source =
+                format!("const cp = require(\"child_process\");\n{declaration}\ncp.exec(input);\n");
+            let output = analyze("callable-arrows.ts", &source);
+            let calls = output
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "{declaration}");
+            let location = output
+                .locations
+                .iter()
+                .find(|location| Some(&location.id) == calls[0].location_id.as_ref())
+                .unwrap();
+            assert_eq!(location.start.unwrap().line, 3, "{declaration}");
+        }
+    }
+
+    #[test]
+    fn wrapped_types_preserve_shadowed_and_real_javascript_receivers() {
+        for (declaration, expected) in [
+            (
+                "const typed = (cp: any): (() => void) => () => cp.exec(input);",
+                1,
+            ),
+            (
+                "const typed = (cp: any): (() => void) => { return () => cp.exec(input); };",
+                1,
+            ),
+            (
+                "const typed = (cp: any): ((() => void) | undefined) => () => cp.exec(input);",
+                1,
+            ),
+            (
+                "const typed = (cp: any): { run(): void } => ({run(){cp.exec(input)}});",
+                1,
+            ),
+            (
+                "const typed = (other: any): (() => void) => () => cp.exec(input);",
+                2,
+            ),
+            (
+                "const callback = [1].map((cp: any): (number | null) => cp.exec(input));",
+                1,
+            ),
+            (
+                "const typed = (cp: any): <T = () => void>() => T => <T = () => void>() => cp.exec(input);",
+                1,
+            ),
+            (
+                "function typed(cp: any): (() => void) { return () => cp.exec(input); }",
+                1,
+            ),
+            (
+                "function typed(other: any): (() => void) { return () => cp.exec(input); }",
+                2,
+            ),
+            (
+                "function typed(cp: any): cp is { run(): void } { cp.exec(input); return true; }",
+                1,
+            ),
+            (
+                "function typed(cp: any): asserts cp is { run(): void } { cp.exec(input); }",
+                1,
+            ),
+            (
+                "const callback = (cp: any): any extends string ? number : null => cp.exec(input);",
+                1,
+            ),
+            (
+                "const conditional = input ? (cp) : (() => cp.exec(input));",
+                2,
+            ),
+            (
+                "const conditional = input ? (cp) : other => cp.exec(input);",
+                2,
+            ),
+            (
+                "const conditional = input ? (cp) : (other) => cp.exec(input);",
+                2,
+            ),
+            (
+                "const conditional = input ? (cp): number => cp.exec(input) : undefined;",
+                1,
+            ),
+            (
+                "const conditional = input ? (cp) : ((other: any) => (value: any): number => cp.exec(input));",
+                2,
+            ),
+            (
+                "const conditional = input ? (cp): number => cp.exec(input) : cp.exec(input);",
+                2,
+            ),
+            (
+                "const conditional = input ? cp => cp.exec(input) : cp.exec(input);",
+                2,
+            ),
+            (
+                "const conditional = input ? cp => cp.exec(input) : other => cp.exec(input);",
+                2,
+            ),
+        ] {
+            let source =
+                format!("const cp = require(\"child_process\");\n{declaration}\ncp.exec(input);\n");
+            let output = analyze("wrapped-types.ts", &source);
+            let lines = output
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+                .map(|finding| {
+                    output
+                        .locations
+                        .iter()
+                        .find(|location| Some(&location.id) == finding.location_id.as_ref())
+                        .unwrap()
+                        .start
+                        .unwrap()
+                        .line
+                })
+                .collect::<BTreeSet<_>>();
+            let expected_lines = if expected == 1 {
+                BTreeSet::from([3])
+            } else {
+                BTreeSet::from([2, 3])
+            };
+            assert_eq!(lines, expected_lines, "{declaration}");
+        }
+    }
+
+    #[test]
+    fn conditional_arrow_annotation_search_stops_before_a_following_label() {
+        let output = analyze(
+            "conditional-asi.ts",
+            "const cp = require(\"child_process\");\nconst conditional = input ? (cp) : other => cp.exec(input)\nlabel: cp.exec(input)\ncp.exec(input);",
+        );
+        let lines = output
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id.as_str() == "sast.javascript.exec-dynamic")
+            .map(|finding| {
+                output
+                    .locations
+                    .iter()
+                    .find(|location| Some(&location.id) == finding.location_id.as_ref())
+                    .unwrap()
+                    .start
+                    .unwrap()
+                    .line
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(lines, BTreeSet::from([2, 3, 4]));
     }
 
     #[test]

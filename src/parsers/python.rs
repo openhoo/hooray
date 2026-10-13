@@ -1,9 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
-use crate::model::{ComponentId, Scope};
+use crate::model::Scope;
+
+use super::LockComponents;
 pub(crate) fn parse_requirements(
     path: &str,
     bytes: &[u8],
@@ -134,7 +136,8 @@ pub(crate) fn parse_poetry_lock(
         ));
     };
     entry_bound(packages.len(), path, "poetry.lock")?;
-    let mut ids: BTreeMap<String, ComponentId> = BTreeMap::new();
+    let mut ids = LockComponents::new();
+    let mut registered = Vec::new();
     for package in packages {
         let name = package
             .get("name")
@@ -199,28 +202,142 @@ pub(crate) fn parse_poetry_lock(
             path,
             BTreeSet::new(),
         )?;
-        ids.insert(normalize_pypi_name(name), id);
+        ids.entry(normalize_pypi_name(name))
+            .or_default()
+            .insert(version.to_owned(), id.clone());
+        registered.push((id, package));
     }
-    for package in packages {
-        let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
-            continue;
-        };
-        let Some(from) = ids.get(&normalize_pypi_name(name)) else {
-            continue;
-        };
+    // A Poetry lock can contain multiple versions selected by environment
+    // markers. Keep the exact parent identity and resolve each declared
+    // dependency constraint rather than overwriting a name-only map.
+    // Only registered PyPI packages contribute edges; skipped source entries
+    // must not attach their dependency declarations to a public namesake.
+    for (from, package) in registered {
         let Some(deps) = package.get("dependencies").and_then(toml::Value::as_table) else {
             continue;
         };
-        for dep in deps.keys() {
+        for (dep, spec) in deps {
             if dep == "python" {
                 continue;
             }
-            if let Some(to) = ids.get(&normalize_pypi_name(dep)) {
-                out.edge(from, to, Scope::Runtime, false);
+            let Some(versions) = ids.get(&normalize_pypi_name(dep)) else {
+                continue;
+            };
+            // Marker-qualified alternatives are stored as arrays of tables;
+            // ordinary declarations are strings or a single version table.
+            let specs = spec
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_else(|| std::slice::from_ref(spec));
+            for spec in specs {
+                let requested = spec
+                    .as_str()
+                    .or_else(|| spec.get("version").and_then(toml::Value::as_str));
+                for (version, to) in versions {
+                    if requested.is_none_or(|requested| poetry_version_matches(version, requested))
+                    {
+                        out.edge(&from, to, Scope::Runtime, false);
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+/// All compatible locked variants may describe a marker-qualified
+/// dependency. Do not choose one by lexical order or fall back to a version
+/// that contradicts the declaration when none matches.
+fn poetry_version_matches(version: &str, requested: &str) -> bool {
+    if !poetry_operand_supported(version, false) {
+        return false;
+    }
+    let mut matched = false;
+    for alternative in requested.trim().split("||") {
+        // Empty alternatives or conjunctions are malformed, not vacuously
+        // true. Validate every clause even if another clause already fails.
+        if alternative.split(',').any(|part| part.trim().is_empty()) {
+            return false;
+        }
+        let normalized = alternative
+            .replace(">= ", ">=")
+            .replace("<= ", "<=")
+            .replace("> ", ">")
+            .replace("< ", "<")
+            .replace("= ", "=");
+        let mut matches = true;
+        for clause in normalized
+            .split(|character: char| character == ',' || character.is_whitespace())
+            .filter(|clause| !clause.is_empty())
+        {
+            let (operator, operand) =
+                ["~=", "!=", "===", "==", ">=", "<=", ">", "<", "=", "^", "~"]
+                    .into_iter()
+                    .find_map(|operator| {
+                        clause
+                            .strip_prefix(operator)
+                            .map(|operand| (operator, operand))
+                    })
+                    .unwrap_or(("", clause));
+            let wildcard = matches!(operator, "" | "=" | "==" | "===" | "!=");
+            if !poetry_operand_supported(operand, wildcard) {
+                return false;
+            }
+            let clause_matches = if operator == "~=" {
+                let parts = super::numeric_parts(operand).expect("validated numeric operand");
+                if parts.len() < 2 {
+                    return false;
+                }
+                super::version_cmp(version, operand) != std::cmp::Ordering::Less
+                    && super::numeric_prefix_matches(version, &parts[..parts.len() - 1])
+            } else if operator == "!=" {
+                !super::version_satisfies(version, &format!("={operand}"))
+            } else if wildcard {
+                super::version_satisfies(version, &format!("={operand}"))
+            } else {
+                super::version_satisfies(version, clause)
+            };
+            matches &= clause_matches;
+        }
+        matched |= matches;
+    }
+    matched
+}
+
+/// Only infer edges for operand forms understood by the shared comparator.
+/// Negating an unsupported comparison must not turn it into a match.
+fn poetry_operand_supported(operand: &str, wildcard: bool) -> bool {
+    if wildcard && (operand == "*" || operand.eq_ignore_ascii_case("x")) {
+        return true;
+    }
+    let operand = if wildcard {
+        operand
+            .strip_suffix(".*")
+            .or_else(|| operand.strip_suffix(".x"))
+            .or_else(|| operand.strip_suffix(".X"))
+            .unwrap_or(operand)
+    } else {
+        operand
+    };
+    let valid_suffix = |suffix: &str| {
+        suffix.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    };
+    let (operand, build) = operand
+        .split_once('+')
+        .map(|(operand, build)| (operand, Some(build)))
+        .unwrap_or((operand, None));
+    let (release, prerelease) = operand
+        .split_once('-')
+        .map(|(release, prerelease)| (release, Some(prerelease)))
+        .unwrap_or((operand, None));
+    build.is_none_or(valid_suffix)
+        && prerelease.is_none_or(valid_suffix)
+        && release.split('.').all(|part| part.parse::<u64>().is_ok())
 }
 
 pub(crate) fn parse_pipfile_lock(

@@ -104,6 +104,8 @@ name the fail-closed policy id (`fail-closed-applicability` or
 `fail-closed-license`). If both guards deny, each requires its own matching,
 unexpired exception; accepting unknown applicability alone cannot bypass
 unknown-license enforcement.
+An exception for a fail-closed guard waives only that guard. Ordinary policy
+rules still apply, including independent severity, license, and CVE denials.
 
 Exceptions are deliberately narrow and auditable. Every exception requires an
 ID, owner, reason, ticket, RFC 3339 expiry, and at least one exact selector.
@@ -545,7 +547,9 @@ format version is `1.0.0`; scan reports currently use schema version `1`.
 
 ## Configuration
 
-Pass a YAML or TOML file with global `--config FILE`. Files reject unknown
+Pass a YAML or TOML file with global `--config FILE`. Configuration files must
+be regular files, are limited to 1 MiB, and cannot be symbolic links. Reads
+reject special files such as FIFOs without waiting for a writer. Files reject unknown
 fields. Environment variables with the `HOORAY_` prefix override the loaded file
 or defaults; unknown `HOORAY_` variables are errors.
 

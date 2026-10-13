@@ -6,6 +6,8 @@ use serde_json::Value;
 use crate::input::{InputError, InventoryBuilder, entry_bound, malformed, malformed_msg, utf8};
 use crate::model::{ComponentId, License, Scope};
 
+use super::split_descriptor;
+
 #[derive(Deserialize)]
 struct NpmLock {
     #[serde(default)]
@@ -84,13 +86,35 @@ pub(crate) fn parse_package_lock(
     Ok(())
 }
 
+pub(crate) fn npm_workspace_paths(
+    path: &str,
+    bytes: &[u8],
+) -> Result<BTreeSet<String>, InputError> {
+    let lock: NpmLock = serde_json::from_str(utf8(bytes, path, "package-lock.json")?)
+        .map_err(|e| malformed(path, "package-lock.json", e))?;
+    entry_bound(lock.packages.len(), path, "package-lock.json")?;
+    Ok(lock
+        .packages
+        .into_keys()
+        .filter(|key| {
+            !key.is_empty() && !key.starts_with("node_modules/") && !key.contains("/node_modules/")
+        })
+        .collect())
+}
+
+/// An npm alias names the installed dependency key separately from its
+/// registry identity. Preserve the real package and its raw constraint.
+fn registry_identity<'a>(name: &'a str, version: &'a str) -> (&'a str, &'a str) {
+    match version.strip_prefix("npm:") {
+        Some(alias) => split_descriptor(alias).unwrap_or((alias, "*")),
+        None => (name, version),
+    }
+}
+
 /// Parses a `package.json` manifest: claims the package name/version as
 /// asset identity and records declared dependencies as components. A
 /// sibling package-lock.json already resolved these constraints, so only
 /// identity is claimed when one exists.
-// Wired to the `package.json` manifest route in input.rs by the engine
-// package (issue #154); the route table lives outside this module.
-#[allow(dead_code)]
 pub(crate) fn parse_package_json(
     path: &str,
     bytes: &[u8],
@@ -131,6 +155,7 @@ pub(crate) fn parse_package_json(
             if constraint.is_empty() {
                 continue;
             }
+            let (name, constraint) = registry_identity(name, constraint);
             out.add("npm", name, constraint, scope, path, BTreeSet::new())?;
         }
     }
@@ -321,6 +346,7 @@ fn collect_npm_dependency(
         .ok_or_else(|| malformed_msg(path, "package-lock.json", "dependency has no version"))?;
     let scope = npm_scope(dependency.dev, dependency.optional);
     entry_bound(out.components.len() + 1, path, "package-lock.json")?;
+    let (name, version) = registry_identity(name, version);
     let id = out.add("npm", name, version, scope, path, BTreeSet::new())?;
     if let Some(parent) = parent {
         out.edge(&parent, &id, scope, dependency.optional);

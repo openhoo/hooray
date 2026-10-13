@@ -10,7 +10,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Path, Query, Request, State,
+        DefaultBodyLimit, FromRequest, Path, Query, Request, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{
@@ -109,6 +109,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/policies/evaluate", post(evaluate_policy))
         .route("/v1/exceptions/validate", post(validate_exception))
         .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(max_body))
         .layer(middleware::from_fn(timeout_middleware))
         .layer(middleware::from_fn_with_state(
@@ -185,9 +186,33 @@ struct ScanRequest {
 
 async fn create_scan(
     State(state): State<ApiState>,
-    payload: Result<Json<ScanRequest>, JsonRejection>,
+    request: Request,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    scan_with_deadline(state, payload, REQUEST_TIMEOUT).await
+    let started = tokio::time::Instant::now();
+    // The route is exempt from cancellation once a store write starts. Bound
+    // extraction separately so an incomplete upload cannot exploit that
+    // exemption before any authoritative work has begun. Manual extraction
+    // retains the route's DefaultBodyLimit extension.
+    let request_id = request.extensions().get::<RequestId>().cloned();
+    let payload = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        Json::<ScanRequest>::from_request(request, &state),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::with_request_id(
+            StatusCode::GATEWAY_TIMEOUT,
+            "request_timeout",
+            "request body processing exceeded the time limit",
+            request_id,
+        )
+    })?;
+    scan_with_deadline(
+        state,
+        payload,
+        REQUEST_TIMEOUT.saturating_sub(started.elapsed()),
+    )
+    .await
 }
 
 /// POST /v1/scans must complete its authoritative store write once started, so
@@ -939,6 +964,14 @@ async fn not_found() -> ApiError {
     ApiError::not_found("route_not_found", "the requested route does not exist")
 }
 
+async fn method_not_allowed() -> ApiError {
+    ApiError::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "the requested method is not supported for this route",
+    )
+}
+
 #[derive(Clone)]
 struct RequestId(String);
 
@@ -1025,7 +1058,7 @@ impl IntoResponse for ApiError {
             version: API_VERSION,
             error: ErrorBody {
                 code: self.code,
-                message: self.message,
+                message: crate::integrations::redact_secrets(&self.message),
                 request_id: self.request_id,
             },
         };
@@ -1728,6 +1761,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_upload_timeout_does_not_wait_forever_for_incomplete_json() {
+        let pending_body = Body::from_stream(futures::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let request = Request::post(SCAN_SUBMIT_PATH)
+            .header(CONTENT_TYPE, "application/json")
+            .header(&REQUEST_ID_HEADER, "incomplete-upload")
+            .body(pending_body)
+            .unwrap();
+        let response = tokio::time::timeout(
+            REQUEST_TIMEOUT + Duration::from_secs(1),
+            app(Config {
+                offline: true,
+                ..Config::default()
+            })
+            .oneshot(request),
+        )
+        .await
+        .expect("scan JSON uploads must finish or time out within the processing bound")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(response.headers()[&REQUEST_ID_HEADER], "incomplete-upload");
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "request_timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_methods_preserve_allow_and_use_the_error_envelope() {
+        let response = app(Config::default())
+            .oneshot(
+                Request::put("/v1/scans")
+                    .header(&REQUEST_ID_HEADER, "unsupported-method")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[header::ALLOW], "POST");
+        assert_eq!(response.headers()[&REQUEST_ID_HEADER], "unsupported-method");
+        let body = json_body(response).await;
+        assert_eq!(body["version"], API_VERSION);
+        assert_eq!(body["error"]["code"], "method_not_allowed");
     }
 
     #[tokio::test]

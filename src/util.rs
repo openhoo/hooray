@@ -40,32 +40,29 @@ impl<'a> PurlBody<'a> {
 ///
 /// - the leading `pkg:` prefix is required;
 /// - everything from the first `?` or `#` on is cut before validation;
+/// - the package type and name are separated by `/`;
 /// - every `/`-separated segment must be non-empty (fail closed);
 /// - the version is the last `@` inside the final segment with both sides
-///   non-empty; a malformed final segment (e.g. a trailing `@`) yields no
-///   version, while a raw `@` in non-final namespace segments (npm scopes
+///   non-empty; a malformed final segment (e.g. a trailing `@`) is rejected,
+///   while a raw `@` in non-final namespace segments (npm scopes
 ///   like `@babel/core`) is tolerated verbatim.
 pub(crate) fn parse_purl_body(purl: &str) -> Option<PurlBody<'_>> {
     let body = purl.strip_prefix("pkg:")?;
     let body = body.split(['?', '#']).next().unwrap_or(body);
-    let final_segment = match body.rsplit_once('/') {
-        Some((namespace, name)) => {
-            if name.is_empty() || namespace.split('/').any(str::is_empty) {
-                return None;
-            }
-            name
-        }
-        None => body,
-    };
+    let (namespace, final_segment) = body.rsplit_once('/')?;
+    if namespace.split('/').any(str::is_empty) {
+        return None;
+    }
     if final_segment.is_empty() {
         return None;
     }
     // The version separator is the last `@` of the FINAL segment only, and
     // must leave both name and version non-empty; anything else fails closed.
-    let version = final_segment
-        .rsplit_once('@')
-        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
-        .map(|(_, version)| version);
+    let version = match final_segment.rsplit_once('@') {
+        Some((name, version)) if !name.is_empty() && !version.is_empty() => Some(version),
+        Some(_) => return None,
+        None => None,
+    };
     Some(PurlBody { version })
 }
 
@@ -288,13 +285,28 @@ mod tests {
     }
 
     #[test]
-    fn malformed_final_segments_fail_closed_without_a_version() {
-        assert_eq!(parse_purl_body("pkg:npm/a@").unwrap().version(), None);
-        assert_eq!(parse_purl_body("pkg:npm/@1").unwrap().version(), None);
-        assert_eq!(parse_purl_body("pkg:x/@1").unwrap().version(), None);
+    fn rejects_incomplete_purl_identity() {
+        for purl in ["pkg:foo", "pkg:cargo/a@", "pkg:cargo/@1"] {
+            assert!(
+                parse_purl_body(purl).is_none(),
+                "accepted malformed purl: {purl}"
+            );
+        }
+        assert!(parse_purl_body("pkg:cargo/a").is_some());
+        assert!(parse_purl_body("pkg:npm/@babel/core").is_some());
+    }
+
+    #[test]
+    fn malformed_final_segments_fail_closed() {
+        assert!(parse_purl_body("pkg:npm/a@").is_none());
+        assert!(parse_purl_body("pkg:npm/@1").is_none());
+        assert!(parse_purl_body("pkg:x/@1").is_none());
         // Last-`@` rule matches the previous rsplit semantics.
-        assert_eq!(parse_purl_body("pkg:a@b@1").unwrap().version(), Some("1"));
-        assert_eq!(parse_purl_body("pkg:a@b@").unwrap().version(), None);
+        assert_eq!(
+            parse_purl_body("pkg:cargo/a@b@1").unwrap().version(),
+            Some("1")
+        );
+        assert!(parse_purl_body("pkg:cargo/a@b@").is_none());
     }
 
     #[test]

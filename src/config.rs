@@ -1,7 +1,8 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    fmt, fs,
+    fmt,
+    io::{self, Read},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
@@ -12,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(test)]
+use std::fs;
+
 const DEFAULT_OSV_URL: &str = "https://api.osv.dev";
 const MAX_CONCURRENCY: usize = 256;
 const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -21,6 +25,7 @@ const MAX_ARCHIVE_ENTRIES: usize = 1_000_000;
 const MAX_TIMEOUT_SECS: u64 = 300;
 const MAX_MONITOR_INTERVAL_SECS: u64 = 86_400;
 const MAX_PATH_BYTES: usize = 4096;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(transparent)]
@@ -151,10 +156,27 @@ impl Config {
     }
 
     fn from_file(path: &Path) -> Result<Self, ConfigError> {
-        let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.to_owned(),
-            source,
-        })?;
+        let file =
+            crate::input::open_regular_nofollow(path).map_err(|error| ConfigError::Read {
+                path: path.to_owned(),
+                source: match error {
+                    crate::input::InputError::Io { source, .. } => source,
+                    error => io::Error::other(error),
+                },
+            })?;
+        let mut contents = String::new();
+        file.take(MAX_CONFIG_BYTES + 1)
+            .read_to_string(&mut contents)
+            .map_err(|source| ConfigError::Read {
+                path: path.to_owned(),
+                source,
+            })?;
+        if contents.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(ConfigError::TooLarge {
+                path: path.to_owned(),
+                maximum: MAX_CONFIG_BYTES,
+            });
+        }
         let extension = path
             .extension()
             .and_then(OsStr::to_str)
@@ -229,6 +251,8 @@ impl Config {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("configuration file {path} exceeds the {maximum} byte limit")]
+    TooLarge { path: PathBuf, maximum: u64 },
     #[error("failed to read configuration file {path}: {source}")]
     Read {
         path: PathBuf,
@@ -401,6 +425,40 @@ mod tests {
         assert_eq!(yaml.max_concurrency, 12);
         assert_eq!(toml.max_concurrency, 13);
         assert!(yaml.offline && toml.offline);
+    }
+
+    #[test]
+    fn config_read_enforces_byte_limit_before_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let mut contents = "offline: true\n#".to_owned();
+        contents.extend(std::iter::repeat_n(
+            '.',
+            MAX_CONFIG_BYTES as usize - contents.len(),
+        ));
+        fs::write(&path, &contents).unwrap();
+        assert!(Config::from_file(&path).unwrap().offline);
+        contents.push('.');
+        fs::write(&path, contents).unwrap();
+        assert!(matches!(
+            Config::from_file(&path),
+            Err(ConfigError::TooLarge { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_read_refuses_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let regular = directory.path().join("regular.yaml");
+        let link = directory.path().join("linked.yaml");
+        fs::write(&regular, "offline: true\n").unwrap();
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(matches!(
+            Config::from_file(&link),
+            Err(ConfigError::Read { .. })
+        ));
+        assert!(Config::from_file(&regular).unwrap().offline);
     }
 
     #[test]

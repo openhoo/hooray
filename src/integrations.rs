@@ -190,12 +190,11 @@ impl IntegrationGenerator {
         let locations = location_index(report);
         // The GitHub Checks API rejects any request carrying more than 50
         // annotations, so the emitted payload is capped there regardless of
-        // the configured selection limit; `truncated` still reports the
-        // configured-limit truncation.
-        let annotations: Vec<Value> = selected
+        // the configured selection limit. Missing locations must not consume
+        // that budget, and one extra annotation detects provider truncation.
+        let mut annotations: Vec<Value> = selected
             .items
             .iter()
-            .take(50)
             .filter_map(|finding| {
                 let location = report_location(&locations, finding)?;
                 let path = repository_relative_path(&location.path)?;
@@ -214,7 +213,16 @@ impl IntegrationGenerator {
                     "raw_details": format!("finding_id={} rule_id={}", finding.id, finding.rule_id)
                 }))
             })
+            .take(51)
             .collect();
+        let annotation_truncated = annotations.len() > 50;
+        annotations.truncate(50);
+        let mut summary = bounded_summary(selected.total, selected.items.len());
+        if annotation_truncated {
+            summary.push_str(
+                " Included 50 annotations; additional located findings were omitted by GitHub's limit.",
+            );
+        }
         let conclusion = if report.policy_summary.denied > 0 {
             "failure"
         } else {
@@ -226,14 +234,14 @@ impl IntegrationGenerator {
             "conclusion": conclusion,
             "output": {
                 "title": format!("{} denied, {} warnings", report.policy_summary.denied, report.policy_summary.warned),
-                "summary": bounded_summary(selected.total, selected.items.len()),
+                "summary": summary,
                 "annotations": annotations
             }
         });
         if let Some(url) = details_url {
             value["details_url"] = Value::String(url);
         }
-        self.json_artifact(value, selected.truncated)
+        self.json_artifact(value, selected.truncated || annotation_truncated)
     }
 
     pub fn gitlab_code_quality(
@@ -559,23 +567,19 @@ jobs:
         document_uri: &str,
     ) -> Result<GeneratedArtifact, IntegrationError> {
         let uri = validate_document_uri(document_uri)?;
-        let selected = self.selected_findings(report);
         let locations = location_index(report);
+        let document_path = uri
+            .strip_prefix("file://")
+            .and_then(crate::util::percent_decode_strict);
+        // Select within the requested document before applying its limit.
+        // An unlocated finding cannot be attached to an arbitrary file.
+        let selected = self.selected_findings_from(report.findings.values().filter(|finding| {
+            report_location(&locations, finding)
+                .is_some_and(|location| document_path.as_deref() == Some(location.path.as_str()))
+        }));
         let diagnostics: Vec<Value> = selected
             .items
             .iter()
-            .filter(|finding| {
-                // Diagnostics must attach to the exact document: a suffix
-                // match would attribute `main.rs` findings to
-                // `file:///repo/src/main.rs`. The URI path is decoded and
-                // compared in full.
-                report_location(&locations, finding).is_none_or(|location| {
-                    uri.strip_prefix("file://").is_some_and(|path| {
-                        crate::util::percent_decode_strict(path)
-                            .is_some_and(|decoded| decoded == location.path)
-                    })
-                })
-            })
             .map(|finding| lsp_diagnostic(&locations, finding, self))
             .collect();
         self.json_artifact(
@@ -622,7 +626,14 @@ jobs:
     }
 
     fn selected_findings<'a>(&self, report: &'a ScanReport) -> Selection<'a> {
-        let mut items: Vec<&Finding> = report.findings.values().collect();
+        self.selected_findings_from(report.findings.values())
+    }
+
+    fn selected_findings_from<'a>(
+        &self,
+        findings: impl IntoIterator<Item = &'a Finding>,
+    ) -> Selection<'a> {
+        let mut items: Vec<&Finding> = findings.into_iter().collect();
         items.sort_by(|left, right| {
             severity_rank(right.severity)
                 .cmp(&severity_rank(left.severity))
@@ -1001,7 +1012,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-fn redact_secrets(value: &str) -> String {
+pub(crate) fn redact_secrets(value: &str) -> String {
     const MARKERS: [&str; 7] = [
         "token", "password", "passwd", "secret", "api_key", "apikey", "key",
     ];
@@ -1372,6 +1383,60 @@ mod tests {
             check["output"]["annotations"][0]["path"],
             "src/finding:critical.rs"
         );
+    }
+
+    #[test]
+    fn github_check_run_fills_annotation_budget_after_omitting_unlocated_findings() {
+        let mut findings = (0..50)
+            .map(|index| {
+                finding(
+                    &format!("finding:a-unlocated-{index:03}"),
+                    FindingKind::Sast,
+                    Severity::High,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        findings.push(finding(
+            "finding:z-located",
+            FindingKind::Sast,
+            Severity::High,
+            true,
+        ));
+        let check = json_artifact(
+            generator(100)
+                .github_check_run(&report(findings), None)
+                .unwrap(),
+        );
+        assert_eq!(check["output"]["annotations"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            check["output"]["annotations"][0]["path"],
+            "src/finding:z-located.rs"
+        );
+    }
+
+    #[test]
+    fn github_check_run_reports_the_actual_annotation_cap() {
+        let findings = (0..51)
+            .map(|index| {
+                finding(
+                    &format!("finding:{index:03}"),
+                    FindingKind::Sast,
+                    Severity::High,
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        let artifact = generator(100)
+            .github_check_run(&report(findings), None)
+            .unwrap();
+        assert!(
+            artifact.truncated,
+            "GitHub's 50-annotation cap omits a finding"
+        );
+        let check = json_artifact(artifact);
+        assert_eq!(check["output"]["annotations"].as_array().unwrap().len(), 50);
+        assert!(check["output"]["summary"].as_str().unwrap().contains("50"));
     }
 
     #[test]

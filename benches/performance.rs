@@ -443,6 +443,9 @@ fn main() {
 
     // Regression guard for the quadratic per-finding path BFS: one shared
     // index must serve every component's applicability analysis.
+    // One advisory range keeps this case focused on the 2,000-component
+    // path index. The separate applicability_4000_events case above measures
+    // the full range workload without replaying it for every component here.
     let flat = flat_inventory_fixture(2_000);
     let flat_components: Vec<_> = flat.components.values().collect();
     let (iterations, elapsed) = measure(|| {
@@ -452,7 +455,7 @@ fn main() {
                 component,
                 paths: Some(black_box(&index)),
                 evidence: &evidence,
-                affected_ranges: black_box(&ranges),
+                affected_ranges: black_box(&ranges[..1]),
             }));
         }
     });

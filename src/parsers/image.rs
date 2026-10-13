@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use super::archive::{read_tar_file, read_tar_with_expanded};
 use crate::config::Config;
 use crate::input::{
-    InputError, base_name, malformed, malformed_msg, read_limited, reject_symlink_ancestors,
-    reject_symlink_ancestors_below, scan_virtual_files, sha256,
+    InputError, base_name, malformed, malformed_msg, normalize_relative, read_limited,
+    reject_symlink_ancestors, reject_symlink_ancestors_below, scan_virtual_files, sha256,
 };
 use crate::model::{Asset, AssetKind, Inventory};
 
@@ -73,15 +73,13 @@ pub(crate) fn scan_oci_tar(path: &Path, config: &Config) -> Result<Inventory, In
                 .map_err(|e| malformed("manifest.json", "Docker image manifest", e))?;
             let manifest =
                 select_docker_manifest(&docker, &outer).ok_or(InputError::MissingManifest)?;
+            let config_bytes = read_docker_blob(&outer, &manifest.config)?.to_vec();
             let mut filesystem = BTreeMap::new();
             let mut expanded = 0;
             for layer in &manifest.layers {
-                let bytes = outer
-                    .get(layer)
-                    .ok_or_else(|| InputError::MissingBlob(layer.clone()))?;
+                let bytes = read_docker_blob(&outer, layer)?;
                 apply_layer(bytes, None, config, &mut expanded, &mut filesystem)?;
             }
-            let config_bytes = outer.get(&manifest.config).cloned().unwrap_or_default();
             (
                 scan_virtual_files(path, AssetKind::ContainerImage, filesystem)?,
                 sha256(manifest_bytes),
@@ -204,8 +202,8 @@ fn select_docker_manifest<'a>(
     manifests
         .iter()
         .find(|manifest| {
-            outer
-                .get(&manifest.config)
+            read_docker_blob(outer, &manifest.config)
+                .ok()
                 .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
                 .is_some_and(|config| {
                     config.get("os").and_then(Value::as_str) == Some("linux")
@@ -213,6 +211,20 @@ fn select_docker_manifest<'a>(
                 })
         })
         .or_else(|| manifests.first())
+}
+
+/// Manifest references share the normalized, root-relative path namespace
+/// used when reading the TAR entries. Check references before lookup so
+/// `./blob` resolves consistently and traversal never becomes a missing blob.
+fn read_docker_blob<'a>(
+    outer: &'a BTreeMap<String, Vec<u8>>,
+    path: &str,
+) -> Result<&'a [u8], InputError> {
+    let normalized = normalize_relative(Path::new(path))?;
+    outer
+        .get(&normalized)
+        .map(Vec::as_slice)
+        .ok_or_else(|| InputError::MissingBlob(path.to_owned()))
 }
 
 fn apply_layer(
@@ -339,12 +351,11 @@ pub(crate) fn oci_tar_filesystem(
             .map_err(|e| malformed("manifest.json", "Docker image manifest", e))?;
         let manifest =
             select_docker_manifest(&docker, &outer).ok_or(InputError::MissingManifest)?;
+        read_docker_blob(&outer, &manifest.config)?;
         let mut filesystem = BTreeMap::new();
         let mut expanded = 0;
         for layer in &manifest.layers {
-            let bytes = outer
-                .get(layer)
-                .ok_or_else(|| InputError::MissingBlob(layer.clone()))?;
+            let bytes = read_docker_blob(&outer, layer)?;
             apply_layer(bytes, None, config, &mut expanded, &mut filesystem)?;
         }
         Ok(filesystem)
