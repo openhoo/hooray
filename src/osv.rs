@@ -224,8 +224,10 @@ impl OsvClient {
                 }));
             }
             // Ordered buffering preserves purl-order errors while retaining
-            // only a bounded number of completed chains. The shared budget
-            // admits IDs during page consumption, before any next-page fetch.
+            // only a bounded number of completed chains. Returning an earlier
+            // error drops unfinished later chains; they need not exhaust their
+            // own page budgets. The shared budget admits IDs during page
+            // consumption, before any next-page fetch.
             let mut outcomes = stream::iter(chains).buffered(self.concurrency);
             while let Some((index, outcome)) = outcomes.next().await {
                 vulnerability_ids.insert(chunk[index], outcome?);
@@ -2190,61 +2192,78 @@ mod tests {
 
     #[tokio::test]
     async fn fails_with_lowest_purl_when_concurrent_chains_exceed_page_limit() {
-        let server = MockServer::start().await;
         let purl_first = "pkg:npm/looped-a@1.0.0";
         let purl_second = "pkg:npm/looped-b@1.0.0";
-        Mock::given(method("POST"))
-            .and(path("/v1/querybatch"))
-            .and(body_json(json!({
-                "queries": [
-                    {"package": {"purl": purl_first}},
-                    {"package": {"purl": purl_second}},
-                ]
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "results": [
-                    {"vulns": [], "next_page_token": "token-a"},
-                    {"vulns": [], "next_page_token": "token-b"},
-                ]
-            })))
-            .mount(&server)
-            .await;
-        // Both chains echo a stable token forever, so each independently
-        // enforces `MAX_PAGES_PER_PURL` under concurrency; the scan must
-        // attribute the failure to the first failing purl in input order.
-        for (purl, token) in [(purl_first, "token-a"), (purl_second, "token-b")] {
+        // Exercise both relative speeds. An ordered earlier error cancels
+        // unfinished later chains; requiring every chain to reach the limit
+        // makes correct fail-fast behavior fail nondeterministically.
+        for delayed_purl in [purl_first, purl_second] {
+            let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/querybatch"))
                 .and(body_json(json!({
                     "queries": [
-                        {"package": {"purl": purl}, "page_token": token}
+                        {"package": {"purl": purl_first}},
+                        {"package": {"purl": purl_second}},
                     ]
                 })))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "results": [{
-                        "vulns": [],
-                        "next_page_token": token,
-                    }]
+                    "results": [
+                        {"vulns": [], "next_page_token": "token-a"},
+                        {"vulns": [], "next_page_token": "token-b"},
+                    ]
                 })))
-                .expect(MAX_PAGES_PER_PURL as u64)
                 .mount(&server)
                 .await;
+            // Both chains echo a stable token forever. The lowest PURL must
+            // exhaust its exact budget; the later one may complete or be canceled,
+            // but neither may request beyond MAX_PAGES_PER_PURL.
+            for (purl, token) in [(purl_first, "token-a"), (purl_second, "token-b")] {
+                Mock::given(method("POST"))
+                    .and(path("/v1/querybatch"))
+                    .and(body_json(json!({
+                        "queries": [
+                            {"package": {"purl": purl}, "page_token": token}
+                        ]
+                    })))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_delay(if purl == delayed_purl {
+                                Duration::from_millis(10)
+                            } else {
+                                Duration::ZERO
+                            })
+                            .set_body_json(json!({
+                                "results": [{
+                                    "vulns": [],
+                                    "next_page_token": token,
+                                }]
+                            })),
+                    )
+                    .expect(if purl == purl_first {
+                        MAX_PAGES_PER_PURL as u64..=MAX_PAGES_PER_PURL as u64
+                    } else {
+                        0..=MAX_PAGES_PER_PURL as u64
+                    })
+                    .mount(&server)
+                    .await;
+            }
+
+            let error = OsvClient::new(&server.uri(), 2)
+                .unwrap()
+                .scan(&inventory([
+                    component("component:looped-a", "looped-a", "1.0.0", purl_first),
+                    component("component:looped-b", "looped-b", "1.0.0", purl_second),
+                ]))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                OsvError::PageLimit { purl, maximum }
+                    if purl == purl_first && maximum == MAX_PAGES_PER_PURL
+            ));
         }
-
-        let error = OsvClient::new(&server.uri(), 2)
-            .unwrap()
-            .scan(&inventory([
-                component("component:looped-a", "looped-a", "1.0.0", purl_first),
-                component("component:looped-b", "looped-b", "1.0.0", purl_second),
-            ]))
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            OsvError::PageLimit { purl, maximum }
-                if purl == purl_first && maximum == MAX_PAGES_PER_PURL
-        ));
     }
 
     #[tokio::test]

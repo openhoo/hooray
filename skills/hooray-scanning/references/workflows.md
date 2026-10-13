@@ -50,7 +50,7 @@ a filtered result is not proof that all existing findings were repaired.
 
 Hooray's GitLab Code Quality format is `gitlab-code-quality`. Hoolicy uses a
 different spelling. Supported full-report formats include JSON/YAML/table,
-SARIF, JUnit, HTML, CycloneDX-VEX, SPDX, CSV, and JSON-lines. Inventory/history/
+SARIF, JUnit, HTML, Markdown, CycloneDX-VEX, SPDX, CSV, and JSON-lines. Inventory/history/
 standalone policy evaluation support JSON/YAML only.
 
 The `gitlab-artifacts` format creates an atomic directory bundle on Linux,
@@ -67,3 +67,32 @@ Configuration fields use snake_case; known `HOORAY_` variables override them,
 and unknown prefixed variables fail. Keep database/cache paths and authentication
 outside committed fixtures. API serving and recurring monitoring are separate
 requested operations, not prerequisites for a one-off scan.
+
+## Tooling exports
+
+Use a supporting source build for Markdown and `integrations export`; the
+published `0.9.0` binary predates these additions. A stored report can produce
+many outputs without another scan or network query:
+
+```bash
+hooray report 'run:UUID' --format markdown --output hooray-summary.md
+hooray integrations export 'run:UUID' --kind github-check --head-sha "$GITHUB_SHA" --output check.json
+hooray integrations export 'run:UUID' --kind slack --output slack.json
+hooray integrations export 'run:UUID' --kind jira --project-key SEC --output issue.json
+hooray integrations export 'run:UUID' --kind vscode --output diagnostics.json
+hooray integrations export 'run:CURRENT' --kind pr-gate --baseline 'run:BASELINE' --output gate.json
+```
+
+Exports write local payloads and perform no delivery. GitHub Checks includes
+the commit SHA and no more than 50 annotations. Jira uses REST v2 wiki text,
+not Cloud v3 ADF. LSP additionally requires `--document-uri` and emits only
+findings whose decoded path matches it exactly. `--max-items` defaults to 500;
+payload size is bounded to 1 MiB and omitted entries remain explicit.
+Use an explicit absolute `--workspace-root` for `vscode`/`lsp` when locations
+are repository-relative; exports never guess the editor workspace or rewrite
+stored reports.
+
+Preserve exit status `1` while collecting denied-scan exports. A `pr-gate`
+baseline must refer to the same asset and gates new denied findings; unscoped
+report-level denial always blocks. Existing denials are not a full-policy pass.
+Operational/configuration/export failures exit `2`.

@@ -19,6 +19,7 @@ use crate::{
 
 const SARIF_SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
 const HOORAY_SETUP_ACTION_REVISION: &str = "f2b28d71398749142f4d9366b0427369f3af6e02";
+const GITHUB_ARTIFACT_ACTION_REVISION: &str = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const WEBHOOK_SIGNATURE_VERSION: &str = "v1";
 const REDACTED: &str = "[REDACTED]";
 const MIN_WEBHOOK_SECRET_BYTES: usize = 16;
@@ -85,6 +86,10 @@ pub struct PullRequestGate {
     pub passed: bool,
     pub introduced_findings: usize,
     pub new_denied_decisions: Vec<DeniedDecision>,
+    /// Report-level denials (such as incomplete inventory) have no finding
+    /// identity and cannot safely be grandfathered by a finding-only diff.
+    #[serde(default)]
+    pub unscoped_denied_decisions: Vec<UnscopedDeniedDecision>,
     pub truncated: bool,
 }
 
@@ -92,6 +97,12 @@ pub struct PullRequestGate {
 pub struct DeniedDecision {
     pub policy_id: String,
     pub finding_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct UnscopedDeniedDecision {
+    pub policy_id: String,
     pub reason: String,
 }
 
@@ -191,13 +202,20 @@ impl IntegrationGenerator {
         // The GitHub Checks API rejects any request carrying more than 50
         // annotations, so the emitted payload is capped there regardless of
         // the configured selection limit. Missing locations must not consume
-        // that budget, and one extra annotation detects provider truncation.
+        // that budget. Count every selected source location to explain omissions.
+        let mut unlocated = 0;
         let mut annotations: Vec<Value> = selected
             .items
             .iter()
             .filter_map(|finding| {
-                let location = report_location(&locations, finding)?;
-                let path = repository_relative_path(&location.path)?;
+                let Some((location, path)) =
+                    report_location(&locations, finding).and_then(|location| {
+                        repository_relative_path(&location.path).map(|path| (location, path))
+                    })
+                else {
+                    unlocated += 1;
+                    return None;
+                };
                 let start_line = location.start.map_or(1, |value| value.line.max(1));
                 let end_line = location
                     .end
@@ -208,16 +226,20 @@ impl IntegrationGenerator {
                     "start_line": start_line,
                     "end_line": end_line,
                     "annotation_level": github_annotation_level(finding.severity),
-                    "title": self.finding_title(finding),
+                    "title": self.finding_title(finding).chars().take(255).collect::<String>(),
                     "message": self.finding_message(finding),
                     "raw_details": format!("finding_id={} rule_id={}", finding.id, finding.rule_id)
                 }))
             })
-            .take(51)
             .collect();
         let annotation_truncated = annotations.len() > 50;
         annotations.truncate(50);
-        let mut summary = bounded_summary(selected.total, selected.items.len());
+        let mut summary = format!(
+            "{} Added {} source annotations; {} selected findings have no repository-relative location.",
+            bounded_summary(selected.total, selected.items.len()),
+            annotations.len(),
+            unlocated,
+        );
         if annotation_truncated {
             summary.push_str(
                 " Included 50 annotations; additional located findings were omitted by GitHub's limit.",
@@ -339,6 +361,8 @@ impl IntegrationGenerator {
                 })
             })
             .collect();
+        let listed = top.len();
+        let truncated = listed < selected.total;
         let status = if report.policy_summary.denied == 0 {
             "PASSED"
         } else {
@@ -350,14 +374,14 @@ impl IntegrationGenerator {
                 { "type": "mrkdwn", "text": format!("*Denied:* {}", report.policy_summary.denied) },
                 { "type": "mrkdwn", "text": format!("*Warnings:* {}", report.policy_summary.warned) },
                 { "type": "mrkdwn", "text": format!("*Findings:* {}", report.findings.len()) },
-                { "type": "mrkdwn", "text": format!("*Run:* `{}`", escape_slack(report.run.id.as_str())) }
+                { "type": "mrkdwn", "text": format!("*Run:* `{}`", truncate_utf8(&escape_slack(&self.clean_text(report.run.id.as_str())), 1900)) }
             ] }),
         ];
         if !top.is_empty() {
             blocks.push(json!({ "type": "section", "fields": top }));
         }
-        if selected.truncated {
-            blocks.push(json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": bounded_summary(selected.total, selected.items.len()) }] }));
+        if truncated {
+            blocks.push(json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": bounded_summary(selected.total, listed) }] }));
         }
         if let Some(url) = dashboard_url {
             blocks.push(json!({ "type": "actions", "elements": [{ "type": "button", "text": { "type": "plain_text", "text": "View report" }, "url": url }] }));
@@ -367,7 +391,7 @@ impl IntegrationGenerator {
                 "text": format!("Hooray scan {status}: {} denied, {} warnings", report.policy_summary.denied, report.policy_summary.warned),
                 "blocks": blocks
             }),
-            selected.truncated,
+            truncated,
         )
     }
 
@@ -375,7 +399,6 @@ impl IntegrationGenerator {
     /// Pure function: deterministic ordering, deny findings before warnings,
     /// capped at MAX_LISTED_FINDINGS entries like the Slack summary.
     pub fn jira_issue(&self, report: &ScanReport) -> Value {
-        let selected = self.selected_findings(report);
         let mut outcomes_by_finding: BTreeMap<&FindingId, (bool, bool)> = BTreeMap::new();
         for decision in &report.policy_decisions {
             let Some(finding_id) = decision.finding_id.as_ref() else {
@@ -388,6 +411,27 @@ impl IntegrationGenerator {
                 PolicyOutcome::Allow => {}
             }
         }
+        // Choose policy denials before warnings before applying the configured
+        // limit, so low-severity denials cannot be displaced by warnings.
+        let mut items: Vec<&Finding> = report.findings.values().collect();
+        items.sort_by(|left, right| {
+            let rank = |finding: &Finding| match outcomes_by_finding.get(&finding.id) {
+                Some((true, _)) => 0,
+                Some((_, true)) => 1,
+                _ => 2,
+            };
+            rank(left)
+                .cmp(&rank(right))
+                .then_with(|| severity_rank(right.severity).cmp(&severity_rank(left.severity)))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let total = items.len();
+        items.truncate(self.limits.max_annotations);
+        let selected = Selection {
+            truncated: items.len() < total,
+            items,
+            total,
+        };
         let mut denied_lines: Vec<String> = Vec::new();
         let mut warned_lines: Vec<String> = Vec::new();
         for finding in &selected.items {
@@ -398,7 +442,7 @@ impl IntegrationGenerator {
             let line = format!(
                 "* *{}* {{{}}} — {}",
                 finding.severity,
-                finding.rule_id.as_str(),
+                escape_jira_wiki(&self.clean_text(finding.rule_id.as_str())),
                 escape_jira_wiki(&self.finding_title(finding)),
             );
             if denied {
@@ -409,25 +453,19 @@ impl IntegrationGenerator {
         }
         denied_lines.truncate(MAX_LISTED_FINDINGS);
         let warn_budget = MAX_LISTED_FINDINGS - denied_lines.len();
-        let warn_omitted = warned_lines.len().saturating_sub(warn_budget);
         warned_lines.truncate(warn_budget);
 
-        let description = jira_description(
-            &denied_lines,
-            &warned_lines,
-            warn_omitted,
-            &selected,
-            report,
-        );
-        let summary: String = format!(
-            "Hooray scan: {} denied, {} warnings ({})",
-            report.policy_summary.denied,
-            report.policy_summary.warned,
-            report.run.id.as_str(),
-        )
-        .chars()
-        .take(JIRA_MAX_SUMMARY_CHARS)
-        .collect();
+        let description = jira_description(&denied_lines, &warned_lines, &selected, report);
+        let summary: String = self
+            .clean_text(&format!(
+                "Hooray scan: {} denied, {} warnings ({})",
+                report.policy_summary.denied,
+                report.policy_summary.warned,
+                report.run.id.as_str(),
+            ))
+            .chars()
+            .take(JIRA_MAX_SUMMARY_CHARS)
+            .collect();
         json!({
             "fields": {
                 "summary": summary,
@@ -461,14 +499,18 @@ on:
 
 permissions:
   contents: read
-  security-events: write
-  checks: write
 
 jobs:
   hooray:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: openhoo/hooray/actions/setup@{} # v0.6.5
         with:
           version: {}
@@ -480,25 +522,64 @@ jobs:
           set +e
           status_file="$RUNNER_TEMP/hooray-scan-status"
           rm -f "$status_file" hooray.sarif
+          command_marker="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+          if [[ -z "$command_marker" ]]; then
+            printf '2\n' > "$status_file"
+            printf 'status=2\n' >> "$GITHUB_OUTPUT"
+            exit 2
+          fi
+          printf '::stop-commands::%s\n' "$command_marker"
           hooray scan project . --format sarif --output hooray.sarif
           status=$?
+          printf '::%s::\n' "$command_marker"
           set -e
-          if [[ "$status" -le 1 && -s hooray.sarif ]]; then
-            printf '%s\n' "$status" > "$status_file"
-            printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
-            exit "$status"
-          fi
-          if [[ "$status" -le 1 ]]; then
-            echo "::error::Hooray did not produce hooray.sarif."
-            status=2
-          fi
+          case "$status" in
+            0|1)
+              if [[ ! -s hooray.sarif ]]; then
+                echo "::error::Hooray did not produce hooray.sarif."
+                status=2
+              fi
+              ;;
+            *) status=2 ;;
+          esac
           printf '%s\n' "$status" > "$status_file"
           printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
           exit "$status"
+      - name: Summarize Hooray scan
+        if: always()
+        shell: bash
+        run: |
+          status_file="$RUNNER_TEMP/hooray-scan-status"
+          status="$(cat "$status_file" 2>/dev/null || printf '2')"
+          case "$status" in
+            0) outcome='Passed' ;;
+            1) outcome='Policy denied' ;;
+            *) outcome='Operational error'; status=2 ;;
+          esac
+          {{
+            printf '## Hooray: %s\n\n' "$outcome"
+            printf 'Scanner exit status: `%s` (0: passed, 1: policy denied, 2: operational error).\n\n' "$status"
+            if [[ "$status" -le 1 ]]; then
+              jq -r '.runs[0].properties.policySummary | "| Allowed | Warnings | Denied |\n| --- | --- | --- |\n| \(.allowed) | \(.warned) | \(.denied) |"' hooray.sarif
+              printf '\nDownload the Hooray artifact for the full SARIF report.\n'
+            fi
+          }} >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain Hooray report
+        uses: actions/upload-artifact@{} # v7.0.1
+        if: always() && (steps.scan.outputs.status == '0' || steps.scan.outputs.status == '1')
+        with:
+          name: hooray-report
+          path: hooray.sarif
+          if-no-files-found: error
+          retention-days: 14
       - uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v4.37.9
-        if: steps.scan.outputs.status == '0' || steps.scan.outputs.status == '1'
+        # SARIF uploads on pull_request support restricted fork tokens.
+        # Dependabot pushes cannot write security events. Set the repository
+        # variable HOORAY_UPLOAD_SARIF=false when code scanning is unavailable.
+        if: always() && (steps.scan.outputs.status == '0' || steps.scan.outputs.status == '1') && vars.HOORAY_UPLOAD_SARIF != 'false' && (github.event_name == 'pull_request' || github.actor != 'dependabot[bot]')
         with:
           sarif_file: hooray.sarif
+          category: hooray
       - name: Enforce Hooray scan status
         if: always()
         shell: bash
@@ -512,6 +593,7 @@ jobs:
 "#,
                 HOORAY_SETUP_ACTION_REVISION,
                 env!("CARGO_PKG_VERSION"),
+                GITHUB_ARTIFACT_ACTION_REVISION,
             ),
         )
     }
@@ -533,10 +615,186 @@ jobs:
         } else {
             ""
         };
-        let template = format!(
-            "stages: [test, security-gate]\n\nhooray_security:\n  stage: test\n  image:\n    name: $HOORAY_IMAGE\n    entrypoint: [\"\"]\n  allow_failure: false\n  variables:\n    HOORAY_INPUT: \".\"\n    HOORAY_POLICY: \"hooray-policy.yaml\"\n  rules:\n    - if: '$HOORAY_DISABLED == \"true\"'\n      when: never\n    - when: on_success\n  script:\n    - |\n      set +e\n      hooray scan auto \"$HOORAY_INPUT\" --policy \"$HOORAY_POLICY\" --format gitlab-artifacts --output .hooray-gitlab\n      status=$?\n      set -e\n      test \"$status\" -le 1\n  artifacts:\n    when: always\n    expire_in: 1 week\n    paths: [.hooray-gitlab/]\n    reports:\n      codequality: .hooray-gitlab/gl-code-quality-report.json\n      junit: .hooray-gitlab/gl-junit-report.xml\n      dotenv: .hooray-gitlab/hooray.env\n{security}\nhooray_policy:\n  stage: security-gate\n  image: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce\n  allow_failure: false\n  rules:\n    - if: '$HOORAY_DISABLED == \"true\"'\n      when: never\n    - when: always\n  needs:\n    - job: hooray_security\n      artifacts: true\n  script:\n    - |\n      file=.hooray-gitlab/hooray.env\n      test -f \"$file\"\n      test \"$(wc -l < \"$file\")\" -eq 2\n      test \"$(grep -c '^HOORAY_POLICY_DENIED=' \"$file\")\" -eq 1\n      test \"$(grep -c '^HOORAY_POLICY_DENIED_COUNT=' \"$file\")\" -eq 1\n      test -z \"$(grep -Ev '^(HOORAY_POLICY_DENIED=(true|false)|HOORAY_POLICY_DENIED_COUNT=[0-9]+)$' \"$file\")\"\n      denied=$(awk -F= '$1 == \"HOORAY_POLICY_DENIED\" {{ print $2 }}' \"$file\")\n      test \"$denied\" = false\n"
+        let template = r#"# Configure HOORAY_IMAGE with a verified Hooray image ending in @sha256:<64 hex digits>.
+# gitlab-security requires GitLab 19.2+ Ultimate for SARIF ingestion.
+stages: [test, security-gate]
+
+hooray_security:
+  stage: test
+  image:
+    name: $HOORAY_IMAGE
+    entrypoint: [""]
+  allow_failure: false
+  variables:
+    HOORAY_INPUT: "."
+    HOORAY_POLICY: "hooray-policy.yaml"
+  rules:
+    - if: '$HOORAY_DISABLED == "true"'
+      when: never
+    - when: on_success
+  script:
+    - |
+__SCAN_SCRIPT__
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths: [.hooray-gitlab/]
+    reports:
+      codequality: .hooray-gitlab/gl-code-quality-report.json
+      junit: .hooray-gitlab/gl-junit-report.xml
+      dotenv: .hooray-gitlab/hooray.env
+__SECURITY__
+hooray_policy:
+  stage: security-gate
+  image: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+  allow_failure: false
+  rules:
+    - if: '$HOORAY_DISABLED == "true"'
+      when: never
+    - when: always
+  needs:
+    - job: hooray_security
+      artifacts: true
+  script:
+    - |
+__GATE_SCRIPT__
+"#
+        .replace("__SCAN_SCRIPT__", &indent_script(&gitlab_scan_script(), 6))
+        .replace("__SECURITY__", security)
+        .replace(
+            "__GATE_SCRIPT__",
+            &indent_script(&policy_env_script(".hooray-gitlab/hooray.env"), 6),
         );
         self.text_artifact("text/yaml", &template)
+    }
+
+    /// Azure DevOps Services pipeline using a consumer-provisioned verified
+    /// executable. Reports survive denials; the final step preserves 0/1/2.
+    pub fn azure_pipelines_yaml(&self) -> Result<GeneratedArtifact, IntegrationError> {
+        let template = r#"# Provision a verified Hooray executable on the Linux agent and set hoorayExecutable.
+# Requires PublishPipelineArtifact (Azure DevOps Services); use PublishBuildArtifacts on Server.
+trigger:
+  branches:
+    include: [main]
+pr:
+  branches:
+    include: ['*']
+pool:
+  vmImage: ubuntu-latest
+variables:
+  hoorayExecutable: ''
+  hoorayInput: '.'
+  hoorayPolicy: 'hooray-policy.yaml'
+  hoorayReportReady: 'false'
+steps:
+  - checkout: self
+    persistCredentials: false
+  - bash: |
+      set -eu
+      status_file="$HR_STATUS_FILE"
+      log_file="$HR_SCAN_LOG_FILE"
+      rm -f "$status_file" "$log_file"
+      printf '2\n' > "$status_file"
+      set +e
+      (
+__SCAN_SCRIPT__
+      ) > "$log_file" 2>&1
+      status=$?
+      set -e
+      # Escape Azure command markers everywhere: the agent can recognize them
+      # after a prefix too. Repository-controlled scanner output stays inert.
+      sed -e 's/##vso\[/# #vso[/g' -e 's/##\[/# #[/g' -e 's/^/hooray: /' "$log_file"
+      printf '%s\n' "$status" > "$status_file"
+      if [ "$status" -le 1 ]; then
+        printf '##vso[task.setvariable variable=hoorayReportReady]true\n'
+      fi
+      exit "$status"
+    displayName: Scan with Hooray
+    continueOnError: true
+    env:
+      HR_STATUS_FILE: $(Agent.TempDirectory)/hooray-scan-status
+      HR_SCAN_LOG_FILE: $(Agent.TempDirectory)/hooray-scan.log
+      HOORAY_EXECUTABLE: $(hoorayExecutable)
+      HOORAY_INPUT: $(hoorayInput)
+      HOORAY_POLICY: $(hoorayPolicy)
+  - task: PublishTestResults@2
+    displayName: Publish Hooray scan findings
+    condition: and(always(), eq(variables['hoorayReportReady'], 'true'))
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: .hooray-reports/gl-junit-report.xml
+      testRunTitle: Hooray scan findings
+      failTaskOnFailedTests: false
+      failTaskOnMissingResultsFile: true
+      failTaskOnFailureToPublishResults: true
+  - task: PublishPipelineArtifact@1
+    displayName: Retain Hooray reports
+    condition: and(always(), eq(variables['hoorayReportReady'], 'true'))
+    inputs:
+      targetPath: .hooray-reports
+      artifact: hooray-report
+  - bash: |
+      status="$(cat "$HR_STATUS_FILE" 2>/dev/null || printf '2')"
+      case "$status" in
+        0|1|2) exit "$status" ;;
+        *) echo 'Hooray did not report a valid exit status.' >&2; exit 2 ;;
+      esac
+    displayName: Enforce Hooray scan status
+    condition: always()
+    env:
+      HR_STATUS_FILE: $(Agent.TempDirectory)/hooray-scan-status
+"#
+        .replace("__SCAN_SCRIPT__", &indent_script(&portable_ci_scan_script(), 8));
+        self.text_artifact("text/yaml", &template)
+    }
+
+    /// Declarative Jenkins pipeline using a consumer-provisioned verified
+    /// executable and the JUnit plugin. Reports survive policy denials.
+    pub fn jenkins_pipeline(&self) -> Result<GeneratedArtifact, IntegrationError> {
+        let template = r#"// Provision a verified Hooray executable on a Linux agent before running this pipeline.
+// Requires Declarative Pipeline and the JUnit plugin.
+pipeline {
+    agent { label 'linux' }
+    parameters {
+        string(name: 'HOORAY_EXECUTABLE', defaultValue: '', description: 'Path to a verified Hooray executable')
+        string(name: 'HOORAY_INPUT', defaultValue: '.', description: 'Input to scan')
+        string(name: 'HOORAY_POLICY', defaultValue: 'hooray-policy.yaml', description: 'Policy file')
+    }
+    environment {
+        HR_SCAN_STATUS = '2'
+    }
+    stages {
+        stage('Hooray security scan') {
+            steps {
+                script {
+                    int status = sh(returnStatus: true, script: '''
+__SCAN_SCRIPT__
+''')
+                    env.HR_SCAN_STATUS = (status in [0, 1]) ? status.toString() : '2'
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                if (env.HR_SCAN_STATUS in ['0', '1']) {
+                    archiveArtifacts artifacts: '.hooray-reports/*', allowEmptyArchive: false, fingerprint: true
+                    junit testResults: '.hooray-reports/gl-junit-report.xml', allowEmptyResults: false, skipMarkingBuildUnstable: true
+                }
+                sh '''
+case "$HR_SCAN_STATUS" in
+  0|1|2) exit "$HR_SCAN_STATUS" ;;
+  *) echo 'Hooray did not report a valid exit status.' >&2; exit 2 ;;
+esac
+'''
+            }
+        }
+    }
+}
+"#
+        .replace("__SCAN_SCRIPT__", &portable_ci_scan_script());
+        self.text_artifact("text/x-groovy", &template)
     }
 
     pub fn vscode_diagnostics(
@@ -599,6 +857,17 @@ jobs:
 
     pub fn pull_request_gate(&self, diff: &FindingDiff, current: &ScanReport) -> PullRequestGate {
         let introduced: BTreeSet<&FindingId> = diff.introduced.iter().collect();
+        let mut unscoped: Vec<UnscopedDeniedDecision> = current
+            .policy_decisions
+            .iter()
+            .filter(|decision| {
+                decision.outcome == PolicyOutcome::Deny && decision.finding_id.is_none()
+            })
+            .map(|decision| UnscopedDeniedDecision {
+                policy_id: decision.policy_id.to_string(),
+                reason: self.clean_text(&decision.reason),
+            })
+            .collect();
         let mut denied: Vec<DeniedDecision> = current
             .policy_decisions
             .iter()
@@ -615,12 +884,17 @@ jobs:
             })
             .collect();
         denied.sort();
-        let truncated = denied.len() > self.limits.max_annotations;
-        denied.truncate(self.limits.max_annotations);
+        unscoped.sort();
+        let passed = denied.is_empty() && unscoped.is_empty();
+        let truncated = denied.len() + unscoped.len() > self.limits.max_annotations;
+        // Report-level guards take priority over individual annotations.
+        unscoped.truncate(self.limits.max_annotations);
+        denied.truncate(self.limits.max_annotations - unscoped.len());
         PullRequestGate {
-            passed: denied.is_empty() && !truncated,
+            passed,
             introduced_findings: diff.introduced.len(),
             new_denied_decisions: denied,
+            unscoped_denied_decisions: unscoped,
             truncated,
         }
     }
@@ -677,7 +951,14 @@ jobs:
     }
 
     fn clean_text(&self, value: &str) -> String {
-        truncate_utf8(&redact_secrets(value), self.limits.max_text_bytes)
+        let cleaned: String = value
+            .chars()
+            .filter(|character| {
+                !matches!(*character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}')
+                    && (!character.is_control() || matches!(*character, '\n' | '\t'))
+            })
+            .collect();
+        truncate_utf8(&redact_secrets(&cleaned), self.limits.max_text_bytes)
     }
 
     fn json_artifact(
@@ -716,6 +997,107 @@ jobs:
             Ok(())
         }
     }
+}
+
+fn indent_script(script: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    script
+        .lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reads the artifact itself rather than trusting inherited dotenv variables.
+/// Every malformed/missing input is operational failure; a well-formed denial
+/// is policy failure. No report content is evaluated as shell code.
+fn policy_env_script(path: &str) -> String {
+    format!(
+        r#"set -eu
+file={path}
+invalid() {{ echo 'Hooray policy artifact is missing or invalid.' >&2; exit 2; }}
+if [ ! -f "$file" ] || [ -L "$file" ]; then invalid; fi
+if [ "$(wc -c < "$file")" -gt 128 ]; then invalid; fi
+if [ "$(wc -l < "$file")" -ne 2 ]; then invalid; fi
+if [ "$(grep -ac '^HOORAY_POLICY_DENIED=' "$file")" -ne 1 ]; then invalid; fi
+if [ "$(grep -ac '^HOORAY_POLICY_DENIED_COUNT=' "$file")" -ne 1 ]; then invalid; fi
+if grep -qaEv '^(HOORAY_POLICY_DENIED=(true|false)|HOORAY_POLICY_DENIED_COUNT=(0|[1-9][0-9]{{0,19}}))$' "$file"; then invalid; fi
+if ! awk -F= '$1 == "HOORAY_POLICY_DENIED_COUNT" && length($2) == 20 && ("x" $2 > "x18446744073709551615") {{ exit 1 }}' "$file"; then invalid; fi
+denied=$(awk -F= '$1 == "HOORAY_POLICY_DENIED" {{ print $2 }}' "$file")
+count=$(awk -F= '$1 == "HOORAY_POLICY_DENIED_COUNT" {{ print $2 }}' "$file")
+# Validate the exact writer bytes as well: some grep/awk implementations
+# ignore embedded NUL bytes even in text mode.
+if ! printf 'HOORAY_POLICY_DENIED=%s\nHOORAY_POLICY_DENIED_COUNT=%s\n' "$denied" "$count" | cmp -s "$file" -; then invalid; fi
+case "$denied:$count" in
+  false:0) exit 0 ;;
+  true:0|false:*) invalid ;;
+  true:*) exit 1 ;;
+  *) invalid ;;
+esac"#,
+    )
+}
+
+fn portable_ci_scan_script() -> String {
+    let script = r#"set -eu
+output=.hooray-reports
+input=${HOORAY_INPUT:-.}
+policy=${HOORAY_POLICY:-hooray-policy.yaml}
+executable=${HOORAY_EXECUTABLE:-}
+# Integration variables are not Hooray configuration. Preserve documented
+# scanner HOORAY_* settings while removing these wrapper-only variables.
+unset HOORAY_EXECUTABLE HOORAY_INPUT HOORAY_POLICY HOORAY_IMAGE HOORAY_DISABLED HOORAY_POLICY_DENIED HOORAY_POLICY_DENIED_COUNT
+case "$executable" in
+  ''|-*) echo 'Configure the path to a verified Hooray executable.' >&2; exit 2 ;;
+esac
+# This fixed directory is owned by this CI job. Clear prior build artifacts.
+if ! rm -rf -- "$output"; then
+  echo 'Cannot clear prior Hooray report artifacts.' >&2
+  exit 2
+fi
+set +e
+"$executable" scan auto "$input" --policy "$policy" --format gitlab-artifacts --output "$output"
+status=$?
+set -e
+case "$status" in
+  0|1) ;;
+  *) echo 'Hooray scan failed operationally.' >&2; exit 2 ;;
+esac
+for artifact in gl-code-quality-report.json gl-sarif-report.sarif gl-sbom-hooray.cdx.json gl-junit-report.xml hooray.env; do
+  if [ ! -s "$output/$artifact" ] || [ -L "$output/$artifact" ]; then
+    echo 'Hooray did not produce a complete report bundle.' >&2
+    exit 2
+  fi
+done
+set +e
+(
+__POLICY_SCRIPT__
+)
+report_status=$?
+set -e
+if [ "$status" -ne "$report_status" ]; then
+  echo 'Hooray exit status and policy artifact disagree.' >&2
+  exit 2
+fi
+exit "$status""#;
+    script.replace(
+        "__POLICY_SCRIPT__",
+        &indent_script(&policy_env_script(".hooray-reports/hooray.env"), 2),
+    )
+}
+
+fn gitlab_scan_script() -> String {
+    let preamble = r#"set -eu
+image=${HOORAY_IMAGE:-}
+if ! printf '%s\n' "$image" | grep -Eq '^[a-zA-Z0-9._:/-]+@sha256:[a-f0-9]{64}$'; then
+  echo 'Set HOORAY_IMAGE to a verified immutable image digest.' >&2
+  exit 2
+fi
+HOORAY_EXECUTABLE=hooray
+"#;
+    let script = portable_ci_scan_script().replace(".hooray-reports", ".hooray-gitlab");
+    // GitLab ingests security artifacts only from successful scanner jobs.
+    // The dependent policy job enforces the independently validated artifact.
+    format!("{preamble}{}", script.replace("exit \"$status\"", "exit 0"))
 }
 
 struct Selection<'a> {
@@ -858,7 +1240,6 @@ fn bounded_summary(total: usize, included: usize) -> String {
 fn jira_description(
     denied_lines: &[String],
     warned_lines: &[String],
-    warn_omitted: usize,
     selected: &Selection<'_>,
     report: &ScanReport,
 ) -> String {
@@ -888,7 +1269,7 @@ fn jira_description(
             description.push('\n');
         }
     }
-    if selected.truncated || warn_omitted > 0 {
+    if listed < selected.total {
         description.push_str(&bounded_summary(selected.total, listed));
         description.push('\n');
     }
@@ -1158,7 +1539,7 @@ fn escape_jira_wiki(value: &str) -> String {
     for character in flattened.chars() {
         if matches!(
             character,
-            '[' | ']' | '{' | '}' | '*' | '~' | '^' | '!' | '_' | '+' | '-' | '|' | '#'
+            '\\' | '[' | ']' | '{' | '}' | '*' | '~' | '^' | '!' | '_' | '+' | '-' | '|' | '#'
         ) {
             escaped.push('\\');
         }
@@ -1869,9 +2250,14 @@ mod tests {
         assert!(!github_text.contains("upload-sarif@v3"));
         assert!(github_text.contains("hooray scan project . --format sarif --output hooray.sarif"));
         assert!(github_text.contains("        continue-on-error: true\n"));
-        assert!(github_text.contains(
-            "        if: steps.scan.outputs.status == '0' || steps.scan.outputs.status == '1'\n"
-        ));
+        assert!(
+            github_text.contains(
+                "github.event_name == 'pull_request' || github.actor != 'dependabot[bot]'"
+            )
+        );
+        assert!(github_text.contains("      - name: Retain Hooray report"));
+        assert!(github_text.contains("      - name: Summarize Hooray scan"));
+        assert!(!github_text.contains("checks: write"));
         assert!(github_text.contains("status_file=\"$RUNNER_TEMP/hooray-scan-status\""));
         assert!(github_text.contains("      - name: Enforce Hooray scan status"));
         assert!(!github_text.contains("if: always()\n        with:\n          sarif_file"));
@@ -1898,7 +2284,9 @@ mod tests {
             assert_eq!(reports.get("sarif").is_some(), security);
             assert_eq!(reports.get("cyclonedx").is_some(), security);
             let scan_script = scanner["script"][0].as_str().unwrap();
-            assert!(scan_script.contains("set +e\nhooray scan auto \"$HOORAY_INPUT\" --policy \"$HOORAY_POLICY\" --format gitlab-artifacts --output .hooray-gitlab\nstatus=$?\nset -e\ntest \"$status\" -le 1"));
+            assert!(scan_script.contains("\"$executable\" scan auto \"$input\" --policy \"$policy\" --format gitlab-artifacts --output \"$output\""));
+            assert!(scan_script.contains("unset HOORAY_EXECUTABLE HOORAY_INPUT HOORAY_POLICY HOORAY_IMAGE HOORAY_DISABLED HOORAY_POLICY_DENIED HOORAY_POLICY_DENIED_COUNT"));
+            assert!(scan_script.contains("exit 0"));
             let gate = &gitlab["hooray_policy"];
             assert_eq!(gate["stage"], "security-gate");
             assert_eq!(
@@ -1970,6 +2358,136 @@ mod tests {
             unchanged: diff.unchanged,
         };
         assert!(generator(10).pull_request_gate(&clean, &current).passed);
+    }
+
+    #[test]
+    fn pull_request_gate_blocks_global_denials_and_shares_annotation_budget() {
+        let mut current = report(vec![finding(
+            "finding:new",
+            FindingKind::Sast,
+            Severity::High,
+            false,
+        )]);
+        current.policy_decisions = BTreeSet::from([
+            PolicyDecision {
+                policy_id: PolicyId::new("policy:inventory").unwrap(),
+                finding_id: None,
+                outcome: PolicyOutcome::Deny,
+                reason: "Incomplete inventory\u{202e}".into(),
+                exception_id: None,
+            },
+            decision("policy:new", "finding:new", PolicyOutcome::Deny),
+        ]);
+        current.policy_summary = PolicySummary::from_decisions(&current.policy_decisions);
+        let empty = FindingDiff {
+            introduced: vec![],
+            resolved: vec![],
+            unchanged: vec![],
+        };
+        let gate = generator(10).pull_request_gate(&empty, &current);
+        assert!(!gate.passed);
+        assert!(gate.new_denied_decisions.is_empty());
+        assert_eq!(gate.unscoped_denied_decisions.len(), 1);
+        assert_eq!(
+            gate.unscoped_denied_decisions[0].reason,
+            "Incomplete inventory"
+        );
+
+        let introduced = FindingDiff {
+            introduced: vec![FindingId::new("finding:new").unwrap()],
+            ..empty
+        };
+        let capped = generator(1).pull_request_gate(&introduced, &current);
+        assert!(!capped.passed);
+        assert!(capped.truncated);
+        assert_eq!(capped.unscoped_denied_decisions.len(), 1);
+        assert!(capped.new_denied_decisions.is_empty());
+        let legacy: PullRequestGate = serde_json::from_value(json!({
+            "passed": true,
+            "introduced_findings": 0,
+            "new_denied_decisions": [],
+            "truncated": false,
+        }))
+        .unwrap();
+        assert!(legacy.unscoped_denied_decisions.is_empty());
+    }
+
+    #[test]
+    fn github_annotation_titles_respect_provider_character_limit() {
+        let mut finding = finding("finding:unicode", FindingKind::Sast, Severity::High, true);
+        finding.summary = Some("é".repeat(300));
+        let current = report(vec![finding]);
+        let generator = IntegrationGenerator::new(IntegrationLimits {
+            max_text_bytes: 4096,
+            ..IntegrationLimits::default()
+        })
+        .unwrap();
+        let artifact = json_artifact(generator.github_check_run(&current, None).unwrap());
+        let title = artifact["output"]["annotations"][0]["title"]
+            .as_str()
+            .unwrap();
+        assert_eq!(title.chars().count(), 255);
+    }
+
+    #[test]
+    fn summaries_truthfully_report_the_provider_top_ten_limit() {
+        let findings = (0..11)
+            .map(|index| {
+                finding(
+                    &format!("finding:{index:02}"),
+                    FindingKind::Sast,
+                    Severity::High,
+                    false,
+                )
+            })
+            .collect();
+        let mut current = report(findings);
+        current.policy_decisions = current
+            .findings
+            .keys()
+            .map(|id| decision("policy:block", id.as_str(), PolicyOutcome::Deny))
+            .collect();
+        current.policy_summary = PolicySummary::from_decisions(&current.policy_decisions);
+        let generator = generator(500);
+        let slack = generator.slack_summary(&current, None).unwrap();
+        assert!(slack.truncated);
+        assert!(
+            slack
+                .text()
+                .unwrap()
+                .contains("Included 10 of 11 findings; 1 omitted")
+        );
+        let jira = generator.jira_issue(&current);
+        assert!(
+            jira["fields"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Included 10 of 11 findings; 1 omitted")
+        );
+    }
+
+    #[test]
+    fn jira_prioritizes_low_severity_denials_and_escapes_rule_identifiers() {
+        let mut denied = finding("finding:denied", FindingKind::Sast, Severity::Low, false);
+        denied.rule_id = RuleId::new("rule:\\{panel}\u{202e}").unwrap();
+        let warned = finding(
+            "finding:warning",
+            FindingKind::Sast,
+            Severity::Critical,
+            false,
+        );
+        let mut current = report(vec![denied, warned]);
+        current.policy_decisions = BTreeSet::from([
+            decision("policy:block", "finding:denied", PolicyOutcome::Deny),
+            decision("policy:warn", "finding:warning", PolicyOutcome::Warn),
+        ]);
+        current.policy_summary = PolicySummary::from_decisions(&current.policy_decisions);
+        let jira = generator(1).jira_issue(&current);
+        let description = jira["fields"]["description"].as_str().unwrap();
+        assert!(description.contains("finding:denied"));
+        assert!(!description.contains("finding:warning"));
+        assert!(description.contains("rule:\\\\\\{panel\\}"));
+        assert!(!description.contains('\u{202e}'));
     }
 
     #[test]
