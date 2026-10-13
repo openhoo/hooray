@@ -261,7 +261,13 @@ impl Inventory {
             // `component.purl` feeds CycloneDX/SPDX purl fields and OSV
             // queries, so it must be a real package URL, not a free-form
             // `name@version` placeholder.
-            if crate::util::parse_purl_body(&component.purl).is_none() {
+            let valid_purl = crate::util::parse_purl_body(&component.purl).is_some_and(|body| {
+                body.version().is_none_or(|version| {
+                    crate::util::percent_decode_strict(version)
+                        .is_some_and(|version| version == component.version)
+                })
+            });
+            if !valid_purl {
                 return Err(ModelInvariantError::InvalidComponentPurl(
                     component.identity.clone(),
                 ));
@@ -354,7 +360,7 @@ pub enum ModelInvariantError {
     UnredactedSecretEvidence(FindingId),
     #[error("secret finding {0} contains a forbidden evidence property '{1}'")]
     RawSecretProperty(FindingId, String),
-    #[error("component {0} carries a malformed package URL")]
+    #[error("component {0} carries a malformed package URL or a conflicting package version")]
     InvalidComponentPurl(ComponentId),
     #[error("run.started_at must be an RFC 3339 timestamp")]
     InvalidRunTimestamp,
@@ -1085,13 +1091,16 @@ mod tests {
         // and sbom.rs (SBOM ingestion) both build identity = stable_component_id(purl).
         // Pin that contract here so producer drift fails a test instead of silently
         // fragmenting identities across runs.
-        for purl in ["pkg:cargo/serde@1.0.0", "pkg:npm/left-pad@1.3.0"] {
+        for (purl, version) in [
+            ("pkg:cargo/serde@1.0.0", "1.0.0"),
+            ("pkg:npm/left-pad@1.3.0", "1.3.0"),
+        ] {
             let identity = stable_component_id(purl).unwrap();
             assert_eq!(stable_component_id(purl).unwrap(), identity);
             let component = Component {
                 identity: identity.clone(),
                 name: "package".into(),
-                version: "1.0.0".into(),
+                version: version.into(),
                 purl: purl.into(),
                 scope: Scope::Runtime,
                 provenance: BTreeSet::new(),

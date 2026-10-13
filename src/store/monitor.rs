@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter, types::Value};
+use rusqlite::{
+    Connection, OptionalExtension, TransactionBehavior, params, params_from_iter, types::Value,
+};
 
 use super::{
     MonitorCursor, MonitorEvent, MonitorEventFilter, MonitorTarget, Store, StoreError, pagination,
@@ -37,6 +39,26 @@ fn encode_monitor_target(t: &MonitorTarget) -> Result<MonitorTargetEnc, StoreErr
         findings_json: serde_json::to_string(&t.finding_ids)?,
     })
 }
+
+fn update_monitor_target_row(
+    connection: &Connection,
+    target: &MonitorTarget,
+    expected_updated_at: &str,
+) -> Result<bool, StoreError> {
+    let enc = encode_monitor_target(target)?;
+    Ok(connection.execute("UPDATE monitor_targets SET source=?2,interval_seconds=?3,next_due_at=?4,source_fingerprint=?5,inventory_json=?6,advisory_digest=?7,policy_digest=?8,finding_ids_json=?9,updated_at=?10 WHERE target_id=?1 AND updated_at=?11",params![target.target_id,target.source,enc.interval_seconds,target.next_due_at,target.source_fingerprint,enc.inventory_json,target.advisory_digest,target.policy_digest,enc.findings_json,target.updated_at,expected_updated_at])?==1)
+}
+
+fn append_monitor_event_row(
+    connection: &Connection,
+    event: &MonitorEvent,
+) -> Result<bool, StoreError> {
+    let payload = serde_json::to_string(&event.payload)?;
+    let attempts = i64::try_from(event.attempts).map_err(|_| StoreError::VersionOverflow)?;
+    // Only the intended dedupe hit is ignored; FK/CHECK violations surface.
+    Ok(connection.execute("INSERT INTO monitor_events(event_id,target_id,dedupe_key,kind,payload_json,created_at,attempts,next_attempt_at,delivered_at,dead_lettered_at,last_error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(dedupe_key) DO NOTHING",params![event.event_id,event.target_id,event.dedupe_key,event.kind,payload,event.created_at,attempts,event.next_attempt_at,event.delivered_at,event.dead_lettered_at,event.last_error])?==1)
+}
+
 fn read_monitor_target(r: &rusqlite::Row<'_>) -> Result<MonitorTarget, rusqlite::Error> {
     let interval: i64 = r.get(2)?;
     let interval_seconds = u64::try_from(interval).map_err(|e| monitor_data_error(2, e))?;
@@ -185,8 +207,29 @@ impl Store {
         target: &MonitorTarget,
         expected_updated_at: &str,
     ) -> Result<bool, StoreError> {
-        let enc = encode_monitor_target(target)?;
-        Ok(self.connection.execute("UPDATE monitor_targets SET source=?2,interval_seconds=?3,next_due_at=?4,source_fingerprint=?5,inventory_json=?6,advisory_digest=?7,policy_digest=?8,finding_ids_json=?9,updated_at=?10 WHERE target_id=?1 AND updated_at=?11",params![target.target_id,target.source,enc.interval_seconds,target.next_due_at,target.source_fingerprint,enc.inventory_json,target.advisory_digest,target.policy_digest,enc.findings_json,target.updated_at,expected_updated_at])?==1)
+        update_monitor_target_row(&self.connection, target, expected_updated_at)
+    }
+    /// Saves an evaluated target and its alert in one transaction. A stale
+    /// target returns `None` without publishing an alert; an alert write
+    /// failure rolls the target back so its transition can be retried.
+    pub(crate) fn commit_monitor_transition(
+        &mut self,
+        target: &MonitorTarget,
+        expected_updated_at: &str,
+        event: Option<&MonitorEvent>,
+    ) -> Result<Option<bool>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !update_monitor_target_row(&transaction, target, expected_updated_at)? {
+            return Ok(None);
+        }
+        let inserted = event
+            .map(|event| append_monitor_event_row(&transaction, event))
+            .transpose()?
+            .unwrap_or(false);
+        transaction.commit()?;
+        Ok(Some(inserted))
     }
     pub fn add_monitor_target(&mut self, target: &MonitorTarget) -> Result<(), StoreError> {
         validate_monitor_target_fields(&target.target_id, &target.source, target.interval_seconds)?;
@@ -253,12 +296,10 @@ impl Store {
         Ok(())
     }
     pub fn append_monitor_event(&mut self, event: &MonitorEvent) -> Result<bool, StoreError> {
-        let payload = serde_json::to_string(&event.payload)?;
-        let attempts = i64::try_from(event.attempts).map_err(|_| StoreError::VersionOverflow)?;
         // ON CONFLICT(dedupe_key) scopes the ignore to the intended dedupe
         // hit; FK/CHECK violations (deleted target, terminal-state misuse)
         // surface as errors instead of silently dropping the alert.
-        Ok(self.connection.execute("INSERT INTO monitor_events(event_id,target_id,dedupe_key,kind,payload_json,created_at,attempts,next_attempt_at,delivered_at,dead_lettered_at,last_error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(dedupe_key) DO NOTHING",params![event.event_id,event.target_id,event.dedupe_key,event.kind,payload,event.created_at,attempts,event.next_attempt_at,event.delivered_at,event.dead_lettered_at,event.last_error])?==1)
+        append_monitor_event_row(&self.connection, event)
     }
     /// Claims up to `limit` due events for delivery, leasing them until
     /// `lease_until`.
@@ -370,14 +411,11 @@ impl Store {
     pub fn update_monitor_event(&mut self, e: &MonitorEvent) -> Result<bool, StoreError> {
         let payload = serde_json::to_string(&e.payload)?;
         let attempts = i64::try_from(e.attempts).map_err(|_| StoreError::VersionOverflow)?;
-        // claim_monitor_events leases rows only via next_attempt_at (no token), so a
-        // worker whose delivery outlives its lease can race a re-claim. A writer that
-        // observed no terminal state must not overwrite a terminal state recorded by a
-        // newer claim owner; returning false lets the caller surface the lost claim.
-        // Tradeoff: non-terminal bookkeeping (attempts/backoff/last_error) may still
-        // interleave between concurrently failing workers, which at-least-once
-        // delivery tolerates.
-        Ok(self.connection.execute("UPDATE monitor_events SET target_id=?2,dedupe_key=?3,kind=?4,payload_json=?5,created_at=?6,attempts=?7,next_attempt_at=?8,delivered_at=?9,dead_lettered_at=?10,last_error=?11 WHERE event_id=?1 AND (?9 IS NOT NULL OR delivered_at IS NULL) AND (?10 IS NOT NULL OR dead_lettered_at IS NULL)",params![e.event_id,e.target_id,e.dedupe_key,e.kind,payload,e.created_at,attempts,e.next_attempt_at,e.delivered_at,e.dead_lettered_at,e.last_error])?==1)
+        // Each claim advances attempts. Reject an older claim's failure or
+        // success after a re-claim, preserving retry bounds and the newer
+        // receipt even when both snapshots already carry terminal state.
+        // Explicit bookkeeping may advance attempts, but never roll it back.
+        Ok(self.connection.execute("UPDATE monitor_events SET target_id=?2,dedupe_key=?3,kind=?4,payload_json=?5,created_at=?6,attempts=?7,next_attempt_at=?8,delivered_at=?9,dead_lettered_at=?10,last_error=?11 WHERE event_id=?1 AND attempts<=?7 AND (?9 IS NOT NULL OR delivered_at IS NULL) AND (?10 IS NOT NULL OR dead_lettered_at IS NULL)",params![e.event_id,e.target_id,e.dedupe_key,e.kind,payload,e.created_at,attempts,e.next_attempt_at,e.delivered_at,e.dead_lettered_at,e.last_error])?==1)
     }
     pub fn prune_monitor_before(&mut self, timestamp: &str) -> Result<usize, StoreError> {
         // Retention keys on the terminal time (delivery or dead-letter),

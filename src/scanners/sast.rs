@@ -633,7 +633,7 @@ struct JavascriptBindingModel {
 
 impl JavascriptBindingModel {
     fn new(text: &str, tokens: &[JavascriptToken<'_>], aliases: &[JavascriptAlias]) -> Self {
-        let pairs = matching_javascript_parentheses(tokens);
+        let pairs = javascript_syntax(text, tokens);
         let (mut scopes, static_token_scopes, opening_scopes) =
             javascript_scopes(text.len(), tokens);
         mark_javascript_function_scopes(tokens, &pairs, &opening_scopes, &mut scopes);
@@ -1226,23 +1226,273 @@ fn javascript_scopes(
     (scopes, token_scopes, opening_scopes)
 }
 
-fn matching_javascript_parentheses(tokens: &[JavascriptToken<'_>]) -> Vec<Option<usize>> {
+struct JavascriptSyntax {
+    pairs: Vec<Option<usize>>,
+    annotated_parameters: Vec<Option<(usize, usize)>>,
+    type_tokens: Vec<bool>,
+    conditional_branches: Vec<bool>,
+}
+
+impl JavascriptSyntax {
+    fn get(&self, index: usize) -> Option<&Option<usize>> {
+        self.pairs.get(index)
+    }
+}
+
+fn javascript_syntax(text: &str, tokens: &[JavascriptToken<'_>]) -> JavascriptSyntax {
     let mut pairs = vec![None; tokens.len()];
     let mut stack = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
-        if token.text == "(" {
+        if matches!(token.text, "(" | "[" | "{") {
             stack.push(index);
-        } else if token.text == ")"
-            && let Some(open) = stack.pop()
-        {
-            pairs[index] = Some(open);
+        } else if matches!(token.text, ")" | "]" | "}") {
+            if let Some(open) = stack.pop()
+                && matches!(
+                    (tokens[open].text, token.text),
+                    ("(", ")") | ("[", "]") | ("{", "}")
+                )
+            {
+                pairs[index] = Some(open);
+                pairs[open] = Some(index);
+            } else {
+                stack.clear();
+            }
         }
     }
-    pairs
+    let mut syntax = JavascriptSyntax {
+        pairs,
+        annotated_parameters: vec![None; tokens.len()],
+        type_tokens: vec![false; tokens.len()],
+        conditional_branches: vec![false; tokens.len()],
+    };
+    // Read each accepted annotation once. Its boundary owns the declaration's
+    // real parameters; parentheses inside the return type never become them.
+    let mut close = 0;
+    let mut conditionals = vec![0_usize];
+    while close + 2 < tokens.len() {
+        match tokens[close].text {
+            "(" | "[" | "{" => conditionals.push(0),
+            ")" | "]" | "}" if conditionals.len() > 1 => {
+                conditionals.pop();
+            }
+            "?" if !matches!(tokens[close + 1].text, ":" | ".") => {
+                *conditionals.last_mut().expect("root syntax frame exists") += 1;
+            }
+            ":" => {
+                let pending = conditionals.last_mut().expect("root syntax frame exists");
+                *pending = pending.saturating_sub(1);
+            }
+            _ => {}
+        }
+        if tokens[close].text == "=>" {
+            syntax.conditional_branches[close] = conditionals.last() != Some(&0);
+        }
+        if tokens[close].text == ")"
+            && tokens[close + 1].text == ":"
+            && let Some(open) = syntax.pairs[close]
+            && let Some(end) = javascript_type_end(tokens, &syntax.pairs, close + 2, 0)
+            && tokens
+                .get(end)
+                .is_some_and(|token| matches!(token.text, "=>" | "{"))
+            && (conditionals.last() == Some(&0)
+                || javascript_conditional_separator_after(text, tokens, &syntax.pairs, end))
+        {
+            syntax.annotated_parameters[end] = Some((open, close));
+            syntax.type_tokens[close + 1..end].fill(true);
+            close = end;
+        } else {
+            close += 1;
+        }
+    }
+    syntax
+}
+
+// A `):` in a ternary can end a grouped true branch instead of annotating
+// parameters. An annotated true-branch function still needs its own outer
+// ternary separator after the body. Ignore grouped expressions, nested
+// conditionals and nested return annotations when looking for that separator.
+fn javascript_conditional_separator_after(
+    text: &str,
+    tokens: &[JavascriptToken<'_>],
+    pairs: &[Option<usize>],
+    start: usize,
+) -> bool {
+    let mut index = start;
+    let mut conditionals = 0_usize;
+    let end = if tokens[start].text == "=>" {
+        javascript_arrow_expression_end(text, tokens, start + 1, None)
+    } else {
+        text.len()
+    };
+    while index < tokens.len() && tokens[index].start < end && index - start <= 4096 {
+        match tokens[index].text {
+            "(" | "[" | "{" => {
+                let Some(close) = pairs[index] else {
+                    return false;
+                };
+                // Runtime nested arrows may also have a return annotation.
+                // A call's arguments are not parameters of such an arrow.
+                let parameter_context = index.checked_sub(1).is_some_and(|previous| {
+                    matches!(
+                        tokens[previous].text,
+                        "=>" | "=" | "(" | "[" | "," | "return" | "async" | "function" | "?" | ":"
+                    ) || (previous > 0 && tokens[previous - 1].text == "function")
+                });
+                if tokens[index].text == "("
+                    && parameter_context
+                    && tokens.get(close + 1).is_some_and(|token| token.text == ":")
+                    && let Some(end) = javascript_type_end(tokens, pairs, close + 2, 0)
+                    && tokens
+                        .get(end)
+                        .is_some_and(|token| matches!(token.text, "=>" | "{"))
+                {
+                    index = end;
+                    continue;
+                }
+                index = close;
+            }
+            "?" if tokens.get(index + 1).is_none_or(|token| token.text != ".") => conditionals += 1,
+            ":" if conditionals == 0 => return true,
+            ":" => conditionals -= 1,
+            ";" | "," | ")" | "]" | "}" => return false,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+// This bounded reader identifies return annotation boundaries, not a full TS
+// AST. Balanced groups are skipped in constant time, and unsupported syntax
+// leaves the annotation unclassified rather than consuming runtime code.
+fn javascript_type_end(
+    tokens: &[JavascriptToken<'_>],
+    pairs: &[Option<usize>],
+    start: usize,
+    depth: usize,
+) -> Option<usize> {
+    if depth >= 64 {
+        return None;
+    }
+    let mut index = start;
+    while tokens.get(index).is_some_and(|token| {
+        matches!(
+            token.text,
+            "keyof" | "typeof" | "readonly" | "unique" | "infer" | "new" | "abstract" | "asserts"
+        )
+    }) {
+        index += 1;
+        if index - start > 64 {
+            return None;
+        }
+    }
+    if tokens.get(index)?.text == "<" {
+        index = javascript_type_arguments_end(tokens, pairs, index)?;
+    }
+    let token = tokens.get(index)?;
+    let mut signature = false;
+    match token.text {
+        "(" | "[" | "{" => {
+            let close = pairs[index]?;
+            if token.text == "(" {
+                signature = close == index + 1
+                    || tokens
+                        .get(index + 1)
+                        .is_some_and(|token| token.text == "...");
+                let mut parameter = index + 1;
+                while parameter < close && !signature {
+                    if matches!(tokens[parameter].text, ":" | "," | "?" | "=") {
+                        signature = true;
+                    } else if matches!(tokens[parameter].text, "(" | "[" | "{") {
+                        parameter = pairs[parameter]?;
+                    }
+                    parameter += 1;
+                }
+            }
+            index = close + 1;
+        }
+        "'" | "\"" | "`" => {
+            // Literal contents are excluded by the lexical non-code spans.
+            if tokens.get(index + 1)?.text != token.text {
+                return None;
+            }
+            index += 2;
+        }
+        text if is_javascript_identifier(text) => index += 1,
+        text if text.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
+            index += 1;
+            while tokens.get(index).is_some_and(|token| {
+                token.text == "."
+                    || token
+                        .text
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_digit)
+            }) {
+                index += 1;
+            }
+        }
+        _ => return None,
+    }
+    if signature && tokens.get(index).is_some_and(|token| token.text == "=>") {
+        return javascript_type_end(tokens, pairs, index + 1, depth + 1);
+    }
+    loop {
+        match tokens.get(index).map(|token| token.text) {
+            Some(".")
+                if tokens
+                    .get(index + 1)
+                    .is_some_and(|token| is_javascript_identifier(token.text)) =>
+            {
+                index += 2
+            }
+            Some("<") => index = javascript_type_arguments_end(tokens, pairs, index)?,
+            Some("[") => index = pairs[index]? + 1,
+            Some("|" | "&") => return javascript_type_end(tokens, pairs, index + 1, depth + 1),
+            Some("is") => return javascript_type_end(tokens, pairs, index + 1, depth + 1),
+            Some("extends") => {
+                let question = javascript_type_end(tokens, pairs, index + 1, depth + 1)?;
+                if tokens.get(question)?.text != "?" {
+                    return None;
+                }
+                let colon = javascript_type_end(tokens, pairs, question + 1, depth + 1)?;
+                if tokens.get(colon)?.text != ":" {
+                    return None;
+                }
+                return javascript_type_end(tokens, pairs, colon + 1, depth + 1);
+            }
+            _ => return Some(index),
+        }
+    }
+}
+
+fn javascript_type_arguments_end(
+    tokens: &[JavascriptToken<'_>],
+    pairs: &[Option<usize>],
+    start: usize,
+) -> Option<usize> {
+    let mut depth = 1_usize;
+    let mut index = start + 1;
+    while index < tokens.len() && index - start <= 4096 {
+        match tokens[index].text {
+            "<" => depth += 1,
+            ">" => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            "(" | "[" | "{" => index = pairs[index]?,
+            ";" => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 fn mark_javascript_function_scopes(
     tokens: &[JavascriptToken<'_>],
-    pairs: &[Option<usize>],
+    pairs: &JavascriptSyntax,
     opening_scopes: &[Option<usize>],
     scopes: &mut [JavascriptScope],
 ) {
@@ -1279,8 +1529,11 @@ fn javascript_function_scope(scopes: &[JavascriptScope], mut scope: usize) -> us
 fn javascript_body_parameter_range(
     tokens: &[JavascriptToken<'_>],
     body: usize,
-    pairs: &[Option<usize>],
+    pairs: &JavascriptSyntax,
 ) -> Option<(usize, usize)> {
+    if let Some(parameters) = pairs.annotated_parameters[body] {
+        return Some(parameters);
+    }
     let previous = body.checked_sub(1)?;
     if tokens[previous].text == ")" {
         return pairs
@@ -1289,30 +1542,13 @@ fn javascript_body_parameter_range(
             .flatten()
             .map(|open| (open, previous));
     }
-    if matches!(tokens[previous].text, ":" | "<" | "&" | "|" | "," | "=") {
-        return None;
-    }
-    let mut index = previous;
-    while index > 0 {
-        if tokens[index].text == ")" {
-            if let Some(open) = pairs.get(index).copied().flatten()
-                && tokens.get(index + 1).is_some_and(|token| token.text == ":")
-            {
-                return Some((open, index));
-            }
-            if let Some(open) = pairs.get(index).copied().flatten() {
-                index = open;
-            }
-        }
-        index = index.saturating_sub(1);
-    }
     None
 }
 
 fn javascript_function_body_open(
     tokens: &[JavascriptToken<'_>],
     function: usize,
-    pairs: &[Option<usize>],
+    pairs: &JavascriptSyntax,
 ) -> Option<usize> {
     let parameter_open = (function + 1..tokens.len()).find(|&index| tokens[index].text == "(")?;
     let parameter_close = (parameter_open + 1..tokens.len())
@@ -1339,7 +1575,7 @@ fn javascript_is_expression(tokens: &[JavascriptToken<'_>], index: usize) -> boo
 
 fn javascript_named_function_scope(
     tokens: &[JavascriptToken<'_>],
-    pairs: &[Option<usize>],
+    pairs: &JavascriptSyntax,
     opening_scopes: &[Option<usize>],
     function: usize,
     declaration_scope: usize,
@@ -1378,25 +1614,29 @@ fn javascript_body_has_parameters(tokens: &[JavascriptToken<'_>], open: usize) -
 fn add_javascript_expression_arrow_scopes(
     text: &str,
     tokens: &[JavascriptToken<'_>],
-    pairs: &[Option<usize>],
+    pairs: &JavascriptSyntax,
     scopes: &mut Vec<JavascriptScope>,
     aliases: &[JavascriptAlias],
     token_scopes: &[usize],
     opening_scopes: &[Option<usize>],
 ) -> Vec<usize> {
     let mut arrow_scopes = Vec::new();
-    let mut active_arrows = Vec::new();
+    let mut active_arrows: Vec<(usize, usize, usize)> = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         active_arrows.retain(|(_, _, end)| *end > token.start);
-        if token.text != "=>" || tokens.get(index + 1).is_some_and(|next| next.text == "{") {
+        if token.text != "=>"
+            || tokens.get(index + 1).is_some_and(|next| next.text == "{")
+            || javascript_callable_type_arrow(tokens, index, pairs)
+        {
             continue;
         }
         let parent = active_arrows
             .last()
             .map(|(scope, _, _)| *scope)
+            .filter(|scope| scopes[*scope].start > scopes[token_scopes[index]].start)
             .unwrap_or(token_scopes[index]);
         let start = token.end;
-        let end = javascript_arrow_expression_end(text, tokens, index + 1);
+        let end = javascript_arrow_expression_end(text, tokens, index + 1, Some(pairs));
         let scope = scopes.len();
         scopes.push(JavascriptScope {
             start,
@@ -1418,6 +1658,7 @@ fn add_javascript_expression_arrow_scopes(
             );
         }
         arrow_scopes.push((scope, start, end));
+        active_arrows.push((scope, start, end));
     }
 
     let mut final_token_scopes = token_scopes.to_vec();
@@ -1454,12 +1695,16 @@ fn javascript_arrow_expression_end(
     text: &str,
     tokens: &[JavascriptToken<'_>],
     start: usize,
+    syntax: Option<&JavascriptSyntax>,
 ) -> usize {
     let mut parentheses = 0_usize;
     let mut brackets = 0_usize;
     let mut braces = 0_usize;
+    let mut conditionals = 0_usize;
+    let conditional_branch =
+        syntax.is_some_and(|syntax| start > 0 && syntax.conditional_branches[start - 1]);
     let mut previous: Option<&JavascriptToken<'_>> = None;
-    for token in tokens.iter().skip(start) {
+    for (index, token) in tokens.iter().enumerate().skip(start) {
         if let Some(previous_token) = previous
             && parentheses == 0
             && brackets == 0
@@ -1480,6 +1725,24 @@ fn javascript_arrow_expression_end(
             "{" => braces += 1,
             "}" if braces == 0 => return token.start,
             "}" => braces -= 1,
+            "?" if parentheses == 0
+                && brackets == 0
+                && braces == 0
+                && syntax.is_none_or(|syntax| !syntax.type_tokens[index])
+                && tokens.get(index + 1).is_none_or(|token| token.text != ".") =>
+            {
+                conditionals += 1;
+            }
+            ":" if parentheses == 0
+                && brackets == 0
+                && braces == 0
+                && syntax.is_none_or(|syntax| !syntax.type_tokens[index]) =>
+            {
+                if conditional_branch && conditionals == 0 {
+                    return token.start;
+                }
+                conditionals = conditionals.saturating_sub(1);
+            }
             "," | ";" if parentheses == 0 && brackets == 0 && braces == 0 => return token.start,
             _ => {}
         }
@@ -1511,8 +1774,11 @@ fn javascript_expression_continues(token: &str) -> bool {
 fn javascript_arrow_parameter_range(
     tokens: &[JavascriptToken<'_>],
     arrow: usize,
-    pairs: &[Option<usize>],
+    pairs: &JavascriptSyntax,
 ) -> Option<(usize, usize)> {
+    if let Some((open, close)) = pairs.annotated_parameters[arrow] {
+        return Some((open + 1, close));
+    }
     let previous = arrow.checked_sub(1)?;
     if tokens[previous].text == ")" {
         return pairs
@@ -1521,36 +1787,15 @@ fn javascript_arrow_parameter_range(
             .flatten()
             .map(|open| (open + 1, previous));
     }
-    let mut candidate = previous;
-    while candidate > 0 {
-        if tokens[candidate].text == ")"
-            && tokens
-                .get(candidate + 1)
-                .is_some_and(|token| token.text == ":")
-            && let Some(open) = pairs.get(candidate).copied().flatten()
-        {
-            return Some((open + 1, candidate));
-        }
-        if let Some(open) = pairs.get(candidate).copied().flatten() {
-            candidate = open;
-        }
-        candidate = candidate.saturating_sub(1);
-    }
-    let mut start = previous;
-    while start > 0 {
-        let previous_token = tokens[start - 1].text;
-        if matches!(
-            previous_token,
-            ";" | "," | "{" | "}" | "[" | "]" | "(" | "="
-        ) {
-            break;
-        }
-        start -= 1;
-    }
-    if tokens.get(start).is_some_and(|token| token.text == "async") {
-        start += 1;
-    }
-    Some((start, arrow))
+    is_javascript_identifier(tokens[previous].text).then_some((previous, arrow))
+}
+
+fn javascript_callable_type_arrow(
+    _tokens: &[JavascriptToken<'_>],
+    arrow: usize,
+    pairs: &JavascriptSyntax,
+) -> bool {
+    pairs.type_tokens.get(arrow).copied().unwrap_or(false)
 }
 
 fn javascript_parameter_binding_start(
@@ -2382,6 +2627,75 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
 
+    #[test]
+    fn arrow_parameter_search_stays_within_current_declaration() {
+        let source = "const typed = (old): number => old; const plain = cp => cp.exec(user);";
+        let tokens = javascript_tokens(source, &[]);
+        let pairs = javascript_syntax(source, &tokens);
+        let arrow = tokens.iter().rposition(|token| token.text == "=>").unwrap();
+        let (start, end) = javascript_arrow_parameter_range(&tokens, arrow, &pairs).unwrap();
+        assert_eq!(
+            tokens[start..end]
+                .iter()
+                .map(|token| token.text)
+                .collect::<Vec<_>>(),
+            vec!["cp"]
+        );
+    }
+
+    #[test]
+    fn arrow_parameter_search_preserves_callable_return_types() {
+        for source in [
+            "const typed = (cp: any): () => void => () => cp.exec(input);",
+            "const typed = (cp: any): () => () => void => () => () => cp.exec(input);",
+            "const typed = (cp: any): () => Result => () => cp.exec(input);",
+            "const typed = (cp: any): <T extends { value: string }>() => T => <T extends { value: string }>() => cp.exec(input);",
+        ] {
+            let tokens = javascript_tokens(source, &[]);
+            let pairs = javascript_syntax(source, &tokens);
+            let arrow = tokens
+                .iter()
+                .enumerate()
+                .find(|(index, token)| {
+                    token.text == "=>" && matches!(tokens[index - 1].text, "void" | "Result" | "T")
+                })
+                .map(|(index, _)| index)
+                .unwrap();
+            let (start, end) = javascript_arrow_parameter_range(&tokens, arrow, &pairs).unwrap();
+            assert_eq!(
+                tokens[start..end]
+                    .iter()
+                    .map(|token| token.text)
+                    .collect::<Vec<_>>(),
+                vec!["cp", ":", "any"]
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_callable_type_keeps_outer_runtime_arrow_and_parameters() {
+        let source = "const typed = (cp: any): (() => void) => () => cp.exec(input);";
+        let tokens = javascript_tokens(source, &[]);
+        let pairs = javascript_syntax(source, &tokens);
+        let arrows = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| (token.text == "=>").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(arrows.len(), 3);
+        assert!(javascript_callable_type_arrow(&tokens, arrows[0], &pairs));
+        assert!(!javascript_callable_type_arrow(&tokens, arrows[1], &pairs));
+        assert!(!javascript_callable_type_arrow(&tokens, arrows[2], &pairs));
+        let (start, end) = javascript_arrow_parameter_range(&tokens, arrows[1], &pairs).unwrap();
+        assert_eq!(
+            tokens[start..end]
+                .iter()
+                .map(|token| token.text)
+                .collect::<Vec<_>>(),
+            vec!["cp", ":", "any"]
+        );
+    }
+
     fn javascript_arrow_fixture(count: usize) -> String {
         let mut source = String::with_capacity(count * 32);
         for index in 0..count {
@@ -2392,7 +2706,7 @@ mod tests {
 
     fn assignment_ownership_lookups(source: &str) -> (usize, usize) {
         let tokens = javascript_tokens(source, &[]);
-        let pairs = matching_javascript_parentheses(&tokens);
+        let pairs = javascript_syntax(source, &tokens);
         let (mut scopes, static_token_scopes, opening_scopes) =
             javascript_scopes(source.len(), &tokens);
         mark_javascript_function_scopes(&tokens, &pairs, &opening_scopes, &mut scopes);

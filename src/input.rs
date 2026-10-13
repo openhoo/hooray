@@ -28,7 +28,7 @@ use self::parsers::{
     archive::{
         decompress_archive, read_entry_bounded, read_tar_file, read_zip_file, tar_entry_path,
     },
-    bun::parse_bun_lock,
+    bun::{bun_workspace_paths, parse_bun_lock},
     cargo::parse_cargo_lock,
     conda::parse_conda_environment,
     dart::parse_pubspec_lock,
@@ -40,12 +40,12 @@ use self::parsers::{
     helm::{parse_chart_lock, parse_chart_yaml},
     image::{oci_layout_filesystem, oci_tar_filesystem, scan_oci_layout, scan_oci_tar},
     maven::parse_pom_xml,
-    npm::parse_package_lock,
+    npm::{npm_workspace_paths, parse_package_json, parse_package_lock},
     nuget::{
         parse_csproj, parse_directory_packages_props, parse_nuget_lock, parse_packages_config,
     },
     php::{parse_composer_json, parse_composer_lock},
-    pnpm::parse_pnpm_lock,
+    pnpm::{parse_pnpm_lock, pnpm_workspace_paths},
     python::{parse_pipfile_lock, parse_poetry_lock, parse_requirements},
     ruby::{parse_gemfile_lock, parse_podfile_lock},
     swift::parse_package_resolved,
@@ -156,14 +156,15 @@ impl ScanInput {
             return Err(InputError::UnsupportedPath(canonical));
         }
         // Archive inputs are container/archive payloads, not single input
-        // files: bound them by the archive budget so a >100 MiB image tar
+        // files: bound them by the archive budget so a >100 MiB archive
         // scans like the equivalent unpacked layout.
-        let is_tar = canonical
+        let is_archive = canonical
             .file_name()
             .and_then(|v| v.to_str())
             .map(|name| {
                 let name = name.to_ascii_lowercase();
-                name.ends_with(".tar")
+                name.ends_with(".zip")
+                    || name.ends_with(".tar")
                     || name.ends_with(".tar.gz")
                     || name.ends_with(".tgz")
                     || name.ends_with(".tar.zst")
@@ -171,7 +172,7 @@ impl ScanInput {
             .unwrap_or(false);
         check_file_size(
             &canonical,
-            if is_tar {
+            if is_archive {
                 config.max_archive_bytes
             } else {
                 config.max_input_bytes
@@ -332,6 +333,7 @@ enum LockfileRoute {
     Manifest {
         parse: ManifestParser,
         lock_names: &'static [&'static str],
+        ancestor_locks: bool,
     },
 }
 
@@ -376,6 +378,7 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
                 "pnpm-lock.yaml",
                 "bun.lock",
             ],
+            ancestor_locks: true,
         },
     ),
     (
@@ -383,6 +386,7 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
         LockfileRoute::Manifest {
             parse: parse_composer_json,
             lock_names: &["composer.lock"],
+            ancestor_locks: false,
         },
     ),
     ("composer.lock", LockfileRoute::Lock(parse_composer_lock)),
@@ -395,6 +399,7 @@ const LOCKFILES: &[(&str, LockfileRoute)] = &[
         LockfileRoute::Manifest {
             parse: parse_chart_yaml,
             lock_names: &["Chart.lock"],
+            ancestor_locks: false,
         },
     ),
     ("Chart.lock", LockfileRoute::Lock(parse_chart_lock)),
@@ -452,6 +457,7 @@ fn scan_virtual_files(
     files: BTreeMap<String, Vec<u8>>,
 ) -> Result<Inventory, InputError> {
     let mut builder = InventoryBuilder::new(locator, kind);
+    let workspace_members = workspace_lock_members(&files)?;
     for (path, bytes) in &files {
         let Some(route) = lockfile_route(base_name(path)) else {
             continue;
@@ -465,14 +471,24 @@ fn scan_virtual_files(
                 files.get(&sibling(path, "Cargo.toml")),
                 &mut builder,
             )?,
-            LockfileRoute::Manifest { parse, lock_names } => {
+            LockfileRoute::Manifest {
+                parse,
+                lock_names,
+                ancestor_locks,
+            } => {
                 // The manifest's declared constraints are superseded by the
                 // nearest covering lockfile — a sibling, or one in an
                 // ancestor directory for workspace members whose lockfile
                 // lives at the workspace root (pnpm workspaces, npm/yarn
                 // workspaces). The parser still receives the first present
                 // lockfile so it can skip redundant work.
-                let lock = covering_lockfile(path, lock_names, &files);
+                let lock = covering_lockfile(
+                    path,
+                    lock_names,
+                    *ancestor_locks,
+                    &files,
+                    &workspace_members,
+                );
                 parse(path, bytes, lock, &mut builder)?;
             }
         }
@@ -802,7 +818,7 @@ pub(crate) fn open_regular_nofollow(path: &Path) -> Result<File, InputError> {
             target_os = "dragonfly"
         ))]
         const O_NOFOLLOW: i32 = 0x100;
-        options.custom_flags(O_NOFOLLOW);
+        options.custom_flags(O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path).map_err(|source| {
         if is_symlink_open_error(&source) {
@@ -1025,25 +1041,137 @@ fn sibling(path: &str, name: &str) -> String {
 }
 
 /// Returns the nearest lockfile covering a manifest at `path`: its sibling
-/// first, then ancestor directories outward, so a workspace member's
-/// manifest is superseded by the workspace-root lockfile that resolved its
-/// dependencies.
+/// first, then ancestor directories when the ecosystem shares workspace
+/// locks. Composer and Helm locks only cover their sibling manifest.
 fn covering_lockfile<'a>(
     path: &str,
     lock_names: &[&'static str],
+    ancestor_locks: bool,
     files: &'a BTreeMap<String, Vec<u8>>,
+    workspace_members: &BTreeMap<String, BTreeSet<String>>,
 ) -> Option<&'a Vec<u8>> {
-    let mut dir = path.rsplit_once('/').map(|(parent, _)| parent);
-    while let Some(current) = dir {
-        if let Some(lock) = lock_names
-            .iter()
-            .find_map(|name| files.get(&format!("{current}/{name}")))
-        {
-            return Some(lock);
+    let parent = path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    let mut current = parent;
+    loop {
+        for name in lock_names {
+            let key = if current.is_empty() {
+                (*name).to_owned()
+            } else {
+                format!("{current}/{name}")
+            };
+            if let Some(lock) = files.get(&key)
+                && (current == parent
+                    || workspace_members
+                        .get(&key)
+                        .is_some_and(|members| members.contains(path)))
+            {
+                return Some(lock);
+            }
         }
-        dir = current.rsplit_once('/').map(|(parent, _)| parent);
+        if !ancestor_locks || current.is_empty() {
+            return None;
+        }
+        current = current
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
     }
-    lock_names.iter().find_map(|name| files.get(*name))
+}
+
+/// Build membership once per lockfile. An unrelated nested package.json is
+/// not resolved by an ancestor lock merely because it is below that lock.
+fn workspace_lock_members(
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<BTreeMap<String, BTreeSet<String>>, InputError> {
+    if !files
+        .keys()
+        .any(|path| path.contains('/') && base_name(path) == "package.json")
+    {
+        return Ok(BTreeMap::new());
+    }
+    let mut memberships = BTreeMap::new();
+    for (path, bytes) in files {
+        let members = match base_name(path) {
+            "package-lock.json" | "npm-shrinkwrap.json" => npm_workspace_paths(path, bytes)?,
+            "pnpm-lock.yaml" => pnpm_workspace_paths(path, bytes)?,
+            "bun.lock" => bun_workspace_paths(path, bytes)?,
+            "yarn.lock" => yarn_workspace_paths(path, files)?,
+            _ => continue,
+        };
+        let prefix = path
+            .rsplit_once('/')
+            .map(|(parent, _)| format!("{parent}/"))
+            .unwrap_or_default();
+        let mut manifest_paths = BTreeSet::new();
+        for member in members {
+            if member.is_empty() || member == "." {
+                continue;
+            }
+            let member = normalize_relative(Path::new(&member))?;
+            manifest_paths.insert(format!("{prefix}{member}/package.json"));
+        }
+        memberships.insert(path.clone(), manifest_paths);
+    }
+    Ok(memberships)
+}
+
+fn yarn_workspace_paths(
+    lock: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<BTreeSet<String>, InputError> {
+    let manifest = sibling(lock, "package.json");
+    let Some(bytes) = files.get(&manifest) else {
+        return Ok(BTreeSet::new());
+    };
+    let doc: Value = serde_json::from_str(utf8(bytes, &manifest, "package.json")?)
+        .map_err(|error| malformed(&manifest, "package.json", error))?;
+    let workspaces = doc.get("workspaces");
+    let patterns = workspaces.and_then(Value::as_array).or_else(|| {
+        workspaces
+            .and_then(|value| value.get("packages"))
+            .and_then(Value::as_array)
+    });
+    let Some(patterns) = patterns else {
+        return Ok(BTreeSet::new());
+    };
+    entry_bound(patterns.len(), &manifest, "package.json")?;
+    let mut include = globset::GlobSetBuilder::new();
+    let mut exclude = globset::GlobSetBuilder::new();
+    for pattern in patterns.iter().filter_map(Value::as_str) {
+        let (pattern, excluded) = pattern
+            .strip_prefix('!')
+            .map(|pattern| (pattern, true))
+            .unwrap_or((pattern, false));
+        let glob = globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .map_err(|error| malformed(&manifest, "package.json", error))?;
+        if excluded {
+            exclude.add(glob);
+        } else {
+            include.add(glob);
+        }
+    }
+    let include = include
+        .build()
+        .map_err(|error| malformed(&manifest, "package.json", error))?;
+    let exclude = exclude
+        .build()
+        .map_err(|error| malformed(&manifest, "package.json", error))?;
+    let prefix = lock
+        .rsplit_once('/')
+        .map(|(parent, _)| format!("{parent}/"))
+        .unwrap_or_default();
+    Ok(files
+        .keys()
+        .filter(|path| base_name(path) == "package.json")
+        .filter_map(|path| path.strip_prefix(&prefix)?.strip_suffix("/package.json"))
+        .filter(|directory| include.is_match(directory) && !exclude.is_match(directory))
+        .map(str::to_owned)
+        .collect())
 }
 fn base_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -1097,57 +1225,6 @@ fn stable_asset(
         crate::util::hex_lower(&hash.finalize())
     ))
     .map_err(|_| InputError::InvalidIdentifier)
-}
-
-/// Parses a `package.json` manifest: claims the project name/version and
-/// registers declared dependencies as versionless constraint components,
-/// matching the `composer.json` standalone-manifest contract. A sibling
-/// npm-family lockfile supersedes these declarations.
-fn parse_package_json(
-    path: &str,
-    bytes: &[u8],
-    lock: Option<&Vec<u8>>,
-    out: &mut InventoryBuilder,
-) -> Result<(), InputError> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|e| malformed(path, "package.json", e))?;
-    let root = value
-        .as_object()
-        .ok_or_else(|| malformed_msg(path, "package.json", "expected a JSON object"))?;
-    let name = root
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned);
-    let version = root
-        .get("version")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned);
-    out.claim_asset_identity(path, name, version);
-    if lock.is_some() {
-        return Ok(());
-    }
-    for (section, scope) in [
-        ("dependencies", Scope::Runtime),
-        ("devDependencies", Scope::Development),
-        ("optionalDependencies", Scope::Optional),
-    ] {
-        let Some(packages) = root.get(section).and_then(Value::as_object) else {
-            continue;
-        };
-        entry_bound(packages.len(), path, "package.json")?;
-        for (name, constraint) in packages {
-            let Some(constraint) = constraint.as_str() else {
-                continue;
-            };
-            if constraint.is_empty() {
-                continue;
-            }
-            out.add("npm", name, constraint, scope, path, BTreeSet::new())?;
-        }
-    }
-    Ok(())
 }
 
 /// Returns the concrete purl version for a specifier, stripping pnpm-style
@@ -1258,40 +1335,39 @@ pub(crate) fn yaml_expansion_within_budget(text: &str) -> bool {
     // (libyaml reads the input in place), each event is deleted after its
     // data is copied out, and the parser is deleted on every exit path.
     unsafe {
-        let mut parser = MaybeUninit::<unsafe_libyaml::yaml_parser_t>::uninit();
-        if unsafe_libyaml::yaml_parser_initialize(parser.as_mut_ptr()).fail {
+        let mut parser = MaybeUninit::<libyaml_rs::yaml_parser_t>::uninit();
+        if libyaml_rs::yaml_parser_initialize(parser.as_mut_ptr()).fail {
             return true;
         }
         let parser = parser.as_mut_ptr();
-        unsafe_libyaml::yaml_parser_set_encoding(parser, unsafe_libyaml::YAML_UTF8_ENCODING);
-        unsafe_libyaml::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
-        let mut event = MaybeUninit::<unsafe_libyaml::yaml_event_t>::uninit();
+        libyaml_rs::yaml_parser_set_encoding(parser, libyaml_rs::YAML_UTF8_ENCODING);
+        libyaml_rs::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
+        let mut event = MaybeUninit::<libyaml_rs::yaml_event_t>::uninit();
         let mut within_budget = true;
         loop {
-            if unsafe_libyaml::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
+            if libyaml_rs::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
                 break;
             }
             let mut parsed_event = event.assume_init();
             match parsed_event.type_ {
-                unsafe_libyaml::YAML_STREAM_END_EVENT => {
-                    unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                libyaml_rs::YAML_STREAM_END_EVENT => {
+                    libyaml_rs::yaml_event_delete(&mut parsed_event);
                     break;
                 }
-                unsafe_libyaml::YAML_DOCUMENT_START_EVENT => {
+                libyaml_rs::YAML_DOCUMENT_START_EVENT => {
                     stack.clear();
                     anchors.clear();
                     total = 0;
                 }
-                unsafe_libyaml::YAML_MAPPING_START_EVENT
-                | unsafe_libyaml::YAML_SEQUENCE_START_EVENT => {
-                    let anchor = if parsed_event.type_ == unsafe_libyaml::YAML_MAPPING_START_EVENT {
+                libyaml_rs::YAML_MAPPING_START_EVENT | libyaml_rs::YAML_SEQUENCE_START_EVENT => {
+                    let anchor = if parsed_event.type_ == libyaml_rs::YAML_MAPPING_START_EVENT {
                         parsed_event.data.mapping_start.anchor
                     } else {
                         parsed_event.data.sequence_start.anchor
                     };
                     if !account(&mut stack, &mut total, 1, budget) {
                         within_budget = false;
-                        unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                        libyaml_rs::yaml_event_delete(&mut parsed_event);
                         break;
                     }
                     stack.push(Frame {
@@ -1299,15 +1375,14 @@ pub(crate) fn yaml_expansion_within_budget(text: &str) -> bool {
                         size: 1,
                     });
                 }
-                unsafe_libyaml::YAML_MAPPING_END_EVENT
-                | unsafe_libyaml::YAML_SEQUENCE_END_EVENT => {
+                libyaml_rs::YAML_MAPPING_END_EVENT | libyaml_rs::YAML_SEQUENCE_END_EVENT => {
                     if let Some(frame) = stack.pop()
                         && let Some(anchor) = frame.anchor
                     {
                         anchors.insert(anchor, frame.size);
                     }
                 }
-                unsafe_libyaml::YAML_SCALAR_EVENT => {
+                libyaml_rs::YAML_SCALAR_EVENT => {
                     let scalar = parsed_event.data.scalar;
                     if !scalar.anchor.is_null() {
                         // The anchored scalar's materialized size is one
@@ -1316,31 +1391,31 @@ pub(crate) fn yaml_expansion_within_budget(text: &str) -> bool {
                     }
                     if !account(&mut stack, &mut total, 1 + scalar.length, budget) {
                         within_budget = false;
-                        unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                        libyaml_rs::yaml_event_delete(&mut parsed_event);
                         break;
                     }
                 }
-                unsafe_libyaml::YAML_ALIAS_EVENT => {
+                libyaml_rs::YAML_ALIAS_EVENT => {
                     let alias = parsed_event.data.alias;
                     // serde_yaml resolves aliases against the anchors seen so
                     // far and errors on unknown ones; an unresolved alias
                     // here means the document is rejected downstream without
                     // materializing anything further, so accounting stops.
                     let Some(size) = anchors.get(anchor_name(alias.anchor).as_slice()) else {
-                        unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                        libyaml_rs::yaml_event_delete(&mut parsed_event);
                         break;
                     };
                     if !account(&mut stack, &mut total, *size, budget) {
                         within_budget = false;
-                        unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+                        libyaml_rs::yaml_event_delete(&mut parsed_event);
                         break;
                     }
                 }
                 _ => {}
             }
-            unsafe_libyaml::yaml_event_delete(&mut parsed_event);
+            libyaml_rs::yaml_event_delete(&mut parsed_event);
         }
-        unsafe_libyaml::yaml_parser_delete(parser);
+        libyaml_rs::yaml_parser_delete(parser);
         within_budget
     }
 }
@@ -1499,6 +1574,7 @@ mod tests {
         fs::write(&archive, [0_u8; 5]).unwrap();
         let mut limited = config();
         limited.max_input_bytes = 4;
+        limited.max_archive_bytes = 4;
         assert!(matches!(
             ScanInput::detect(&archive, &limited),
             Err(InputError::InputTooLarge {

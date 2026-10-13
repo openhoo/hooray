@@ -18,6 +18,22 @@ type PnpmNode = (String, String);
 /// A not-yet-resolved dependency edge: `(from, dep name, dep value, optional)`.
 type PnpmEdge = (PnpmNode, String, String, bool);
 
+pub(crate) fn pnpm_workspace_paths(
+    path: &str,
+    bytes: &[u8],
+) -> Result<BTreeSet<String>, InputError> {
+    let doc = pnpm_lock_doc(utf8(bytes, path, "pnpm-lock.yaml")?, path)?;
+    let Some(importers) = doc.get("importers").and_then(Yaml::as_mapping) else {
+        return Ok(BTreeSet::new());
+    };
+    entry_bound(importers.len(), path, "pnpm-lock.yaml")?;
+    Ok(importers
+        .keys()
+        .filter_map(Yaml::as_str)
+        .map(str::to_owned)
+        .collect())
+}
+
 pub(crate) fn parse_pnpm_lock(
     path: &str,
     bytes: &[u8],

@@ -119,16 +119,32 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
         "metadata.component.components",
         &mut state,
     )?;
+    let root_ref = sbom
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.component.as_ref())
+        .and_then(|component| component.bom_ref.as_deref())
+        .map(|reference| required_value(reference, "bom-ref", "metadata.component"))
+        .transpose()?;
+    if let Some(reference) = root_ref
+        && (state.refs.contains_key(reference)
+            || (state.skipped_refs.contains(reference)
+                && !sbom
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.component.as_ref())
+                    .is_some_and(|root| {
+                        mirrors_unidentified_root(root, reference, &sbom.components)
+                            || mirrors_unidentified_root(root, reference, metadata_components)
+                    })))
+    {
+        return Err(SbomError::DuplicateBomRef(reference.to_owned()));
+    }
     collect_declared_dependencies(
         &sbom.dependencies,
         &state.refs,
         &state.skipped_refs,
-        sbom.metadata
-            .as_ref()
-            .and_then(|metadata| metadata.component.as_ref())
-            .and_then(|component| component.bom_ref.as_deref())
-            .map(str::trim)
-            .filter(|reference| !reference.is_empty()),
+        root_ref,
         &mut state.dependencies,
     )?;
     if !state.skipped.is_empty() {
@@ -152,6 +168,24 @@ pub fn parse_cyclonedx(input: &[u8]) -> Result<Inventory, SbomError> {
     };
     inventory.validate()?;
     Ok(inventory)
+}
+
+/// Some producers mirror their versionless metadata root in `components`.
+/// Preserve that existing input shape only when its identifying declarations
+/// match; an unrelated component sharing the root's reference is ambiguous.
+/// Component traversal already enforced the depth and count bounds.
+fn mirrors_unidentified_root(
+    root: &CycloneDxComponent,
+    reference: &str,
+    components: &[CycloneDxComponent],
+) -> bool {
+    components.iter().any(|component| {
+        (trimmed(component.bom_ref.as_deref()) == Some(reference)
+            && trimmed(component.name.as_deref()) == trimmed(root.name.as_deref())
+            && trimmed(component.version.as_deref()) == trimmed(root.version.as_deref())
+            && trimmed(component.purl.as_deref()) == trimmed(root.purl.as_deref()))
+            || mirrors_unidentified_root(root, reference, &component.components)
+    })
 }
 
 struct ParseState<'a> {
@@ -185,6 +219,9 @@ impl ParseState<'_> {
             existing.provenance.extend(component.provenance);
             existing.licenses.extend(component.licenses);
             existing.locations.extend(component.locations);
+            if scope_exposure(component.scope) > scope_exposure(existing.scope) {
+                existing.scope = component.scope;
+            }
         } else {
             self.components.insert(identity.clone(), component);
         }
@@ -268,7 +305,7 @@ fn collect_components(
                     field: "bom-ref",
                 }
             })?;
-        let scope = parse_scope(wire.scope.as_deref());
+        let scope = component_scope(wire, &component_path)?;
         let component = Component {
             identity: identity.clone(),
             name: name.to_owned(),
@@ -328,10 +365,7 @@ fn collect_declared_dependencies(
         let from = (!from_is_root)
             .then(|| refs.get(&dependency.reference))
             .flatten();
-        if from.is_none() && !from_is_root {
-            if skipped.contains(&dependency.reference) {
-                continue;
-            }
+        if from.is_none() && !from_is_root && !skipped.contains(&dependency.reference) {
             return Err(SbomError::UnknownDependency {
                 from: dependency.reference.clone(),
                 to: dependency.reference.clone(),
@@ -522,6 +556,43 @@ fn parse_scope(scope: Option<&str>) -> Scope {
     }
 }
 
+fn scope_exposure(scope: Scope) -> u8 {
+    match scope {
+        Scope::Runtime => 5,
+        Scope::Build => 4,
+        Scope::Optional => 3,
+        Scope::Development => 2,
+        Scope::Test => 1,
+        Scope::Unknown => 0,
+    }
+}
+
+fn component_scope(wire: &CycloneDxComponent, path: &str) -> Result<Scope, SbomError> {
+    let standard = parse_scope(wire.scope.as_deref());
+    let mut declared = None;
+    for property in wire
+        .properties
+        .iter()
+        .filter(|property| property.name == "hooray:scope")
+    {
+        let scope = serde_json::from_value::<Scope>(Value::String(property.value.clone()))
+            .map_err(|_| SbomError::InvalidComponent {
+                path: path.to_owned(),
+                field: "scope",
+            })?;
+        if declared.is_some_and(|previous| previous != scope)
+            || standard != Scope::Unknown && standard != scope
+        {
+            return Err(SbomError::InvalidComponent {
+                path: path.to_owned(),
+                field: "scope",
+            });
+        }
+        declared = Some(scope);
+    }
+    Ok(declared.unwrap_or(standard))
+}
+
 fn stable_asset_id(sbom: &CycloneDxSbom, digest: &str) -> Result<AssetId, SbomError> {
     let key = sbom
         .serial_number
@@ -600,7 +671,15 @@ struct CycloneDxComponent {
     #[serde(default)]
     licenses: Vec<CycloneDxLicenseChoice>,
     #[serde(default)]
+    properties: Vec<CycloneDxProperty>,
+    #[serde(default)]
     components: Vec<CycloneDxComponent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CycloneDxProperty {
+    name: String,
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -793,25 +872,23 @@ fn collect_spdx_relationships(
             ),
             _ => continue,
         };
-        let Some(from) = refs.get(source) else {
-            if skipped.contains(source) {
-                continue;
-            }
+        let from = refs.get(source);
+        if from.is_none() && !skipped.contains(source) {
             return Err(SbomError::UnknownDependency {
                 from: source.to_owned(),
                 to: target.to_owned(),
             });
-        };
-        let Some(to) = refs.get(target) else {
-            if skipped.contains(target) {
-                continue;
-            }
+        }
+        let to = refs.get(target);
+        if to.is_none() && !skipped.contains(target) {
             return Err(SbomError::UnknownDependency {
                 from: source.to_owned(),
                 to: target.to_owned(),
             });
-        };
-        if from != to {
+        }
+        if let (Some(from), Some(to)) = (from, to)
+            && from != to
+        {
             output.insert(DependencyEdge {
                 from: from.clone(),
                 to: to.clone(),
@@ -1678,6 +1755,7 @@ mod tests {
             purl: Some("pkg:cargo/a@1".into()),
             scope: None,
             licenses: Vec::new(),
+            properties: Vec::new(),
             components: Vec::new(),
         }
     }

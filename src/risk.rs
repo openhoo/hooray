@@ -114,8 +114,11 @@ fn scope_points(scope: Scope) -> i32 {
 }
 
 fn fix_points(remediation: Option<&Remediation>, metadata: &EvidenceProperties<'_>) -> i32 {
-    if remediation.is_some_and(|item| !item.fixed_versions.is_empty())
-        || metadata.boolean("fix.available") == Some(true)
+    if remediation.is_some_and(|item| {
+        item.fixed_versions
+            .iter()
+            .any(|version| !version.trim().is_empty())
+    }) || metadata.boolean("fix.available") == Some(true)
     {
         -600
     } else if metadata.boolean("fix.available") == Some(false) {

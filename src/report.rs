@@ -1229,10 +1229,17 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
 }
 
 fn render_gitlab_cyclonedx(report: &ScanReport, limit: usize) -> Result<Vec<u8>, ReportError> {
-    let asset_ref = format!(
+    let preferred_asset_ref = format!(
         "asset:{}",
         sha256_hex(report.inventory.asset.id.as_str().as_bytes())
     );
+    let component_refs = report
+        .inventory
+        .components
+        .keys()
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    let asset_ref = available_bom_ref(&preferred_asset_ref, &component_refs);
     let mut metadata_component = json!({
         "type": cyclonedx_asset_type(report.inventory.asset.kind),
         "bom-ref": asset_ref,
@@ -1242,7 +1249,7 @@ fn render_gitlab_cyclonedx(report: &ScanReport, limit: usize) -> Result<Vec<u8>,
         metadata_component["version"] = json!(version);
     }
     let components: Vec<Value> = report.inventory.components.values().map(|component| {
-        let mut properties = Vec::new();
+        let mut properties = vec![json!({"name": "hooray:scope", "value": enum_label(component.scope)})];
         if let Some(path) = gitlab_component_input_file(component) {
             properties.push(json!({"name": "gitlab:dependency_scanning:input_file:path", "value": path}));
             if let Some((manager, language)) = gitlab_package_metadata(&component.purl) {
@@ -1291,19 +1298,38 @@ fn cdx_envelope(report: &ScanReport, component: Value) -> Value {
     })
 }
 
+/// Native asset, component and finding IDs have separate namespaces, while
+/// CycloneDX bom-refs share one. Keep a native ID when available and choose a
+/// deterministic free suffix when another exported item already uses it.
+fn available_bom_ref(preferred: &str, occupied: &BTreeSet<String>) -> String {
+    let mut reference = preferred.to_owned();
+    let mut suffix = 1_u64;
+    while occupied.contains(&reference) {
+        reference = format!("{preferred}:{suffix}");
+        suffix += 1;
+    }
+    reference
+}
+
 fn cdx_dependencies(report: &ScanReport) -> Vec<Value> {
+    // Scope/optional variants describe one dependency target in CycloneDX.
+    // Index once instead of re-scanning every edge for every component.
+    let mut targets: BTreeMap<&ComponentId, BTreeSet<&str>> = BTreeMap::new();
+    for edge in &report.inventory.dependencies {
+        targets
+            .entry(&edge.from)
+            .or_default()
+            .insert(edge.to.as_str());
+    }
     report
         .inventory
         .components
         .keys()
         .map(|id| {
-            let depends_on: Vec<&str> = report
-                .inventory
-                .dependencies
-                .iter()
-                .filter(|edge| &edge.from == id)
-                .map(|edge| edge.to.as_str())
-                .collect();
+            let depends_on: Vec<&str> = targets
+                .get(id)
+                .map(|values| values.iter().copied().collect())
+                .unwrap_or_default();
             json!({"ref": id.as_str(), "dependsOn": depends_on})
         })
         .collect()
@@ -1366,6 +1392,20 @@ fn cyclonedx_licenses(component: &Component) -> Option<Value> {
             return Some(json!([{"expression": expression}]));
         }
     }
+    // CycloneDX licenses are either license objects or exactly one SPDX
+    // expression. Multiple compound expressions cannot be mixed with ids.
+    if records.len() > 1
+        && records.iter().all(|(expression, _, _)| {
+            expression.is_some_and(|value| spdx::Expression::parse(value).is_ok())
+        })
+    {
+        let combined = records
+            .iter()
+            .map(|(expression, _, _)| format!("({})", expression.expect("all expressions checked")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        return Some(json!([{"expression": combined}]));
+    }
     cyclonedx_license_objects(&records)
 }
 
@@ -1375,21 +1415,10 @@ fn cyclonedx_license_objects(
     let mut rendered = BTreeSet::new();
     for (expression, name, url) in records {
         let single_id = expression.and_then(single_spdx_id);
-        // Expression-only records (e.g. "MIT OR Apache-2.0" with no name)
-        // are valid CycloneDX license choices and must not be dropped.
-        if single_id.is_none() && name.is_none() {
-            if let Some(expression) = expression {
-                rendered.insert(
-                    serde_json::to_string(&json!({"expression": expression}))
-                        .expect("license JSON is serializable"),
-                );
-            }
-            continue;
-        }
         let mut license = serde_json::Map::new();
         if let Some(id) = single_id {
             license.insert("id".into(), json!(id));
-        } else if let Some(name) = name {
+        } else if let Some(name) = name.or(*expression) {
             license.insert("name".into(), json!(name));
         } else {
             continue;
@@ -1526,18 +1555,52 @@ fn render_cyclonedx_vex(
     limit: usize,
     index: &ReportIndex<'_>,
 ) -> Result<Vec<u8>, ReportError> {
-    let components: Vec<Value> = report.inventory.components.values().map(|component| {
-        json!({
-            "type": "library", "bom-ref": component.identity.as_str(), "name": component.name,
-            "version": component.version, "purl": component.purl,
-            "properties": [{"name": "hooray:scope", "value": format!("{:?}", component.scope).to_ascii_lowercase()}]
+    let component_refs: BTreeSet<&str> = report
+        .inventory
+        .components
+        .keys()
+        .map(|id| id.as_str())
+        .collect();
+    let mut occupied: BTreeSet<String> = component_refs
+        .iter()
+        .map(|reference| (*reference).to_owned())
+        .chain(
+            report
+                .findings
+                .values()
+                .filter(|finding| finding.kind == FindingKind::Vulnerability)
+                .map(|finding| finding.id.as_str().to_owned()),
+        )
+        .collect();
+    let asset_ref = available_bom_ref(report.inventory.asset.id.as_str(), &occupied);
+    occupied.insert(asset_ref.clone());
+    let components: Vec<Value> = report
+        .inventory
+        .components
+        .values()
+        .map(|component| {
+            let mut value = json!({
+                "type": "library", "bom-ref": component.identity.as_str(), "name": component.name,
+                "version": component.version, "purl": component.purl,
+                "properties": [{"name": "hooray:scope", "value": enum_label(component.scope)}]
+            });
+            if let Some(licenses) = cyclonedx_licenses(component) {
+                value["licenses"] = licenses;
+            }
+            value
         })
-    }).collect();
+        .collect();
     // CycloneDX `vulnerabilities[]` is consumed as vulnerability records by
     // VEX tooling (Dependency-Track etc.), so only vulnerability findings
     // belong there; license/secret/iac/sast/malware/risk findings would be
     // ingested as bogus CVE-style entries.
     let vulnerabilities: Vec<Value> = report.findings.values().filter(|finding| finding.kind == FindingKind::Vulnerability).map(|finding| {
+        let finding_ref = if component_refs.contains(finding.id.as_str()) {
+            available_bom_ref(finding.id.as_str(), &occupied)
+        } else {
+            finding.id.as_str().to_owned()
+        };
+        occupied.insert(finding_ref.clone());
         let affects: Vec<Value> = finding.component_id.as_ref().map(|id| vec![json!({"ref": id.as_str()})]).unwrap_or_default();
         let analysis = cdx_analysis(finding);
         // CycloneDX `advisories[].url` expects a URL/iri-reference; evidence
@@ -1547,7 +1610,7 @@ fn render_cyclonedx_vex(
         let ratings = vec![json!({"severity": cdx_severity(finding.severity), "method": "other"})];
         let properties = common_properties(index, finding);
         json!({
-            "bom-ref": finding.id.as_str(), "id": finding.advisory_id.as_deref().unwrap_or(finding.rule_id.as_str()),
+            "bom-ref": finding_ref, "id": finding.advisory_id.as_deref().unwrap_or(finding.rule_id.as_str()),
             "source": {"name": "hooray"}, "ratings": ratings,
             "description": finding.details.as_deref().or(finding.summary.as_deref()).unwrap_or(finding.rule_id.as_str()),
             "advisories": advisories, "analysis": analysis, "affects": affects, "properties": properties
@@ -1556,7 +1619,7 @@ fn render_cyclonedx_vex(
     let mut document = cdx_envelope(
         report,
         json!({
-            "type": "application", "bom-ref": report.inventory.asset.id.as_str(), "name": report.inventory.asset.name, "version": report.inventory.asset.version.as_deref().unwrap_or("unknown")
+            "type": "application", "bom-ref": asset_ref, "name": report.inventory.asset.name, "version": report.inventory.asset.version.as_deref().unwrap_or("unknown")
         }),
     );
     document["components"] = Value::Array(components);
@@ -1917,14 +1980,41 @@ fn check_text(label: &str, value: &str) -> Result<(), ReportError> {
 
 /// Returns the redacted form of `report`: borrowed verbatim when the closed
 /// free-form-key carrier set is clean (see [`contains_sensitive_key`]),
-/// otherwise rebuilt through the redacting JSON roundtrip.
+/// otherwise cloned and redacted at its free-form metadata carriers.
 pub(crate) fn sanitize_report(report: &ScanReport) -> Result<Cow<'_, ScanReport>, ReportError> {
     if !contains_sensitive_key(report) {
         return Ok(Cow::Borrowed(report));
     }
-    let mut value = serde_json::to_value(report)?;
-    redact_sensitive_values(&mut value, None);
-    Ok(Cow::Owned(serde_json::from_value(value)?))
+    let mut sanitized = report.clone();
+    for metadata in [
+        &mut sanitized.run.metadata,
+        &mut sanitized.inventory.asset.metadata,
+    ] {
+        for (key, value) in metadata {
+            redact_sensitive_values(value, Some(key));
+        }
+    }
+    for finding in sanitized.findings.values_mut() {
+        finding.evidence = std::mem::take(&mut finding.evidence)
+            .into_iter()
+            .map(|mut evidence| {
+                for (key, value) in &mut evidence.properties {
+                    if is_sensitive_key(key) {
+                        *value = REDACTED.to_owned();
+                    }
+                }
+                evidence
+            })
+            .collect();
+        if let Some(risk) = &mut finding.risk {
+            for (key, value) in &mut risk.factors {
+                if is_sensitive_key(key) {
+                    *value = 0;
+                }
+            }
+        }
+    }
+    Ok(Cow::Owned(sanitized))
 }
 pub(crate) fn sanitize_value(value: &mut Value) {
     redact_sensitive_values(value, None);
@@ -1944,10 +2034,11 @@ pub(crate) fn sanitize_value(value: &mut Value) {
 /// - `Evidence.properties` (`BTreeMap<String, String>`);
 /// - `Risk.factors` (`BTreeMap<String, i32>`).
 ///
-/// Every other string-keyed collection carries validated identifier keys
+/// Every other string-keyed collection carries typed identifier keys
 /// (finding/component/location/policy id maps) or enum keys
-/// (`UpgradePlan.commands: BTreeMap<ManifestTool, String>`), so neither can
-/// smuggle attacker-chosen key names. Pinned end-to-end by the test
+/// (`UpgradePlan.commands: BTreeMap<ManifestTool, String>`). Identifier text
+/// may look sensitive, so redaction must never traverse those maps as metadata.
+/// Pinned end-to-end by the test
 /// `sanitize_report_fast_path_carrier_set`.
 fn contains_sensitive_key(report: &ScanReport) -> bool {
     fn metadata_carries(metadata: &BTreeMap<String, Value>) -> bool {
@@ -2096,19 +2187,18 @@ fn common_properties(index: &ReportIndex<'_>, finding: &Finding) -> Vec<Value> {
 }
 
 fn cdx_analysis(finding: &Finding) -> Value {
-    let (state, justification) = match finding.applicability.as_ref().map(|item| item.status) {
-        Some(ApplicabilityStatus::Affected) => ("exploitable", None),
-        Some(ApplicabilityStatus::NotAffected) => ("not_affected", Some("code_not_reachable")),
-        Some(ApplicabilityStatus::Fixed) => ("resolved", None),
+    let state = match finding.applicability.as_ref().map(|item| item.status) {
+        Some(ApplicabilityStatus::Affected) => "exploitable",
+        // NotAffected may mean an ecosystem/version mismatch. The model
+        // does not carry a typed justification, so do not invent execution
+        // evidence from the status alone.
+        Some(ApplicabilityStatus::NotAffected) => "not_affected",
+        Some(ApplicabilityStatus::Fixed) => "resolved",
         Some(ApplicabilityStatus::UnderInvestigation)
         | Some(ApplicabilityStatus::Unknown)
-        | None => ("in_triage", None),
+        | None => "in_triage",
     };
-    let mut analysis = json!({"state": state, "detail": finding.applicability.as_ref().and_then(|item| item.rationale.as_deref()).unwrap_or("Hooray applicability assessment")});
-    if let Some(justification) = justification {
-        analysis["justification"] = json!(justification);
-    }
-    analysis
+    json!({"state": state, "detail": finding.applicability.as_ref().and_then(|item| item.rationale.as_deref()).unwrap_or("Hooray applicability assessment")})
 }
 
 fn finding_detail_text(index: &ReportIndex<'_>, finding: &Finding) -> String {
@@ -2721,6 +2811,7 @@ mod tests {
             Component {
                 identity: first.clone(),
                 name: "first".into(),
+                version: "1".into(),
                 purl: "pkg:cargo/first@1".into(),
                 ..template.clone()
             },
@@ -2730,6 +2821,7 @@ mod tests {
             Component {
                 identity: second.clone(),
                 name: "second".into(),
+                version: "1".into(),
                 purl: "pkg:cargo/second@1".into(),
                 ..template
             },

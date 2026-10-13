@@ -27,7 +27,7 @@ fn open_regular_nofollow(path: &Path) -> Result<File, InputError> {
             target_os = "dragonfly"
         ))]
         const O_NOFOLLOW: i32 = 0x100;
-        options.custom_flags(O_NOFOLLOW);
+        options.custom_flags(O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path).map_err(|source| {
         if is_symlink_open_error(&source) {

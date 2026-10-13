@@ -77,8 +77,16 @@ impl DependencyGraph {
     /// `Transitive`. Inventories that lock the project as a component
     /// (Cargo) never set the flag and keep the legacy depth mapping.
     fn add_virtual_root(&mut self) {
-        let virtual_root =
-            ComponentId::new("hooray:virtual-root").expect("static virtual root id is valid");
+        let mut root_name = "hooray:virtual-root".to_owned();
+        let mut suffix = 0_u64;
+        while self
+            .nodes
+            .contains(&ComponentId::new(&root_name).expect("root id is nonempty"))
+        {
+            suffix += 1;
+            root_name = format!("hooray:virtual-root:{suffix}");
+        }
+        let virtual_root = ComponentId::new(root_name).expect("root id is nonempty");
         let dependency_roots: Vec<ComponentId> = self
             .nodes
             .iter()

@@ -456,6 +456,21 @@ pub trait MonitorRepository: Send {
         expected_updated_at: i64,
     ) -> Result<(), MonitorError>;
     fn enqueue_event(&mut self, event: &AlertEvent) -> Result<bool, MonitorError>;
+    /// Saves a completed target transition and its optional alert. Durable
+    /// repositories should override this to commit both writes atomically;
+    /// the default supports existing infallible in-memory repositories.
+    fn save_target_with_event(
+        &mut self,
+        target: &MonitorTarget,
+        expected_updated_at: i64,
+        event: Option<&AlertEvent>,
+    ) -> Result<bool, MonitorError> {
+        self.save_target(target, expected_updated_at)?;
+        event
+            .map(|event| self.enqueue_event(event))
+            .transpose()
+            .map(|inserted| inserted.unwrap_or(false))
+    }
     fn claim_events(
         &mut self,
         now: i64,
@@ -537,6 +552,28 @@ impl MonitorRepository for crate::store::Store {
             .map_err(store_error)
     }
 
+    fn save_target_with_event(
+        &mut self,
+        target: &MonitorTarget,
+        expected_updated_at: i64,
+        event: Option<&AlertEvent>,
+    ) -> Result<bool, MonitorError> {
+        let stored_target = target_to_store(target)?;
+        let stored_event = event.map(event_to_store).transpose()?;
+        self.commit_monitor_transition(
+            &stored_target,
+            &encode_time(expected_updated_at),
+            stored_event.as_ref(),
+        )
+        .map_err(store_error)?
+        .ok_or_else(|| {
+            MonitorError::Persistence(format!(
+                "monitor target '{}' changed or was removed concurrently",
+                target.id
+            ))
+        })
+    }
+
     fn claim_events(
         &mut self,
         now: i64,
@@ -566,7 +603,7 @@ impl MonitorRepository for crate::store::Store {
             Ok(())
         } else {
             Err(MonitorError::Persistence(format!(
-                "monitor event '{}' disappeared",
+                "monitor event '{}' changed or disappeared",
                 event.id
             )))
         }
@@ -791,7 +828,7 @@ where
         });
         target.next_due_at = now.saturating_add(self.config.retry.delay_after(streak));
         let expected_updated_at = target.updated_at;
-        target.updated_at = now;
+        target.updated_at = advance_updated_at(expected_updated_at, now)?;
         self.repository.save_target(target, expected_updated_at)
     }
 
@@ -842,6 +879,7 @@ where
             let advisory_changed = refresh.changed
                 || target.advisory_digest.as_deref() != Some(advisory_digest.as_str());
             let policy_changed = target.policy_digest.as_deref() != Some(policy_digest.as_str());
+            let mut pending_event = None;
 
             let inventory = if source_changed
                 || advisory_changed
@@ -873,8 +911,12 @@ where
                                 policy_digest: policy_digest.clone(),
                                 diff,
                             };
+                            // Deduplicate retries of this transition against
+                            // its observed baseline. An identical finding diff
+                            // after an intervening resolution is a new alert.
                             let dedupe_key = digest_json(&(
                                 &payload.target_id,
+                                target.updated_at,
                                 &payload.source_fingerprint,
                                 &payload.advisory_digest,
                                 &payload.policy_digest,
@@ -892,9 +934,7 @@ where
                                 dead_lettered_at: None,
                                 last_error: None,
                             };
-                            if self.repository.enqueue_event(&event)? {
-                                summary.events_created += 1;
-                            }
+                            pending_event = Some(event);
                         }
                         target.finding_ids = evaluation.finding_ids;
                         evaluation.inventory
@@ -920,8 +960,14 @@ where
             target.policy_digest = Some(policy_digest.clone());
             target.next_due_at = advance_due(target.next_due_at, target.interval_seconds, now);
             let expected_updated_at = target.updated_at;
-            target.updated_at = now;
-            self.repository.save_target(&target, expected_updated_at)?;
+            target.updated_at = advance_updated_at(expected_updated_at, now)?;
+            if self.repository.save_target_with_event(
+                &target,
+                expected_updated_at,
+                pending_event.as_ref(),
+            )? {
+                summary.events_created += 1;
+            }
         }
 
         self.deliver_events(&mut summary).await?;
@@ -1021,6 +1067,16 @@ where
             None => Ok(()),
         }
     }
+}
+
+/// `updated_at` doubles as the optimistic write token. Registration and the
+/// first cycle may share one clock second, and clocks may move backwards, so
+/// every successful target write must advance it even in those cases.
+fn advance_updated_at(previous: i64, now: i64) -> Result<i64, MonitorError> {
+    previous
+        .checked_add(1)
+        .map(|next| next.max(now))
+        .ok_or_else(|| MonitorError::Persistence("monitor target update timestamp overflow".into()))
 }
 
 fn advance_due(previous_due: i64, interval: i64, now: i64) -> i64 {
@@ -1627,6 +1683,102 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn same_second_monitor_cycles_invalidate_stale_sqlite_writers() {
+        for fail_fingerprint in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("monitor.sqlite3");
+            let mut store = crate::store::Store::open(&database).unwrap();
+            let mut registered = target(100);
+            registered.updated_at = 100;
+            store
+                .add_monitor_target(&target_to_store(&registered).unwrap())
+                .unwrap();
+            let mut competing = crate::store::Store::open(&database).unwrap();
+            let mut stale = competing.due_targets(100, 1).unwrap().remove(0);
+            let runner = Arc::new(FakeRunner::new());
+            if fail_fingerprint {
+                *runner.fingerprint_error.lock().unwrap() = Some("unavailable source".into());
+            }
+            let mut service = MonitorService::new(
+                store,
+                Arc::new(FakeClock::new(100)),
+                runner,
+                Arc::new(FakeNotifier::succeeding()),
+                MonitorConfig::default(),
+            )
+            .unwrap();
+            service.run_once().await.unwrap();
+            stale.source = "stale competing source".into();
+            stale.updated_at = 100;
+            assert!(
+                competing.save_target(&stale, 100).is_err(),
+                "a completed cycle must change its CAS token even in its registration second"
+            );
+            let saved = service
+                .repository()
+                .get_monitor_target("target")
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.source, "repo");
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_monitor_alerts_again_when_a_resolved_finding_reappears() {
+        let mut store = crate::store::Store::open_memory().unwrap();
+        store
+            .add_monitor_target(&target_to_store(&target(100)).unwrap())
+            .unwrap();
+        let clock = Arc::new(FakeClock::new(100));
+        let runner = Arc::new(FakeRunner::new());
+        let notifier = Arc::new(FakeNotifier::succeeding());
+        let mut service = MonitorService::new(
+            store,
+            clock.clone(),
+            runner.clone(),
+            notifier.clone(),
+            MonitorConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(service.run_once().await.unwrap().events_created, 1);
+
+        clock.set(110);
+        *runner.fingerprint.lock().unwrap() = "source-2".into();
+        runner.findings.lock().unwrap().clear();
+        assert_eq!(service.run_once().await.unwrap().events_created, 1);
+
+        // Reverting to the exact vulnerable source state is a new incident,
+        // even when its advisory, policy and introduced finding are identical.
+        clock.set(120);
+        *runner.fingerprint.lock().unwrap() = "source-1".into();
+        *runner.findings.lock().unwrap() = ids(&["finding-a"]);
+        let reintroduced = service.run_once().await.unwrap();
+        assert_eq!(reintroduced.events_created, 1);
+        assert_eq!(reintroduced.events_delivered, 1);
+        assert_eq!(notifier.calls.load(Ordering::SeqCst), 3);
+
+        // A later cycle observing that same vulnerable state stays quiet.
+        clock.set(130);
+        assert_eq!(service.run_once().await.unwrap().events_created, 0);
+        assert_eq!(notifier.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            service
+                .repository()
+                .list_monitor_events(
+                    &crate::store::MonitorEventFilter {
+                        include_delivered: true,
+                        ..Default::default()
+                    },
+                    100,
+                    0,
+                )
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[tokio::test]

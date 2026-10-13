@@ -367,40 +367,36 @@ impl RangeOutcome {
     }
 }
 
-/// Ecosystem-aware ordering context for PyPI and Maven components: carries
-/// the component version parsed once through remediation's comparator so OSV
-/// event boundaries compare under PEP 440 / Maven ordering.
+/// Ecosystem-aware ordering context shared with remediation. A known
+/// ecosystem remains scoped even when its version cannot be parsed, so an
+/// invalid version cannot silently fall back to a different ordering.
 #[derive(Debug, Clone)]
 struct ScopedOrdering {
     ecosystem: PackageEcosystem,
-    key: VersionKey,
+    key: Option<VersionKey>,
 }
 
 impl ScopedOrdering {
-    /// Builds the context when the purl ecosystem routes through remediation's
-    /// comparator (PyPI, Maven only) and that comparator accepts the version;
-    /// every other ecosystem keeps the legacy heuristic untouched.
+    /// Unknown ecosystems retain the legacy comparator; known ecosystems use
+    /// the same version grammar for applicability and remediation.
     fn for_component(ecosystem: Option<&str>, version: &str) -> Option<Self> {
-        let ecosystem = package_ecosystem_for_purl_type(ecosystem?).filter(|ecosystem| {
-            matches!(ecosystem, PackageEcosystem::Pypi | PackageEcosystem::Maven)
-        })?;
-        let key = VersionKey::parse(ecosystem, version)?;
+        let ecosystem = package_ecosystem_for_purl_type(ecosystem?)?;
+        let key = VersionKey::parse(ecosystem, version);
         Some(Self { ecosystem, key })
     }
 }
 
-/// Orders the component version against one OSV event boundary, preferring
-/// the scoped comparator and falling back to the legacy heuristic whenever
-/// either side cannot be parsed by it.
+/// Orders the component version against one OSV event boundary. A known
+/// ecosystem's unparsable component or boundary is incomparable.
 fn compare_scoped(
     scoped: Option<&ScopedOrdering>,
     version_parts: Option<&[String]>,
     boundary: &str,
 ) -> Option<Ordering> {
-    if let Some(scoped) = scoped
-        && let Some(boundary) = VersionKey::parse(scoped.ecosystem, boundary)
-    {
-        return Some(scoped.key.cmp(&boundary));
+    if let Some(scoped) = scoped {
+        let key = scoped.key.as_ref()?;
+        let boundary = VersionKey::parse(scoped.ecosystem, boundary)?;
+        return Some(key.cmp(&boundary));
     }
     compare_version_parts(version_parts, boundary)
 }
@@ -442,6 +438,27 @@ fn evaluate_range(
         };
     }
 
+    // A comparable closing event cannot establish a fixed/negative verdict
+    // when another event is empty or its boundary cannot be interpreted.
+    // Preserve uncertainty before sorting or short-circuiting the walk.
+    if range.events.iter().any(|event| {
+        let boundaries = [
+            event.introduced.as_deref(),
+            event.fixed.as_deref(),
+            event.last_affected.as_deref(),
+            event.limit.as_deref(),
+        ];
+        boundaries.iter().all(Option::is_none)
+            || boundaries
+                .into_iter()
+                .flatten()
+                .any(|boundary| compare_scoped(scoped, version_parts, boundary).is_none())
+    }) {
+        return RangeOutcome::Unknown(
+            "OSV range contains an empty event or a boundary that could not be compared to the component version".to_owned(),
+        );
+    }
+
     // OSV says events SHOULD be sorted by version boundary, but producers
     // do not always comply; sort a copy so document order cannot change the
     // verdict. The stable sort keeps the original order for events whose
@@ -474,19 +491,16 @@ fn event_boundary(event: &OsvEvent) -> String {
         .to_owned()
 }
 
-/// Orders two OSV event boundaries: the scoped comparator when both parse,
-/// else the legacy token heuristic; `None` when either side is incomparable.
+/// Orders two OSV event boundaries under the known ecosystem grammar, or
+/// the legacy comparator for an unknown ecosystem.
 fn compare_boundaries(
     scoped: Option<&ScopedOrdering>,
     left: &str,
     right: &str,
 ) -> Option<Ordering> {
-    if let Some(scoped) = scoped
-        && let (Some(a), Some(b)) = (
-            VersionKey::parse(scoped.ecosystem, left),
-            VersionKey::parse(scoped.ecosystem, right),
-        )
-    {
+    if let Some(scoped) = scoped {
+        let a = VersionKey::parse(scoped.ecosystem, left)?;
+        let b = VersionKey::parse(scoped.ecosystem, right)?;
         return Some(a.cmp(&b));
     }
     compare_version_parts(version_parts(left).as_deref(), right)
@@ -1375,9 +1389,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ecosystems_keep_semver_rule_11_outcomes() {
-        // Prerelease identifiers sort below the plain release for ecosystems
-        // that stay on the legacy comparator...
+    fn known_semver_ecosystems_keep_semver_rule_11_outcomes() {
+        // Prerelease identifiers sort below the plain release.
         let below = vec![OsvEvent {
             introduced: Some("0".into()),
             fixed: Some("1.0.0".into()),

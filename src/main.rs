@@ -306,6 +306,7 @@ enum OutputFormat {
     GitlabSarif,
     Junit,
     Html,
+    #[value(name = "cyclonedx-vex", alias = "cyclone-dx-vex")]
     CycloneDxVex,
     GitlabCyclonedx,
     Spdx,
@@ -1077,6 +1078,22 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
     use tempfile::TempDir;
+
+    #[test]
+    fn cli_accepts_documented_cyclonedx_format_and_legacy_spelling() {
+        for name in ["cyclonedx-vex", "cyclone-dx-vex"] {
+            let cli =
+                Cli::try_parse_from(["hooray", "scan", "sbom", "input.json", "--format", name])
+                    .unwrap();
+            let Command::Scan(ScanArgs {
+                command: ScanCommand::Sbom(args),
+            }) = cli.command
+            else {
+                panic!("unexpected parsed command");
+            };
+            assert_eq!(args.output.format, OutputFormat::CycloneDxVex);
+        }
+    }
 
     fn output(path: PathBuf, format: OutputFormat) -> OutputArgs {
         OutputArgs {

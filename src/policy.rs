@@ -422,9 +422,6 @@ impl<'a> CompiledPolicy<'a> {
                 exempted = Some(selected);
             }
         }
-        if let Some(selected) = exempted {
-            return selected;
-        }
         let selected = if let Some(rule) = self
             .rules
             .iter()
@@ -444,7 +441,16 @@ impl<'a> CompiledPolicy<'a> {
                 "no policy rule matched",
             )
         };
-        self.apply_exception(selected, finding, component, now)
+        let mut selected = self.apply_exception(selected, finding, component, now);
+        if let Some(exemption) = exempted {
+            // A waiver for missing evidence only clears that guard. Ordinary
+            // policy rules still decide whether the finding is acceptable.
+            if selected.outcome == PolicyOutcome::Allow && selected.exception_id.is_none() {
+                return exemption;
+            }
+            selected.reason = format!("{}; {}", exemption.reason, selected.reason);
+        }
+        selected
     }
 
     fn apply_exception(
@@ -573,8 +579,11 @@ impl CompiledRule<'_> {
 /// references but no fixed version also classifies as unavailable.
 fn fix_available(remediation: Option<&Remediation>) -> bool {
     remediation.is_some_and(|remediation| {
-        !remediation.fixed_versions.is_empty()
-            || (!remediation.description.is_empty() && remediation.references.is_empty())
+        remediation
+            .fixed_versions
+            .iter()
+            .any(|version| !version.trim().is_empty())
+            || (!remediation.description.trim().is_empty() && remediation.references.is_empty())
     })
 }
 
@@ -705,10 +714,25 @@ fn validate_exact_exception_selectors(exception: &PolicyException) -> Result<(),
                 format!("exception '{}'.selectors.{selector}", exception.id),
                 value,
             )?;
-            if value
-                .bytes()
-                .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'{' | b'}'))
-            {
+            let qualifier_delimiter = (selector == "purl")
+                .then(|| value.split_once('?'))
+                .flatten()
+                .filter(|(base, qualifiers)| {
+                    crate::util::parse_purl_body(base).is_some()
+                        && !base.ends_with('@')
+                        && qualifiers.split('#').next().is_some_and(|query| {
+                            query.split('&').all(|part| {
+                                part.split_once('=').is_some_and(|(key, value)| {
+                                    !key.is_empty() && !value.is_empty()
+                                })
+                            })
+                        })
+                })
+                .map(|(base, _)| base.len());
+            if value.bytes().enumerate().any(|(index, byte)| {
+                matches!(byte, b'*' | b'[' | b']' | b'{' | b'}')
+                    || byte == b'?' && qualifier_delimiter != Some(index)
+            }) {
                 return Err(PolicyError::NonExactExceptionSelector {
                     exception_id: exception.id.clone(),
                     selector,

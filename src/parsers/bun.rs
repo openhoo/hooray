@@ -23,6 +23,16 @@ struct BunWorkspace {
     version: Option<String>,
 }
 
+pub(crate) fn bun_workspace_paths(
+    path: &str,
+    bytes: &[u8],
+) -> Result<BTreeSet<String>, InputError> {
+    let json = jsonc_to_json(utf8(bytes, path, "bun.lock")?);
+    let lock: BunLock = serde_json::from_str(&json).map_err(|e| malformed(path, "bun.lock", e))?;
+    entry_bound(lock.workspaces.len(), path, "bun.lock")?;
+    Ok(lock.workspaces.into_keys().collect())
+}
+
 /// Text `bun.lock` ingestion. The file is JSONC (comments and trailing
 /// commas are legal), so the bytes are sanitized to strict JSON before
 /// serde sees them; the binary `bun.lockb` format is not recognized.

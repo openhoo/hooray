@@ -675,34 +675,58 @@ fn affected_ranges(vulnerability: &Vulnerability, component: &Component) -> Vec<
                 .iter()
                 .filter_map(|version| clean_version(Some(version)))
                 .collect();
-            affected.ranges.iter().filter_map(move |range| {
-                let range_type = match range
-                    .kind
-                    .as_deref()
-                    .map(str::to_ascii_uppercase)
-                    .as_deref()
-                {
-                    None | Some("ECOSYSTEM") => OsvRangeType::Ecosystem,
-                    Some("SEMVER") => OsvRangeType::Semver,
-                    Some("GIT") => OsvRangeType::Git,
-                    Some(_) => return None,
-                };
-                Some(OsvAffectedRange {
-                    range_type,
-                    ecosystem: ecosystem.clone(),
-                    versions: versions.clone(),
-                    events: range
-                        .events
-                        .iter()
-                        .map(|event| OsvEvent {
-                            introduced: clean_version(event.introduced.as_deref()),
-                            fixed: clean_version(event.fixed.as_deref()),
-                            last_affected: clean_version(event.last_affected.as_deref()),
-                            limit: clean_version(event.limit.as_deref()),
-                        })
-                        .collect(),
+            let ranges: Vec<_> = affected
+                .ranges
+                .iter()
+                .filter_map(|range| {
+                    let range_type = match range
+                        .kind
+                        .as_deref()
+                        .map(str::to_ascii_uppercase)
+                        .as_deref()
+                    {
+                        None | Some("ECOSYSTEM") => OsvRangeType::Ecosystem,
+                        Some("SEMVER") => OsvRangeType::Semver,
+                        Some("GIT") => OsvRangeType::Git,
+                        Some(_) => return None,
+                    };
+                    Some(OsvAffectedRange {
+                        range_type,
+                        ecosystem: ecosystem.clone(),
+                        versions: versions.clone(),
+                        events: range
+                            .events
+                            .iter()
+                            .map(|event| OsvEvent {
+                                introduced: clean_version(event.introduced.as_deref()),
+                                fixed: clean_version(event.fixed.as_deref()),
+                                last_affected: clean_version(event.last_affected.as_deref()),
+                                limit: clean_version(event.limit.as_deref()),
+                            })
+                            .collect(),
+                    })
                 })
-            })
+                .collect();
+            if ranges.is_empty()
+                && !versions.is_empty()
+                && (affected.ranges.is_empty()
+                    || versions
+                        .iter()
+                        .any(|version| version == component.version.trim()))
+            {
+                // Explicit affected versions are independent of range events.
+                // Preserve them when ranges are absent or use an unsupported
+                // ordering scheme. An unsupported scheme cannot establish a
+                // negative verdict for a version outside the explicit list.
+                vec![OsvAffectedRange {
+                    range_type: OsvRangeType::Ecosystem,
+                    ecosystem,
+                    versions,
+                    events: Vec::new(),
+                }]
+            } else {
+                ranges
+            }
         })
         .collect()
 }
@@ -857,7 +881,10 @@ fn same_package(left: &str, right: &str) -> bool {
 /// `pkg:npm/`) and its sorted qualifier list.
 fn package_identity(purl: &str) -> (String, Vec<String>) {
     let body = purl.strip_prefix("pkg:").unwrap_or(purl);
-    let (path, qualifiers) = match body.split_once(['?', '#']) {
+    // Subpaths identify content inside the package. They are separate from
+    // qualifiers and do not change which advisory package is being queried.
+    let body = body.split('#').next().unwrap_or(body);
+    let (path, qualifiers) = match body.split_once('?') {
         Some((path, qualifiers)) => (path, qualifiers),
         None => (body, ""),
     };
