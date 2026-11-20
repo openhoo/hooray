@@ -60,7 +60,12 @@ and run identifiers make reports and history diffs reproducible.
 - Deduplicates package URLs before network access.
 - Queries OSV in batches of at most 1,000 packages and follows paginated batch
   results.
-- Fetches each unique advisory once with bounded concurrency.
+- Fetches each unique OSV advisory once with bounded concurrency.
+- Checks Cargo `zip` coordinates against a [pinned table from the package
+  maintainers](docs/verification/zip-maintainer-coordinates.tsv) in online and
+  offline scans. Reports record the snapshot source, Git revision and SHA-256
+  in `run.metadata.publisher_snapshot`. These findings describe declared
+  package/version matches. They do not verify crate bytes or feature use.
 - Preserves advisory aliases, references, modified timestamps, fixed versions,
   and severity derived from OSV CVSS or ecosystem metadata.
 - Classifies dependencies as direct, transitive, or disconnected and records up
@@ -75,9 +80,9 @@ and run identifiers make reports and history diffs reproducible.
   pip/Poetry, Go, Maven/Gradle, and NuGet when the required data is available.
 
 `--offline` (or `HOORAY_OFFLINE=true`, or `offline: true` in the config file)
-disables OSV access. Local inventory, license, filesystem, policy, history, and
-report operations remain available; vulnerability findings are not invented or
-served from an implicit cache.
+disables OSV access. The bundled publisher snapshot still runs, along with
+local inventory, license, filesystem and policy checks. An empty vulnerability
+list is only a statement about the sources consulted.
 
 ### Policy and exceptions
 
@@ -546,6 +551,8 @@ hooray [--config FILE] <COMMAND>
 Commands and subcommands:
 
 ```text
+hooray gate evaluate ARTIFACT.zip --policy FILE
+hooray gate require ARTIFACT.zip --policy FILE
 hooray scan project INPUT [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--offline] [--format FORMAT] [--output FILE]
 hooray scan sbom INPUT    [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--offline] [--format FORMAT] [--output FILE]
 hooray scan artifact INPUT [--policy FILE] [--baseline RUN_ID] [--new-findings-only] [--offline] [--format FORMAT] [--output FILE]
@@ -695,7 +702,7 @@ target's own interval still determines when that target becomes due.
 | Code | Meaning |
 | --- | --- |
 | `0` | Command completed and policy produced no denied decisions |
-| `1` | Scan, stored report, or standalone policy evaluation contained denied decisions |
+| `1` | Policy denial, or the artifact gate could not confirm a current allow |
 | `2` | Configuration, input, network, storage, validation, rendering, or other operational error |
 
 Warnings do not produce exit code `1`. Policy controls the gate; there is no
@@ -793,7 +800,33 @@ pinned revisions of this repository with the same checked-in policy. They
 compare inventory against Cargo.lock, Hooray findings against cargo-audit,
 and version ranges against the projects that published the advisories.
 The sources have different coverage; the report lists disagreements.
-These controls do not verify an Xray watch or repository download gate.
+The separate [repository pilot](docs/verification/repository-gate-pilot.md)
+uses a Git HTTP repository to test promotion and download with two real Cargo
+lockfiles. Neither test establishes equivalence with a configured Xray watch.
+
+### Artifact promotion pilot
+
+`hooray gate evaluate artifact.zip --policy policy.yaml` records an offline
+decision for the exact artifact and policy bytes in the configured SQLite
+database. This pilot checks the Cargo `zip` coordinate and refuses promotion
+on any applicable pinned publisher advisory or a policy denial. A positive
+decision is scoped to that check; it does not certify the whole artifact.
+
+Immediately before publication, the trusted writer runs
+`hooray gate require artifact.zip --policy policy.yaml` against its private
+copy of those bytes and its own database. Only exit 0 authorizes publishing
+that copy. Exit 1 means denied, unknown, or missing a matching decision;
+exit 2 signals an operational error. Changing the artifact, policy or
+publisher snapshot requires a fresh evaluation. The CLI writes JSON to
+stdout. The repository operator must prevent other writers from publishing
+directly. Already distributed bytes cannot be recalled by this gate.
+
+Opening a history database upgrades it to schema 3. Back up the database
+before upgrading; use the matching backup to roll back to an older scanner.
+Retention keeps scan runs referenced by a gate decision. Use a database
+writable only by the trusted writer. A new scanner release or snapshot
+requires a new allow. The embedded table does not refresh automatically;
+operators must decide how recent a snapshot their repository requires.
 
 ## JFrog Xray parity testing
 
@@ -812,7 +845,7 @@ The current corpus does not exercise repository enforcement or OCI image parity.
 - The offline suite scans the local fixtures and checks inventory expectations.
   When recordings exist, it also compares fresh local output against their
   Hooray inventory and computes scores against their captured Xray side.
-  The offline re-scan does not regenerate vulnerability findings.
+  The offline re-scan cannot regenerate live OSV findings.
 - In a licensed environment, an operator scans the same input with Xray and
   uses `record` to save both normalized results and their provenance.
   Recordings go in `tests/fixtures/parity/recordings/`.

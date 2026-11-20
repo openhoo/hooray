@@ -80,6 +80,7 @@ def scan(binary, rev, expected_exit, parent, save_reports):
     passed = proc.returncode == expected_exit and (positive if expected_exit == 1 else fixed_coordinate)
     return {"commit": commit, "input_sha256": hashes, "started_at": report["run"]["started_at"],
             "exit_code": proc.returncode, "expected_exit_code": expected_exit, "passed": passed,
+            "publisher_snapshot": report["run"]["metadata"].get("publisher_snapshot"),
             "zip_coordinates": fixed_zip, "components": len(components),
             "edges": len(report["inventory"]["dependencies"]), "lockfile_inventory_equal": True,
             "decisions": dict(sorted(Counter(outcomes.values()).items())),
@@ -99,7 +100,7 @@ def main():
         rows = [scan(binary, ref, code, Path(tmp), args.save_reports) for ref, code in [(BASE, 1), (args.candidate_ref, 0)]]
     if rows[0]["input_sha256"]["hooray-policy.yaml"] != rows[1]["input_sha256"]["hooray-policy.yaml"]:
         raise ValueError("policy changed between controls; review and requalify the comparison")
-    print(json.dumps({"control": CONTROL, "provider": "live OSV; no pinned snapshot",
+    print(json.dumps({"control": CONTROL, "provider": "live OSV; any bundled publisher snapshot is identified per case",
                       "binary_version": subprocess.check_output([binary, "--version"], text=True).strip(),
                       "executable_sha256": sha(binary.read_bytes()),
                       "cases": rows}, indent=2))

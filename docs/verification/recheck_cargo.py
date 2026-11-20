@@ -48,7 +48,7 @@ def hooray_matches(report, reference):
             continue
         component = inventory[item['component_id']]
         coordinate = component['name'], component['version']
-        id_ = item['rule_id'].removeprefix('osv:')
+        id_ = item.get('advisory_id') or item['rule_id'].removeprefix('osv:')
         aliases = {id_, *item['aliases']}
         labels[coordinate].update(aliases)
         matches = [key for key, (_, row) in reference.items() if key[:2] == coordinate and aliases.intersection({key[2], *row['advisory']['aliases']})]

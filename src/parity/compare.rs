@@ -296,8 +296,8 @@ pub fn effective_threshold(recording_gate: Option<f64>, cli_gate: Option<f64>) -
 /// Drift guard between a fresh offline scan and the recorded hooray side.
 ///
 /// Components, license findings, and parse errors must match exactly;
-/// vulnerabilities are exempt by construction because offline scans query no
-/// advisory database and would always diverge from a recorded live run.
+/// vulnerabilities are exempt because the offline snapshot cannot reproduce
+/// the OSV feed used by a recorded live run.
 /// Generator identity, scan mode, and case id are metadata, not behavior,
 /// and are likewise exempt.
 pub fn drift_violations(fresh: &CanonicalReport, recorded: &CanonicalReport) -> Vec<String> {

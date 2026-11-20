@@ -51,6 +51,8 @@ struct Cli {
 enum Command {
     /// Scan a project, SBOM, archive, or container and enforce policy
     Scan(ScanArgs),
+    /// Record or require an artifact decision using the pinned Cargo ZIP publisher snapshot
+    Gate(GateArgs),
     /// Validate a policy or evaluate it against a stored scan
     Policy(PolicyArgs),
     /// Show dependency inventory from the latest or a selected scan
@@ -102,6 +104,28 @@ struct ScanTargetArgs {
     offline: bool,
     #[command(flatten)]
     output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
+struct GateArgs {
+    #[command(subcommand)]
+    command: GateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum GateCommand {
+    /// Scan exact ZIP and policy bytes offline, then record the decision
+    Evaluate(GateInput),
+    /// Require a current stored allow for these exact ZIP and policy bytes
+    Require(GateInput),
+}
+
+#[derive(Debug, Args)]
+struct GateInput {
+    #[arg(value_name = "ARTIFACT.zip")]
+    artifact: PathBuf,
+    #[arg(long, value_name = "FILE")]
+    policy: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -465,6 +489,7 @@ async fn run(cli: Cli) -> Result<CommandOutcome> {
     let config = Config::load(cli.config.as_deref()).context("failed to load configuration")?;
     match cli.command {
         Command::Scan(args) => run_scan(&config, args).await,
+        Command::Gate(args) => run_gate(&config, args).await,
         Command::Policy(args) => run_policy(&config, args),
         Command::Inventory(args) => run_inventory(&config, args),
         Command::History(args) => run_history(&config, args),
@@ -540,6 +565,46 @@ fn detect_input(kind: ScanKind, path: &Path, config: &Config) -> Result<ScanInpu
         bail!("input type does not match the selected scan subcommand");
     }
     Ok(detected)
+}
+
+async fn run_gate(config: &Config, args: GateArgs) -> Result<CommandOutcome> {
+    use hooray::gate;
+    let mut store = open_store(config)?;
+    let decision = match args.command {
+        GateCommand::Evaluate(input) => {
+            gate::evaluate(config, &mut store, &input.artifact, &input.policy).await?
+        }
+        GateCommand::Require(input) => {
+            let (artifact_sha256, policy_sha256) =
+                gate::input_digests(&input.artifact, &input.policy)?;
+            match gate::lookup(&store, &artifact_sha256, &policy_sha256)? {
+                Some(decision) => decision,
+                None => {
+                    write_gate_json(&serde_json::json!({
+                        "outcome": "unknown",
+                        "reason": "no current decision for these artifact and policy bytes",
+                        "artifact_sha256": artifact_sha256,
+                        "policy_sha256": policy_sha256,
+                    }))?;
+                    return Ok(CommandOutcome::PolicyDenied);
+                }
+            }
+        }
+    };
+    write_gate_json(&decision)?;
+    Ok(if decision.allowed() {
+        CommandOutcome::Passed
+    } else {
+        CommandOutcome::PolicyDenied
+    })
+}
+
+fn write_gate_json(value: &impl Serialize) -> Result<()> {
+    let mut out = io::stdout().lock();
+    serde_json::to_writer_pretty(&mut out, value)?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
 }
 
 fn run_policy(config: &Config, args: PolicyArgs) -> Result<CommandOutcome> {

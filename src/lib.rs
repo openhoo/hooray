@@ -5,7 +5,8 @@
 //! - [`input`]: detection and inventory building from lockfiles and manifests
 //!   (leaf parsers are private internals of this module); [`sbom`] ingests CycloneDX/SPDX.
 //! - [`scanners`]: content analyzers (secrets, IaC/service config, SAST, malware).
-//! - [`osv`]: OSV.org query client; [`analysis`] evaluates affected ranges.
+//! - [`osv`]: OSV.org query client; [`publisher`]: pinned maintainer ranges.
+//! - [`analysis`]: applicability; [`gate`]: scoped decisions for exact artifact bytes.
 //! - [`graph`] / [`risk`] / [`remediation`]: dependency-graph context, operational
 //!   risk, and upgrade planning.
 //! - [`engine`]: scan orchestration (`finalize_scan` shared report assembly).
@@ -21,6 +22,7 @@ pub mod api;
 pub mod config;
 pub mod engine;
 mod filesystem;
+pub mod gate;
 pub mod graph;
 pub mod input;
 pub mod integrations;
@@ -31,6 +33,7 @@ pub mod osv;
 #[cfg(feature = "parity")]
 pub mod parity;
 pub mod policy;
+pub mod publisher;
 pub mod remediation;
 pub mod report;
 pub mod risk;

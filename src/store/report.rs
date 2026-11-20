@@ -318,8 +318,12 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deleted =
-            transaction.execute("DELETE FROM scan_runs WHERE started_at < ?1", [timestamp])?;
+        // A gate decision points to its original server-generated scan as audit evidence.
+        let deleted = transaction.execute(
+            "DELETE FROM scan_runs WHERE started_at < ?1 AND NOT EXISTS
+             (SELECT 1 FROM artifact_gate_decisions d WHERE d.run_id = scan_runs.run_id)",
+            [timestamp],
+        )?;
         // occurred_at records when the prune actually ran (not the cutoff),
         // and the audit event_id carries a unique nonce so repeat prunes
         // with identical results are not dedupe-swallowed.

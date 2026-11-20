@@ -21,6 +21,7 @@ use thiserror::Error;
 use crate::model::{Finding, FindingId, ModelInvariantError, RunId, ScanReport};
 
 mod document;
+mod gate;
 mod monitor;
 mod report;
 
@@ -28,7 +29,8 @@ use self::report::{ensure_supported_report_schema, insert_report, reject_unredac
 
 const CORE_SCHEMA: &str = include_str!("../../migrations/001_init.sql");
 const MONITOR_SCHEMA: &str = include_str!("../../migrations/002_monitor.sql");
-const CURRENT_DATABASE_VERSION: i64 = 2;
+const GATE_SCHEMA: &str = include_str!("../../migrations/003_artifact_decisions.sql");
+const CURRENT_DATABASE_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_PAGE_SIZE: u32 = 1_000;
 
@@ -248,6 +250,10 @@ impl Store {
         if found < 2 {
             transaction.execute_batch(MONITOR_SCHEMA)?;
             transaction.execute("INSERT INTO schema_migrations(version, name, applied_at) VALUES (2, 'monitor', '1970-01-01T00:00:00Z')", [])?;
+        }
+        if found < 3 {
+            transaction.execute_batch(GATE_SCHEMA)?;
+            transaction.execute("INSERT INTO schema_migrations(version, name, applied_at) VALUES (3, 'artifact-decisions', '1970-01-01T00:00:00Z')", [])?;
         }
         transaction.commit()?;
         Ok(Self { connection })
@@ -601,7 +607,7 @@ mod tests {
                 .query_row("SELECT max(version) FROM schema_migrations", [], |r| r
                     .get::<_, i64>(0))
                 .unwrap(),
-            2
+            CURRENT_DATABASE_VERSION
         );
     }
     #[test]
@@ -638,7 +644,7 @@ mod tests {
     }
     #[test]
     fn rejects_gapped_and_future_migration_histories() {
-        for (version, error_kind) in [(2, "gap"), (3, "future")] {
+        for (version, error_kind) in [(2, "gap"), (4, "future")] {
             let dir = tempdir().unwrap();
             let path = dir.path().join(format!("{error_kind}.db"));
             let c = Connection::open(&path).unwrap();
@@ -785,13 +791,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("future.db");
         let c = Connection::open(&path).unwrap();
-        c.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY NOT NULL CHECK(version>0),name TEXT NOT NULL UNIQUE,applied_at TEXT NOT NULL) STRICT; INSERT INTO schema_migrations VALUES (1,'one','t'),(2,'two','t'),(3,'three','t');").unwrap();
+        c.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY NOT NULL CHECK(version>0),name TEXT NOT NULL UNIQUE,applied_at TEXT NOT NULL) STRICT; INSERT INTO schema_migrations VALUES (1,'one','t'),(2,'two','t'),(3,'three','t'),(4,'four','t');").unwrap();
         drop(c);
         assert!(matches!(
             Store::open(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             })
         ));
     }
