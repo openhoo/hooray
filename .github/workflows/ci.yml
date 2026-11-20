@@ -106,7 +106,7 @@ jobs:
           fail-on: none
 
       - name: Set up HooNeedsUpdates
-        uses: openhoo/hooneedsupdates/actions/setup@ffd31b013dafcd772bb067a0eec76f739ecd76a3 # v0.3.1
+        uses: openhoo/hooneedsupdates/actions/setup@ea4b79540099524b3c43d0731d939c2a2b13e3d2 # v0.4.0
         with:
           version: 0.3.1
 
