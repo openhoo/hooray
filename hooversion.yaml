@@ -11,6 +11,7 @@ packages:
 hooks:
   afterVersion:
     - scripts/sync-action-versions.sh
-    - cargo generate-lockfile
+    # Update the root version while retaining the reviewed dependency graph.
+    - cargo update --workspace
 github:
   releases: true
