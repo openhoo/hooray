@@ -17,7 +17,8 @@ requires Bash and Python 3 on Linux or macOS. The release installer supports Lin
 `SHA256SUMS` against their published Sigstore bundles, pinned certificate
 identity `https://github.com/openhoo/hooray/.github/workflows/release.yml@refs/heads/main`,
 and OIDC issuer `https://token.actions.githubusercontent.com`, then checks the
-installed binary version.
+installed binary versions. Starting with 0.10.0, the archive includes both
+`hooray` and `hooray-parity`; earlier releases install the scanner alone.
 
 ## Scan once and reuse the reports
 
@@ -32,16 +33,16 @@ repeating scans or OSV queries. Supported additional formats are `json`, `yaml`,
 report is also appended to the job summary, with large details bounded to keep
 the summary within GitHub's size limit.
 
-The default installed release remains **0.9.0**. Its existing report formats,
-policy outputs, and summary work with this action. `markdown` and the new
-`integrations export` command require a supporting release or a binary built
-from the source revision that introduced them. Repository tests can set
+The action installs the version declared in its pinned manifest unless you set
+`version`. Release 0.9.0 predates the `markdown` format and the
+`integrations export` command. Those need a supporting release or a binary
+built from the source revision that introduced them. Repository tests can set
 `executable: ./target/debug/hooray`; normal consumers can select a supporting
 verified `version` after that release is available.
 
 | Input | Default | Purpose |
 | --- | --- | --- |
-| `version` | `0.9.0` | Verified release to install. |
+| `version` | Version in the action manifest | Verified release to install. |
 | `executable` | empty | Use a supplied binary instead of installation. |
 | `working-directory` | `.` | Directory where Hooray runs. |
 | `input` | `.` | Project to scan, relative to the working directory. |

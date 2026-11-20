@@ -181,8 +181,8 @@ jobs:
           test "$RELEASE_TAG" = "v$RELEASE_VERSION"
           test "$cargo_version" = "$RELEASE_VERSION"
 
-      - name: Build optimized binary
-        run: cargo build --locked --release --bin hooray
+      - name: Build scanner and parity CLI
+        run: cargo build --locked --release --features parity --bin hooray --bin hooray-parity
 
       - name: Package artifact
         env:
@@ -192,10 +192,21 @@ jobs:
           package="hooray-${RELEASE_VERSION}-x86_64-unknown-linux-gnu"
           rm -rf dist
           mkdir -p "dist/$package"
-          install -m 0755 target/release/hooray "dist/$package/hooray"
+          install -m 0755 target/release/hooray target/release/hooray-parity "dist/$package/"
           install -m 0644 LICENSE "dist/$package/LICENSE"
           cp -R licenses "dist/$package/licenses"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
+
+          extracted="$(mktemp -d)"
+          trap 'rm -rf "$extracted"' EXIT
+          tar -C "$extracted" -xzf "dist/$package.tar.gz"
+          cmp LICENSE "$extracted/$package/LICENSE"
+          diff -r licenses "$extracted/$package/licenses"
+          for binary in hooray hooray-parity; do
+            reported_version="$("$extracted/$package/$binary" --version)"
+            test "$reported_version" = "$binary $RELEASE_VERSION"
+            "$extracted/$package/$binary" --help > /dev/null
+          done
 
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
@@ -227,23 +238,6 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/*.spdx.json
-            dist/SHA256SUMS
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - name: Sign release assets
-        run: |
-          set -euo pipefail
-          for artifact in dist/*.tar.gz dist/SHA256SUMS; do
-            cosign sign-blob "$artifact" --bundle "${artifact}.sigstore.json" --yes
-          done
-
-      - name: Attest release assets
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: |
-            dist/*.tar.gz
             dist/SHA256SUMS
 
       - name: Upload GitHub Release assets
@@ -334,13 +328,24 @@ jobs:
           marker_count="$(jq -r '.body // ""' release.json | grep -c 'Hooray-OCI-Digest:' || true)"
           marker=""
 
+          verify_commands() {
+            local ref="$1"
+            docker --config "$anon_config" run --rm --network none "$ref" --version | grep -Fx "hooray $version"
+            docker --config "$anon_config" run --rm --network none "$ref" --help > /dev/null
+            # Published releases through 0.9.x contained only the scanner.
+            if [[ "$RECOVERY" != true || ! "$version" =~ ^0\.[0-9]\. ]]; then
+              docker --config "$anon_config" run --rm --network none --entrypoint hooray-parity "$ref" --version | grep -Fx "hooray-parity $version"
+              docker --config "$anon_config" run --rm --network none --entrypoint hooray-parity "$ref" --help > /dev/null
+            fi
+          }
+
           verify_image() {
             ref="$1"
             expected_digest="$2"
             docker --config "$anon_config" pull "$ref"
             actual_digest="$(docker image inspect "$ref" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
             test "$actual_digest" = "$expected_digest"
-            docker --config "$anon_config" run --rm "$ref" --version | grep -Fx "hooray $version"
+            verify_commands "$ref"
             test "$(docker --config "$anon_config" run --rm --entrypoint /usr/bin/id "$ref" -u)" = 1000
             test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
             test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$sha"
@@ -378,7 +383,7 @@ jobs:
               --build-arg "VCS_REF=$sha" \
               --tag "$attempt" \
               .
-            docker run --rm "$attempt" --version | grep -Fx "hooray $version"
+            verify_commands "$attempt"
             test "$(docker run --rm --entrypoint /usr/bin/id "$attempt" -u)" = 1000
             test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$version"
             test "$(docker image inspect "$attempt" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$sha"
