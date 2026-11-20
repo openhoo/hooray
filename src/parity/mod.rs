@@ -13,8 +13,8 @@
 //!    corpus tier-1 expectations ([`crate::engine`]-driven normalization),
 //!    an always-on drift guard (fresh offline scan must reproduce the
 //!    recorded hooray components/licenses/license findings/parse errors
-//!    exactly; vulnerabilities are exempt because offline scans produce
-//!    none), and the scorecard thresholds chosen by the operator
+//!    exactly; vulnerabilities are exempt because offline scans skip
+//!    OSV), and the scorecard thresholds chosen by the operator
 //!    ([`compare::scorecard`]).
 
 pub mod compare;

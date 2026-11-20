@@ -84,6 +84,9 @@ jobs:
       - name: Build Hooray action executable
         run: cargo build --locked --bin hooray
 
+      - name: Verify artifact promotion and download in a Git HTTP repository
+        run: python3 scripts/repository_gate/pilot.py --binary target/debug/hooray
+
       - name: Dogfood Hooray action
         uses: ./actions/scan
         with:

@@ -16,10 +16,11 @@ run at the checkout root using `rust-toolchain.toml` (currently Rust 1.90.0).
 | CLI, exit status, orchestration | `src/main.rs`, `src/engine.rs`, `src/config.rs` |
 | Input discovery and safe paths | `src/input.rs`, `src/filesystem.rs` |
 | Ecosystem dependency parsing | `src/parsers/` |
-| Vulnerability queries and enrichment | `src/osv.rs`, `src/analysis.rs`, `src/risk.rs`, `src/remediation.rs` |
+| Vulnerability queries and enrichment | `src/osv.rs`, `src/analysis.rs`, `src/risk.rs`, `src/remediation.rs`, `src/publisher.rs` |
 | Local source/config scanners | `src/scanners/` |
 | Policy and exceptions | `src/policy.rs`, `src/model.rs` |
 | Output and SBOMs | `src/report.rs`, `src/sbom.rs`, `src/graph.rs` |
+| Digest-bound artifact promotion | `src/gate.rs`, `scripts/repository_gate/` |
 | History and monitoring | `src/store/`, `src/monitor.rs` |
 | HTTP/CI integrations | `src/api.rs`, `src/integrations.rs`, `actions/` |
 | Parity experiments | `src/parity/`, `tests/parity_harness.rs`, feature `parity` |

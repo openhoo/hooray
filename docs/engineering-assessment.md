@@ -69,6 +69,15 @@ Both workloads used less memory. Neither showed a lower median wall time. Five l
 
 On November 20, 2026, an online scan of the public npm corpus fixture produced 13 inventory components, 8 vulnerability findings and 13 license findings. The result included CVE-2020-8203; the allow policy returned exit 0. This checks the native CLI scan path against live OSV at one time. The OSV snapshot was not pinned and no Xray result was used.
 
+## Artifact decision pilot
+
+The [repository pilot](verification/repository-gate-pilot.md) adds an offline
+decision for Cargo ZIP evidence, bound to the SHA-256 of both the submitted
+archive and the policy. CLI and API scans also consume the same pinned
+maintainer table. The pilot checks a real Git HTTP reader and one trusted
+publisher. It does not implement automatic advisory refresh, production
+repository integration, revocation of published bytes, or an Xray comparison.
+
 ## Recommended order of work
 
 1. **Pick one real workflow.** Obtain the operator's Xray watch scope, policies, exceptions and a representative artifact set from one repository. Record which Xray features are in use, output expectations and current latency/volume. Store only approved, sanitized fixtures in this repository.

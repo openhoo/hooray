@@ -111,6 +111,8 @@ pub enum EngineError {
     Input(#[from] crate::input::InputError),
     #[error("vulnerability provider failed")]
     Osv(#[from] OsvError),
+    #[error("publisher advisory analysis failed")]
+    Publisher(#[from] crate::publisher::PublisherError),
     #[error("license analysis failed")]
     License(#[from] license::LicenseError),
     #[error("filesystem analysis failed")]
@@ -223,6 +225,8 @@ impl<'a> Engine<'a> {
                 }
             }
         };
+
+        crate::publisher::augment(&inventory, &mut findings)?;
 
         // Components and dependencies never change after inventory creation
         // (later stages only extend locations and evidence), so the graph is
@@ -407,7 +411,7 @@ pub(crate) struct ScanParts {
 
 pub(crate) fn finalize_scan(
     policy: Option<&Policy>,
-    parts: ScanParts,
+    mut parts: ScanParts,
     as_of: UtcDateTime,
 ) -> Result<ScanReport, FinalizeError> {
     let (policy_decisions, policy_summary) = match policy {
@@ -417,6 +421,11 @@ pub(crate) fn finalize_scan(
         }
         None => (Default::default(), PolicySummary::default()),
     };
+    // The service owns this key even when an API caller submits run metadata.
+    parts.metadata.insert(
+        "publisher_snapshot".to_owned(),
+        serde_json::json!(crate::publisher::metadata()),
+    );
     let report = ScanReport {
         schema_version: REPORT_SCHEMA_VERSION.to_owned(),
         run: RunMetadata {

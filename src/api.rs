@@ -251,6 +251,8 @@ async fn scan_with_deadline(
             }
         }
     };
+    crate::publisher::augment(&request.inventory, &mut findings)
+        .map_err(|error| ApiError::internal("publisher_analysis_failed", error.to_string()))?;
     // Run every inventory-only analysis stage exposed by the CLI. Filesystem
     // analysis is intentionally absent because this endpoint receives a
     // normalized inventory rather than an untrusted filesystem path.
@@ -1431,6 +1433,53 @@ mod tests {
         drop(permit);
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body["error"]["code"], "scan_capacity_exceeded");
+    }
+
+    #[tokio::test]
+    async fn api_scans_apply_and_identify_the_server_publisher_snapshot() {
+        let application = app(Config {
+            offline: true,
+            ..Config::default()
+        });
+        let mut inventory = report("template").inventory;
+        let mut zip = component("", "zip", "pkg:cargo/zip@8.6.0", Scope::Runtime);
+        zip.version = "8.6.0".to_owned();
+        inventory.components.insert(zip.identity.clone(), zip);
+        let (status, body) = response(
+            application.clone(),
+            Request::post("/v1/scans")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "inventory": inventory,
+                        "metadata": {"publisher_snapshot": "client-supplied"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let run_id = body["run_id"].as_str().unwrap();
+        let (status, saved) = response(
+            application,
+            Request::get(format!("/v1/runs/{run_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            saved["run"]["metadata"]["publisher_snapshot"],
+            json!(crate::publisher::metadata())
+        );
+        let matched = saved["findings"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|finding| finding["kind"] == "vulnerability")
+            .count();
+        assert_eq!(matched, 32);
     }
 
     #[tokio::test]
