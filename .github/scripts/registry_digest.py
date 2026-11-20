@@ -37,10 +37,13 @@ def registry_digest(ref):
         f"https://ghcr.io/token?service=ghcr.io&scope=repository:{REPOSITORY}:pull"
     )
     with urlopen(token_url, timeout=30) as auth:
-        token = json.loads(auth.read(65536))["token"]
+        authorization = json.loads(auth.read(65536))
     request = Request(
         f"https://ghcr.io/v2/{REPOSITORY}/manifests/{ref}",
-        headers={"Accept": ", ".join(MEDIA_TYPES), "Authorization": f"Bearer {token}"},
+        headers={
+            "Accept": ", ".join(MEDIA_TYPES),
+            "Authorization": "Bearer " + authorization["token"],
+        },
     )
     with urlopen(request, timeout=30) as response:
         digest = verified_digest(response)

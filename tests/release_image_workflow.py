@@ -87,7 +87,7 @@ def fake(tool, args):
         event("verify-signature")
         return int(cfg["reject"] == "signature")
     elif tool == "curl" and args[-1].startswith("https://ghcr.io/token?"):
-        print('{"token":"fixture-only"}')
+        print(json.dumps({"token": "dummy"}))
     elif tool == "curl" and args[-1].endswith("/manifests/" + attempt.split(":")[1]):
         Path("attempt-manifest.json").write_text("{}")
         print(404)
