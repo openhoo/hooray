@@ -492,13 +492,14 @@ Hooray is also a library crate. Add it to a project with:
 
 ```toml
 [dependencies]
-hooray = "0.6"
+hooray = { git = "https://github.com/openhoo/hooray", tag = "v0.10.0" }
 ```
 
 The minimum supported Rust version is 1.90, enforced through the repository's
 `rust-toolchain.toml`. The only feature flag is the optional `parity`, which
 gates the JFrog Xray record-replay harness module and its `hooray-parity`
-binary; it is disabled by default.
+binary; it is disabled in default source builds. The official Linux archive and
+container from 0.10.0 include both executables.
 
 A minimal scan pipeline:
 
@@ -785,6 +786,15 @@ and sources are checked on every pull request and push to `main`.
 Once operators supply Xray recordings, the comparison harness can measure
 agreement on those inputs; see [JFrog Xray parity testing](#jfrog-xray-parity-testing).
 
+### Verification without an Xray license
+
+The [public Cargo controls](docs/verification/release-controls.md) exercise two
+pinned revisions of this repository with the same checked-in policy. They
+compare inventory against Cargo.lock, Hooray findings against cargo-audit,
+and version ranges against the projects that published the advisories.
+The sources have different coverage; the report lists disagreements.
+These controls do not verify an Xray watch or repository download gate.
+
 ## JFrog Xray parity testing
 
 Hooray aims to replace JFrog Xray. This repository does not establish product
@@ -855,7 +865,7 @@ To require evidence for the entire corpus, run:
 ```bash
 hooray-parity check --corpus tests/fixtures/parity/corpus \
   --recordings tests/fixtures/parity/recordings \
-  --require-recordings --format table \
+  --require-package-cve-parity --format table \
   --min-purl-recall 0.95 --min-purl-precision 0.95 --min-cve-jaccard 0.8
 ```
 
@@ -868,7 +878,11 @@ scans, run on a clean checkout with regular ancestor ignore files. If a develope
 checkout inherits local ignore rules, use `git archive` to stage the committed
 corpus under a clean temporary directory and pass that path to `--corpus`. A missing or
 empty corpus manifest in this mode is a setup error (exit `2`). A complete
-set of recordings establishes manifest coverage. The gate does not authenticate
+set of recordings establishes manifest coverage. For a package-specific decision,
+`--require-package-cve-parity` also requires complete recording coverage and
+compares (versioned PURL, CVE) pairs. A mismatch or indeterminate result
+fails the gate. Offline scans, SBOM-only inputs and older recordings without
+pair evidence must be re-recorded with advisory data. The gate does not authenticate
 the supplied Xray data or require an online advisory lookup. For a qualification
 run, review capture provenance and include known positive and negative controls. Run the offline integration suite with:
 
@@ -900,6 +914,9 @@ version is kept verbatim.
   matched purls by all Hooray purls.
 - CVE Jaccard similarity compares CVE sets for the entire case. Two empty
   sets score 1.0; the same CVE attributed to different packages can also match.
+- The package/CVE comparison reports pairs missing or extra on each side.
+  It does not score advisories without a CVE. Two measured, empty sets can
+  match; include a known positive case.
 - Severity agreement over matched CVEs at the label level only (`unknown`,
   `low`, `medium`, `high`, `critical`).
 - License agreement as Jaccard similarity over licenses of shared components.
@@ -930,8 +947,9 @@ Hooversion derives releases from Conventional Commits on `main`, updates the
 manifest, lockfile, and changelog, creates the release commit and `v<version>`
 tag, and publishes a GitHub Release. Each release attaches the optimized
 `hooray-<version>-x86_64-unknown-linux-gnu.tar.gz` archive containing the
-`hooray` executable, `SHA256SUMS`, and Sigstore bundles
-`<archive>.sigstore.json` and `SHA256SUMS.sigstore.json`. The setup action
+scanner and (since 0.10) the parity CLI, project license and bundled notices.
+The GitHub Release also supplies the SPDX SBOM, `SHA256SUMS` and Sigstore
+bundles for the archive, SBOM and checksums. The setup action
 verifies both bundles with certificate identity
 `https://github.com/openhoo/hooray/.github/workflows/release.yml@refs/heads/main`
 and OIDC issuer `https://token.actions.githubusercontent.com` before checking
