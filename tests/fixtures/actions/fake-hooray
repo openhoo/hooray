@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with open(os.environ['ACTION_CALLS'], 'a') as stream:
+    stream.write(json.dumps(args) + '\n')
+if args[:1] == ['--config']:
+    args = args[2:]
+status = int(os.environ.get('ACTION_SCAN_STATUS', '0'))
+if args[:2] == ['policy', 'validate']:
+    sys.exit(int(os.environ.get('ACTION_POLICY_STATUS', '0')))
+if args[:2] == ['scan', 'project']:
+    if '--output' in args and os.environ.get('ACTION_OMIT_REPORT') != 'true':
+        destination = pathlib.Path(args[args.index('--output') + 1])
+        if args[args.index('--format') + 1] == 'gitlab-artifacts':
+            destination.mkdir()
+            (destination / 'report.sarif').write_text('current bundle\n')
+        else:
+            destination.write_text('current primary\n')
+    print('::error::repository-controlled CLI text')
+    sys.exit(status)
+if args[:2] == ['history', 'list']:
+    destination = pathlib.Path(args[args.index('--output') + 1])
+    mode = os.environ.get('ACTION_HISTORY_MODE', '')
+    report = {
+        'run': {'id': 'run:test-current'},
+        'policy_summary': {'allowed': 3, 'warned': 2, 'denied': 1 if status == 1 else 0},
+        'findings': {'finding:one': {}, 'finding:two': {}},
+    }
+    if mode == 'newline':
+        report['run']['id'] = 'run:test\nreport=stale'
+    elif mode == 'option':
+        report['run']['id'] = '--help'
+    elif mode == 'contradictory':
+        report['policy_summary']['denied'] = 1 if status == 0 else 0
+    elif mode == 'boolean':
+        report['policy_summary']['allowed'] = True
+    destination.write_text(json.dumps([] if mode == 'empty' else [report]))
+    sys.exit(int(os.environ.get('ACTION_HISTORY_STATUS', '0')))
+if args[:1] == ['report']:
+    report_status = int(os.environ.get('ACTION_REPORT_STATUS', str(status)))
+    destination = pathlib.Path(args[args.index('--output') + 1])
+    if os.environ.get('ACTION_OMIT_EXTRA') != 'true':
+        if args[args.index('--format') + 1] == 'gitlab-artifacts':
+            destination.mkdir()
+            (destination / 'report.sarif').write_text('persisted bundle\n')
+        else:
+            destination.write_text('persisted extra\n' + 'details ' * int(os.environ.get('ACTION_EXTRA_SIZE', '0')))
+    sys.exit(report_status)
+sys.exit(2)
