@@ -63,6 +63,9 @@ jobs:
       - name: Install LLVM coverage tools
         run: rustup component add llvm-tools-preview
 
+      - name: Check registry manifest verification
+        run: python3 -m unittest discover -s .github/scripts -p 'test_registry_digest.py'
+
       - name: Check formatting
         run: cargo fmt --check
 
