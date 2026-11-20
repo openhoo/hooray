@@ -11,16 +11,17 @@ use std::{
 #[cfg(test)]
 use std::fs;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use crate::timestamp::utc_millis;
 use serde_json::Value;
 use thiserror::Error;
+use time::UtcDateTime;
 use uuid::Uuid;
 
 use crate::{
     analysis::{ApplicabilityAnalyzer, ApplicabilityInput, DependencyPathIndex},
     config::Config,
     graph::{DependencyGraph, GraphError},
-    input::ScanInput,
+    input::{PreparedInput, ScanInput, VirtualFiles},
     license,
     model::{
         Applicability, ApplicabilityStatus, ComponentId, Confidence, DependencyKind, Evidence,
@@ -84,7 +85,7 @@ pub struct ScanRequest {
     pub baseline: Option<RunId>,
     pub new_findings_only: bool,
     pub run_id: Option<RunId>,
-    pub as_of: Option<DateTime<Utc>>,
+    pub as_of: Option<UtcDateTime>,
 }
 
 impl ScanRequest {
@@ -186,15 +187,25 @@ impl<'a> Engine<'a> {
     }
 
     pub async fn scan(&mut self, request: ScanRequest) -> Result<ScanReport, EngineError> {
-        let as_of = request.as_of.unwrap_or_else(Utc::now);
-        let started_at = timestamp(as_of);
-        let mut inventory = request.input.inventory(self.config)?;
+        let as_of = request.as_of.unwrap_or_else(UtcDateTime::now);
+        let started_at = utc_millis(as_of);
+        let PreparedInput {
+            mut inventory,
+            files,
+        } = request.input.prepare(self.config)?;
         let policy = load_policy(&request.policy_path)?;
         let baseline = self.resolve_baseline(
             request.baseline.as_ref(),
             request.new_findings_only,
             &inventory.asset.id,
         )?;
+
+        // Archive/image inventories and local evidence must describe the same
+        // bytes. Drop expanded files before waiting on a remote provider.
+        let license_findings =
+            license_findings(&request.input, &inventory, self.config, files.as_ref())?;
+        let file_output = scan_files(&request.input, &inventory, self.config, files.as_ref())?;
+        drop(files);
 
         let mut findings = if self.config.offline {
             BTreeMap::new()
@@ -220,13 +231,10 @@ impl<'a> Engine<'a> {
         // evidence mutations afterwards make the second pass authoritative.
         let graph = DependencyGraph::from_inventory(&inventory)?;
         contextualize_and_score(&inventory, &graph, &mut findings, as_of)?;
+        merge_findings(&mut findings, license_findings);
         merge_findings(
             &mut findings,
-            license_findings(&request.input, &inventory, self.config)?,
-        );
-        merge_findings(
-            &mut findings,
-            filesystem_findings(&request.input, &mut inventory, self.config)?,
+            filesystem_findings(&mut inventory, file_output),
         );
         attach_dependency_remediation(&inventory, &graph, &mut findings)?;
         merge_operational_risk(&inventory, &graph, &mut findings, as_of);
@@ -251,7 +259,7 @@ impl<'a> Engine<'a> {
                         .expect("generated run identifier is non-empty")
                 }),
                 started_at,
-                completed_at: timestamp(as_of),
+                completed_at: utc_millis(as_of),
                 scanner_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                 metadata: BTreeMap::from([
                     (
@@ -400,12 +408,11 @@ pub(crate) struct ScanParts {
 pub(crate) fn finalize_scan(
     policy: Option<&Policy>,
     parts: ScanParts,
-    as_of: DateTime<Utc>,
+    as_of: UtcDateTime,
 ) -> Result<ScanReport, FinalizeError> {
     let (policy_decisions, policy_summary) = match policy {
         Some(policy) => {
-            let evaluation =
-                policy.evaluate(&parts.findings, &parts.inventory, as_of.fixed_offset())?;
+            let evaluation = policy.evaluate(&parts.findings, &parts.inventory, as_of.into())?;
             (evaluation.decisions, evaluation.summary)
         }
         None => (Default::default(), PolicySummary::default()),
@@ -436,7 +443,7 @@ pub(crate) fn contextualize_and_score(
     inventory: &Inventory,
     graph: &DependencyGraph,
     findings: &mut BTreeMap<FindingId, Finding>,
-    as_of: DateTime<Utc>,
+    as_of: UtcDateTime,
 ) -> Result<(), GraphError> {
     // One shared shortest-path index serves every finding's applicability
     // rationale; building it lazily keeps finding-free scans free of the
@@ -476,7 +483,7 @@ pub(crate) fn contextualize_and_score(
             direct,
             remediation: finding.remediation.as_ref(),
             evidence: &evidence,
-            as_of: as_of.date_naive(),
+            as_of: as_of.date(),
         }));
     }
     Ok(())
@@ -486,34 +493,29 @@ fn license_findings(
     input: &ScanInput,
     inventory: &Inventory,
     config: &Config,
+    files: Option<&VirtualFiles>,
 ) -> Result<Vec<Finding>, license::LicenseError> {
-    // Archive inputs carry their members in memory: evaluate license-shaped
-    // files from the extracted set instead of walking a filesystem root.
-    if let Some(files) = input
-        .virtual_files(config)
-        .map_err(|error| license::LicenseError::Io {
-            path: input_path(input).to_owned(),
-            source: io::Error::other(error.to_string()),
-        })?
-    {
-        let files = files
-            .into_iter()
-            .filter(|(_, bytes)| bytes.len() as u64 <= config.max_input_bytes.min(8 * 1024 * 1024))
-            .collect();
-        return Ok(license::analyze_with_files(inventory, files)?.findings);
+    let maximum = config.max_input_bytes.min(8 * 1024 * 1024);
+    if let Some(files) = files {
+        let admitted = files
+            .iter()
+            .filter(|(_, bytes)| bytes.len() as u64 <= maximum)
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()));
+        return Ok(license::analyze_file_slices(inventory, admitted)?.findings);
     }
     let root = match input {
-        ScanInput::ProjectDirectory(path) | ScanInput::OciImageLayout(path) => Some(path.as_path()),
+        ScanInput::ProjectDirectory(path) => Some(path.as_path()),
         _ => None,
     };
-    Ok(license::analyze(inventory, root, config.max_input_bytes.min(8 * 1024 * 1024))?.findings)
+    Ok(license::analyze(inventory, root, maximum)?.findings)
 }
 
-fn filesystem_findings(
+fn scan_files(
     input: &ScanInput,
-    inventory: &mut Inventory,
+    inventory: &Inventory,
     config: &Config,
-) -> Result<Vec<Finding>, scanners::ScanError> {
+    files: Option<&VirtualFiles>,
+) -> Result<scanners::ScanOutput, scanners::ScanError> {
     let path = input_path(input);
     // Config deliberately exposes a single archive-entry budget: max_files
     // shares config.max_archive_entries below, so one knob bounds regular file
@@ -527,18 +529,13 @@ fn filesystem_findings(
         max_archive_uncompressed_bytes: config.max_archive_bytes,
         ..ScannerConfig::default()
     };
-    let output = if let Some(files) =
-        input
-            .virtual_files(config)
-            .map_err(|error| scanners::ScanError::Read {
-                path: input_path(input).to_owned(),
-                source: io::Error::other(error.to_string()),
-            })? {
+    let signatures = MalwareSignatures::default();
+    if let Some(files) = files {
         // Archive members exist only in memory: run the same analyzers over
         // the extracted set under the scanner's file/total budgets.
         let mut merged = scanners::ScanOutput::default();
         let mut total = 0_u64;
-        for (member, bytes) in &files {
+        for (member, bytes) in files {
             if merged.scanned_files >= scanner_config.max_files
                 || total.saturating_add(bytes.len() as u64) > scanner_config.max_total_bytes
             {
@@ -551,22 +548,20 @@ fn filesystem_findings(
                 bytes,
                 &inventory.asset.id,
                 &scanner_config,
-                &MalwareSignatures::default(),
+                &signatures,
             );
             merged.locations.extend(output.locations);
             merged.findings.extend(output.findings);
             merged.scanned_files += 1;
             merged.scanned_bytes += bytes.len() as u64;
         }
-        merged
+        Ok(merged)
     } else {
-        scanners::scan_path(
-            path,
-            &inventory.asset.id,
-            &scanner_config,
-            &MalwareSignatures::default(),
-        )?
-    };
+        scanners::scan_path(path, &inventory.asset.id, &scanner_config, &signatures)
+    }
+}
+
+fn filesystem_findings(inventory: &mut Inventory, output: scanners::ScanOutput) -> Vec<Finding> {
     let scanners::ScanOutput {
         locations,
         mut findings,
@@ -632,7 +627,7 @@ fn filesystem_findings(
         });
     }
     let known_locations = inventory.location_ids();
-    Ok(findings
+    findings
         .into_iter()
         .map(|mut finding| {
             if finding
@@ -652,7 +647,7 @@ fn filesystem_findings(
                 .collect();
             finding
         })
-        .collect())
+        .collect()
 }
 
 pub(crate) fn attach_dependency_remediation(
@@ -723,7 +718,7 @@ pub(crate) fn merge_operational_risk(
     inventory: &Inventory,
     graph: &DependencyGraph,
     findings: &mut BTreeMap<FindingId, Finding>,
-    as_of: DateTime<Utc>,
+    as_of: UtcDateTime,
 ) {
     let mut evidence_by_component: BTreeMap<ComponentId, BTreeSet<Evidence>> = BTreeMap::new();
     for finding in findings.values() {
@@ -817,10 +812,6 @@ fn input_label(input: &ScanInput) -> String {
         ScanInput::CycloneDx(_) => "sbom",
     };
     format!("{kind}:{}", input_path(input).display())
-}
-
-fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 #[cfg(test)]
@@ -1038,7 +1029,8 @@ mod tests {
             ..Config::default()
         };
 
-        let findings = filesystem_findings(&input, &mut inventory, &config).unwrap();
+        let output = scan_files(&input, &inventory, &config, None).unwrap();
+        let findings = filesystem_findings(&mut inventory, output);
         let coverage = findings
             .iter()
             .find(|finding| finding.rule_id.as_str() == "scanner:coverage-incomplete")
@@ -1049,6 +1041,81 @@ mod tests {
             coverage.evidence.iter().next().unwrap().properties["skipped_files_lower_bound"],
             "1"
         );
+    }
+
+    #[tokio::test]
+    async fn archive_analysis_uses_the_inventory_snapshot_after_the_source_disappears() {
+        struct RemoveArchive(PathBuf);
+        impl VulnerabilityProvider for RemoveArchive {
+            fn scan<'a>(&'a self, inventory: &'a Inventory) -> ProviderFuture<'a> {
+                Box::pin(async move {
+                    assert_eq!(inventory.components.len(), 1);
+                    assert!(
+                        inventory.locations.is_empty(),
+                        "provider gets inventory-only locations"
+                    );
+                    fs::remove_file(&self.0).unwrap();
+                    Ok(BTreeMap::new())
+                })
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let archive = dir.path().join("app.tar");
+        crate::input::write_tar(
+            &archive,
+            &[
+                ("Cargo.toml", b"[package]\nname='demo'\nversion='1.0.0'\n"),
+                (
+                    "Cargo.lock",
+                    b"version = 3\n[[package]]\nname='demo'\nversion='1.0.0'\n",
+                ),
+                (
+                    "LICENSE",
+                    b"Permission is hereby granted, free of charge, to any person obtaining a copy. The software is provided as is.",
+                ),
+                ("sample.py", b"subprocess.run(user_input, shell=True)\n"),
+            ],
+        );
+        let config = Config {
+            offline: true,
+            ..Config::default()
+        };
+        let input = ScanInput::detect(&archive, &config).unwrap();
+        let policy = policy_fixture(&dir, "allow");
+        let mut store = Store::open_memory().unwrap();
+        let request = || {
+            let mut r = ScanRequest::new(input.clone(), policy.clone());
+            r.as_of = Some(crate::timestamp::parse_utc("2026-01-01T00:00:00Z").unwrap());
+            r
+        };
+        let offline = Engine::new(&config, &mut store, None)
+            .scan(request())
+            .await
+            .unwrap();
+        assert!(
+            offline
+                .findings
+                .values()
+                .any(|f| f.rule_id.as_str() == "license:detected")
+        );
+        assert!(
+            offline
+                .findings
+                .values()
+                .any(|f| f.rule_id.as_str() == "sast.python.shell-true")
+        );
+        let config = Config {
+            offline: false,
+            ..config
+        };
+        let provider = RemoveArchive(archive);
+        let online = Engine::new(&config, &mut store, Some(&provider))
+            .scan(request())
+            .await
+            .unwrap();
+        assert_eq!(online.inventory, offline.inventory);
+        assert_eq!(online.findings, offline.findings);
+        assert!(!provider.0.exists());
     }
 
     #[tokio::test]
@@ -1087,7 +1154,7 @@ mod tests {
             let mut engine = Engine::new(&config, &mut store, Some(&fake));
             let mut request = ScanRequest::new(input, policy);
             request.run_id = Some(RunId::new("run:offline").unwrap());
-            request.as_of = Some("2026-01-01T00:00:00Z".parse().unwrap());
+            request.as_of = Some(crate::timestamp::parse_utc("2026-01-01T00:00:00Z").unwrap());
             let report = engine.scan(request).await.unwrap();
             assert_eq!(report.run.id.as_str(), "run:offline");
             assert_eq!(
@@ -1125,7 +1192,7 @@ mod tests {
             let input = ScanInput::detect(&project, &config).unwrap();
             let mut request = ScanRequest::new(input, temp.path().join("policy.yaml"));
             request.run_id = Some(RunId::new("run:scanner").unwrap());
-            request.as_of = Some("2026-01-02T00:00:00Z".parse().unwrap());
+            request.as_of = Some(crate::timestamp::parse_utc("2026-01-02T00:00:00Z").unwrap());
             engine.scan(request).await.unwrap()
         };
         assert!(
@@ -1173,7 +1240,7 @@ mod tests {
         let mut engine = Engine::new(&config, &mut store, Some(&provider));
         let mut request = ScanRequest::new(input, policy.clone());
         request.run_id = Some(RunId::new("run:online").unwrap());
-        request.as_of = Some("2026-03-04T05:06:07Z".parse().unwrap());
+        request.as_of = Some(crate::timestamp::parse_utc("2026-03-04T05:06:07Z").unwrap());
         let report = engine.scan(request).await.unwrap();
 
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
@@ -1252,14 +1319,14 @@ mod tests {
         let input = ScanInput::detect(&sbom, &config).unwrap();
         let mut first = ScanRequest::new(input, policy.clone());
         first.run_id = Some(RunId::new("run:first").unwrap());
-        first.as_of = Some("2026-01-01T00:00:00Z".parse().unwrap());
+        first.as_of = Some(crate::timestamp::parse_utc("2026-01-01T00:00:00Z").unwrap());
         let first_report = engine.scan(first).await.unwrap();
         assert!(first_report.policy_summary.denied > 0);
 
         let input = ScanInput::detect(&sbom, &config).unwrap();
         let mut latest = ScanRequest::new(input, policy);
         latest.run_id = Some(RunId::new("run:latest").unwrap());
-        latest.as_of = Some("2026-02-01T00:00:00Z".parse().unwrap());
+        latest.as_of = Some(crate::timestamp::parse_utc("2026-02-01T00:00:00Z").unwrap());
         latest.new_findings_only = true;
         let filtered = engine.scan(latest).await.unwrap();
         assert!(filtered.findings.is_empty());
@@ -1288,7 +1355,7 @@ mod tests {
             policy.clone(),
         );
         first_a.run_id = Some(RunId::new("run:asset-a-first").unwrap());
-        first_a.as_of = Some("2026-01-01T00:00:00Z".parse().unwrap());
+        first_a.as_of = Some(crate::timestamp::parse_utc("2026-01-01T00:00:00Z").unwrap());
         let first_a = engine.scan(first_a).await.unwrap();
         assert!(
             first_a
@@ -1301,12 +1368,12 @@ mod tests {
             policy.clone(),
         );
         newer_b.run_id = Some(RunId::new("run:asset-b-newer").unwrap());
-        newer_b.as_of = Some("2026-02-01T00:00:00Z".parse().unwrap());
+        newer_b.as_of = Some(crate::timestamp::parse_utc("2026-02-01T00:00:00Z").unwrap());
         engine.scan(newer_b).await.unwrap();
 
         let mut latest_a = ScanRequest::new(ScanInput::detect(&asset_a, &config).unwrap(), policy);
         latest_a.run_id = Some(RunId::new("run:asset-a-latest").unwrap());
-        latest_a.as_of = Some("2026-03-01T00:00:00Z".parse().unwrap());
+        latest_a.as_of = Some(crate::timestamp::parse_utc("2026-03-01T00:00:00Z").unwrap());
         latest_a.new_findings_only = true;
         let filtered = engine.scan(latest_a).await.unwrap();
 
@@ -1451,7 +1518,7 @@ mod tests {
         let mut engine = Engine::new(&config, &mut store, Some(&UnplannedProvider));
         let mut request = ScanRequest::new(input, policy);
         request.run_id = Some(RunId::new("run:unplanned").unwrap());
-        request.as_of = Some("2026-03-04T05:06:07Z".parse().unwrap());
+        request.as_of = Some(crate::timestamp::parse_utc("2026-03-04T05:06:07Z").unwrap());
         let report = engine.scan(request).await.unwrap();
 
         let finding = report

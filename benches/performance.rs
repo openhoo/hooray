@@ -5,8 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{TimeZone, Utc};
-
 use hooray::{
     analysis::{
         ApplicabilityAnalyzer, ApplicabilityInput, DependencyPathIndex, OsvAffectedRange, OsvEvent,
@@ -334,7 +332,7 @@ fn operational_risk_fixture(
     (report.inventory, evidence)
 }
 
-fn main() {
+fn graph_benchmarks() {
     let (graph, components, target) = graph_fixture();
     let (iterations, elapsed) = measure(|| {
         for component in &components {
@@ -355,6 +353,36 @@ fn main() {
         );
     });
     report("graph_all_paths_dense", iterations, elapsed);
+
+    // Each independent manifest contributes its own chain. Request one
+    // component per manifest, as upgrade planning would for one advisory each.
+    const ROOTS: usize = 256;
+    const LENGTH: usize = 8;
+    let mut nodes = Vec::new();
+    let mut edges = BTreeSet::new();
+    let mut leaves = Vec::new();
+    for root in 0..ROOTS {
+        let chain: Vec<_> = (0..LENGTH)
+            .map(|depth| component_id(format!("manifest-{root:03}/pkg-{depth}")))
+            .collect();
+        edges.extend(chain.windows(2).map(|pair| edge(&pair[0], &pair[1])));
+        leaves.push(chain[LENGTH - 1].clone());
+        nodes.extend(chain);
+    }
+    let forest = DependencyGraph::new(nodes, &edges).expect("manifest forest");
+    let (iterations, elapsed) = measure(|| {
+        for leaf in &leaves {
+            black_box(forest.all_paths(black_box(leaf), 128, 32).unwrap());
+        }
+    });
+    report("graph_all_paths_256_manifest_leaves", iterations, elapsed);
+}
+
+fn main() {
+    graph_benchmarks();
+    if std::env::args().any(|arg| arg == "--graph-only") {
+        return;
+    }
 
     let source = scanner_fixture(SCANNER_SOURCE_BYTES);
     let asset = AssetId::new("asset:benchmark").expect("asset id");
@@ -501,10 +529,7 @@ fn main() {
     report("render_sensitive_sarif_500", iterations, elapsed);
 
     let (risk_inventory, risk_evidence) = operational_risk_fixture(10_000);
-    let risk_as_of = Utc
-        .with_ymd_and_hms(2026, 7, 21, 0, 0, 0)
-        .single()
-        .expect("risk timestamp");
+    let risk_as_of = hooray::timestamp::parse_utc("2026-07-21T00:00:00Z").expect("risk timestamp");
     let risk_graph =
         DependencyGraph::from_inventory(&risk_inventory).expect("benchmark dependency graph");
     let (iterations, elapsed) = measure(|| {

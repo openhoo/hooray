@@ -8,90 +8,85 @@ use serde_json::{Value, json};
 use super::archive::{read_tar_file, read_tar_with_expanded};
 use crate::config::Config;
 use crate::input::{
-    InputError, base_name, malformed, malformed_msg, normalize_relative, read_limited,
-    reject_symlink_ancestors, reject_symlink_ancestors_below, scan_virtual_files, sha256,
+    InputError, PreparedFiles, base_name, malformed, malformed_msg, normalize_relative,
+    read_limited, reject_symlink_ancestors, reject_symlink_ancestors_below, sha256,
 };
-use crate::model::{Asset, AssetKind, Inventory};
 
-pub(crate) fn scan_oci_layout(root: &Path, config: &Config) -> Result<Inventory, InputError> {
+/// Resolve metadata and filesystem together so all consumers see the same layers.
+pub(in crate::input) fn read_oci_layout(
+    root: &Path,
+    config: &Config,
+) -> Result<PreparedFiles, InputError> {
     reject_symlink_ancestors(root)?;
     let index = read_limited(&root.join("index.json"), config.max_input_bytes)?;
-    let index: OciIndex =
-        serde_json::from_slice(&index).map_err(|e| malformed("index.json", "OCI index", e))?;
-    let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
-    let manifest_bytes = read_oci_blob(root, &descriptor.digest, config)?;
-    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| malformed("manifest", "OCI manifest", e))?;
-    let config_bytes = read_oci_blob(root, &manifest.config.digest, config)?;
-    let filesystem = oci_manifest_filesystem(&manifest, config, |digest| {
-        read_oci_blob(root, digest, config)
-    })?;
-    let mut inventory = scan_virtual_files(root, AssetKind::ContainerImage, filesystem)?;
-    inventory
-        .asset
-        .metadata
-        .insert("manifest_digest".into(), json!(descriptor.digest));
-    add_oci_config_metadata(&mut inventory.asset, &config_bytes);
-    Ok(inventory)
+    read_oci_image(&index, config, |digest| read_oci_blob(root, digest, config))
 }
 
-pub(crate) fn scan_oci_tar(path: &Path, config: &Config) -> Result<Inventory, InputError> {
+fn read_oci_image<B: AsRef<[u8]>>(
+    index: &[u8],
+    config: &Config,
+    mut read_blob: impl FnMut(&str) -> Result<B, InputError>,
+) -> Result<PreparedFiles, InputError> {
+    let index: OciIndex =
+        serde_json::from_slice(index).map_err(|e| malformed("index.json", "OCI index", e))?;
+    let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
+    let manifest: OciManifest = serde_json::from_slice(read_blob(&descriptor.digest)?.as_ref())
+        .map_err(|e| malformed("manifest", "OCI manifest", e))?;
+    let metadata = image_metadata(
+        &descriptor.digest,
+        read_blob(&manifest.config.digest)?.as_ref(),
+    );
+    let mut files = BTreeMap::new();
+    let mut expanded = 0;
+    for layer in manifest.layers {
+        let bytes = read_blob(&layer.digest)?;
+        apply_layer(
+            bytes.as_ref(),
+            layer.media_type.as_deref(),
+            config,
+            &mut expanded,
+            &mut files,
+        )?;
+    }
+    Ok(PreparedFiles { files, metadata })
+}
+
+pub(in crate::input) fn read_oci_tar(
+    path: &Path,
+    config: &Config,
+) -> Result<PreparedFiles, InputError> {
     let outer = read_tar_file(path, config)?;
-    let (mut inventory, manifest_digest, config_bytes) =
-        if let Some(index_bytes) = outer.get("index.json") {
-            let index: OciIndex = serde_json::from_slice(index_bytes)
-                .map_err(|e| malformed("index.json", "OCI index", e))?;
-            let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
-            let manifest_bytes = outer
-                .get(&blob_path(&descriptor.digest)?)
-                .ok_or_else(|| InputError::MissingBlob(descriptor.digest.clone()))?;
-            verify_digest(&descriptor.digest, manifest_bytes)?;
-            let manifest: OciManifest = serde_json::from_slice(manifest_bytes)
-                .map_err(|e| malformed("manifest", "OCI manifest", e))?;
-            let config_bytes = outer
-                .get(&blob_path(&manifest.config.digest)?)
-                .ok_or_else(|| InputError::MissingBlob(manifest.config.digest.clone()))?;
-            verify_digest(&manifest.config.digest, config_bytes)?;
-            let config_bytes = config_bytes.clone();
-            let filesystem = oci_manifest_filesystem(&manifest, config, |digest| {
-                let bytes = outer
-                    .get(&blob_path(digest)?)
-                    .ok_or_else(|| InputError::MissingBlob(digest.to_owned()))?;
-                verify_digest(digest, bytes)?;
-                Ok(bytes.clone())
-            })?;
-            (
-                scan_virtual_files(path, AssetKind::ContainerImage, filesystem)?,
-                descriptor.digest.clone(),
-                config_bytes,
-            )
-        } else {
-            let manifest_bytes = outer
-                .get("manifest.json")
-                .ok_or(InputError::MissingManifest)?;
-            let docker: Vec<DockerManifest> = serde_json::from_slice(manifest_bytes)
-                .map_err(|e| malformed("manifest.json", "Docker image manifest", e))?;
-            let manifest =
-                select_docker_manifest(&docker, &outer).ok_or(InputError::MissingManifest)?;
-            let config_bytes = read_docker_blob(&outer, &manifest.config)?.to_vec();
-            let mut filesystem = BTreeMap::new();
-            let mut expanded = 0;
-            for layer in &manifest.layers {
-                let bytes = read_docker_blob(&outer, layer)?;
-                apply_layer(bytes, None, config, &mut expanded, &mut filesystem)?;
-            }
-            (
-                scan_virtual_files(path, AssetKind::ContainerImage, filesystem)?,
-                sha256(manifest_bytes),
-                config_bytes,
-            )
-        };
-    inventory
-        .asset
-        .metadata
-        .insert("manifest_digest".into(), json!(manifest_digest));
-    add_oci_config_metadata(&mut inventory.asset, &config_bytes);
-    Ok(inventory)
+    if let Some(index) = outer.get("index.json") {
+        return read_oci_image(index, config, |digest| {
+            let bytes = outer
+                .get(&blob_path(digest)?)
+                .ok_or_else(|| InputError::MissingBlob(digest.to_owned()))?;
+            verify_digest(digest, bytes)?;
+            Ok(bytes.as_slice())
+        });
+    }
+    let manifest_bytes = outer
+        .get("manifest.json")
+        .ok_or(InputError::MissingManifest)?;
+    let docker: Vec<DockerManifest> = serde_json::from_slice(manifest_bytes)
+        .map_err(|e| malformed("manifest.json", "Docker image manifest", e))?;
+    let manifest = select_docker_manifest(&docker, &outer).ok_or(InputError::MissingManifest)?;
+    let metadata = image_metadata(
+        &sha256(manifest_bytes),
+        read_docker_blob(&outer, &manifest.config)?,
+    );
+    let mut files = BTreeMap::new();
+    let mut expanded = 0;
+    for layer in &manifest.layers {
+        apply_layer(
+            read_docker_blob(&outer, layer)?,
+            None,
+            config,
+            &mut expanded,
+            &mut files,
+        )?;
+    }
+    Ok(PreparedFiles { files, metadata })
 }
 
 #[derive(Deserialize)]
@@ -100,12 +95,12 @@ struct OciIndex {
     manifests: Vec<OciDescriptor>,
 }
 #[derive(Deserialize)]
-pub(crate) struct OciDescriptor {
-    pub(crate) digest: String,
+struct OciDescriptor {
+    digest: String,
     #[serde(rename = "mediaType", default)]
-    pub(crate) media_type: Option<String>,
+    media_type: Option<String>,
     #[serde(rename = "artifactType", default)]
-    pub(crate) artifact_type: Option<String>,
+    artifact_type: Option<String>,
     #[serde(default)]
     platform: Option<OciPlatform>,
     #[serde(default)]
@@ -119,10 +114,10 @@ struct OciPlatform {
     architecture: Option<String>,
 }
 #[derive(Deserialize)]
-pub(crate) struct OciManifest {
-    pub(crate) config: OciDescriptor,
+struct OciManifest {
+    config: OciDescriptor,
     #[serde(default)]
-    pub(crate) layers: Vec<OciDescriptor>,
+    layers: Vec<OciDescriptor>,
 }
 #[derive(Deserialize)]
 struct DockerManifest {
@@ -275,93 +270,6 @@ fn apply_layer(
     Ok(())
 }
 
-/// Builds the virtual filesystem an OCI image manifest describes: every
-/// layer blob is fetched through `read_blob` and applied in order with
-/// whiteout semantics. Exposed so the engine can feed image layers to the
-/// lockfile scanners without duplicating layer application.
-pub(crate) fn oci_manifest_filesystem(
-    manifest: &OciManifest,
-    config: &Config,
-    mut read_blob: impl FnMut(&str) -> Result<Vec<u8>, InputError>,
-) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
-    let mut filesystem = BTreeMap::new();
-    let mut expanded = 0;
-    for layer in &manifest.layers {
-        let bytes = read_blob(&layer.digest)?;
-        apply_layer(
-            &bytes,
-            layer.media_type.as_deref(),
-            config,
-            &mut expanded,
-            &mut filesystem,
-        )?;
-    }
-    Ok(filesystem)
-}
-
-/// Extracted layer filesystem for an unpacked OCI layout, exposed so
-/// `ScanInput::virtual_files` can feed image contents to the filesystem and
-/// license analyzers without duplicating manifest resolution.
-pub(crate) fn oci_layout_filesystem(
-    root: &Path,
-    config: &Config,
-) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
-    reject_symlink_ancestors(root)?;
-    let index = read_limited(&root.join("index.json"), config.max_input_bytes)?;
-    let index: OciIndex =
-        serde_json::from_slice(&index).map_err(|e| malformed("index.json", "OCI index", e))?;
-    let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
-    let manifest_bytes = read_oci_blob(root, &descriptor.digest, config)?;
-    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| malformed("manifest", "OCI manifest", e))?;
-    oci_manifest_filesystem(&manifest, config, |digest| {
-        read_oci_blob(root, digest, config)
-    })
-}
-
-/// Extracted layer filesystem for an OCI/docker-save tar, mirroring the
-/// manifest resolution of `scan_oci_tar` for `ScanInput::virtual_files`.
-pub(crate) fn oci_tar_filesystem(
-    path: &Path,
-    config: &Config,
-) -> Result<BTreeMap<String, Vec<u8>>, InputError> {
-    let outer = read_tar_file(path, config)?;
-    if let Some(index_bytes) = outer.get("index.json") {
-        let index: OciIndex = serde_json::from_slice(index_bytes)
-            .map_err(|e| malformed("index.json", "OCI index", e))?;
-        let descriptor = select_image_manifest(&index).ok_or(InputError::MissingManifest)?;
-        let manifest_bytes = outer
-            .get(&blob_path(&descriptor.digest)?)
-            .ok_or_else(|| InputError::MissingBlob(descriptor.digest.clone()))?;
-        verify_digest(&descriptor.digest, manifest_bytes)?;
-        let manifest: OciManifest = serde_json::from_slice(manifest_bytes)
-            .map_err(|e| malformed("manifest", "OCI manifest", e))?;
-        oci_manifest_filesystem(&manifest, config, |digest| {
-            let bytes = outer
-                .get(&blob_path(digest)?)
-                .ok_or_else(|| InputError::MissingBlob(digest.to_owned()))?;
-            verify_digest(digest, bytes)?;
-            Ok(bytes.clone())
-        })
-    } else {
-        let manifest_bytes = outer
-            .get("manifest.json")
-            .ok_or(InputError::MissingManifest)?;
-        let docker: Vec<DockerManifest> = serde_json::from_slice(manifest_bytes)
-            .map_err(|e| malformed("manifest.json", "Docker image manifest", e))?;
-        let manifest =
-            select_docker_manifest(&docker, &outer).ok_or(InputError::MissingManifest)?;
-        read_docker_blob(&outer, &manifest.config)?;
-        let mut filesystem = BTreeMap::new();
-        let mut expanded = 0;
-        for layer in &manifest.layers {
-            let bytes = read_docker_blob(&outer, layer)?;
-            apply_layer(bytes, None, config, &mut expanded, &mut filesystem)?;
-        }
-        Ok(filesystem)
-    }
-}
-
 /// Wraps a layer blob in the decompressor its bytes and media type declare.
 /// Magic bytes decide the codec (gzip `1f 8b`, zstd `28 b5 2f fd`); the
 /// media type only guards fail-closed handling: a declared codec the blob
@@ -485,26 +393,24 @@ fn blob_path(digest: &str) -> Result<String, InputError> {
     Ok(format!("blobs/{algorithm}/{value}"))
 }
 
-fn add_oci_config_metadata(asset: &mut Asset, bytes: &[u8]) {
+fn image_metadata(digest: &str, bytes: &[u8]) -> BTreeMap<String, Value> {
+    let mut metadata = BTreeMap::from([("manifest_digest".to_owned(), json!(digest))]);
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
         if let Some(labels) = value.pointer("/config/Labels").and_then(Value::as_object) {
-            asset
-                .metadata
-                .insert("labels".into(), Value::Object(labels.clone()));
+            metadata.insert("labels".into(), Value::Object(labels.clone()));
         }
-        if let Some(os) = value.get("os") {
-            asset.metadata.insert("os".into(), os.clone());
-        }
-        if let Some(architecture) = value.get("architecture") {
-            asset
-                .metadata
-                .insert("architecture".into(), architecture.clone());
+        for key in ["os", "architecture"] {
+            if let Some(value) = value.get(key) {
+                metadata.insert(key.into(), value.clone());
+            }
         }
     }
+    metadata
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::AssetKind;
     use std::fs;
     use std::io;
 
@@ -907,7 +813,7 @@ mod tests {
             ],
         );
         assert!(
-            matches!(scan_oci_tar(&path, &config()), Err(InputError::MissingBlob(value)) if value == config_digest)
+            matches!(read_oci_tar(&path, &config()), Err(InputError::MissingBlob(value)) if value == config_digest)
         );
         write_tar(
             &path,
@@ -919,7 +825,7 @@ mod tests {
             ],
         );
         assert!(
-            matches!(scan_oci_tar(&path, &config()), Err(InputError::DigestMismatch(value)) if value == config_digest)
+            matches!(read_oci_tar(&path, &config()), Err(InputError::DigestMismatch(value)) if value == config_digest)
         );
         write_tar(
             &path,
@@ -931,7 +837,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            scan_oci_tar(&path, &config()).unwrap().asset.metadata["os"],
+            read_oci_tar(&path, &config()).unwrap().metadata["os"],
             "linux"
         );
     }

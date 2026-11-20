@@ -177,7 +177,9 @@ The Hooray repository itself is Apache-2.0 licensed. Its dependency policy accep
 only the explicit MIT-compatible permissive SPDX allowlist in `deny.toml`:
 Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-3-Clause,
 CDLA-Permissive-2.0, ISC, MIT, Unicode-3.0, Unlicense, Zlib, and
-bzip2-1.0.6. Unknown, copyleft, source-available, wildcard-version, yanked,
+bzip2-1.0.6. A package-specific exception allows BSD-2-Clause for the legacy
+codecs in `zstd-sys`; its notices ship in the release archive and container image.
+Unknown, copyleft, source-available, wildcard-version, yanked,
 unknown-registry, and unknown-Git dependencies are rejected by the configured
 checks; duplicate dependency versions are reported as warnings.
 
@@ -297,7 +299,7 @@ The v1 API provides:
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Process health |
-| `GET` | `/ready` | SQLite readiness |
+| `GET` | `/ready` | SQLite access and schema version of the newest stored report (an empty history is ready) |
 | `POST` | `/v1/scans` | Analyze a submitted normalized inventory with optional policy |
 | `GET` | `/v1/runs` | Paginated run history |
 | `GET` | `/v1/runs/{run_id}` | Complete stored report |
@@ -702,7 +704,7 @@ legacy severity-only `--fail-on` interface.
 
 | Ecosystem | Recognized files | Inventory behavior |
 | --- | --- | --- |
-| Rust | `Cargo.lock`, optional sibling `Cargo.toml` | Packages, checksums, direct dependency hints, Cargo purls |
+| Rust | `Cargo.lock`, optional sibling `Cargo.toml` | Locked packages and dependency edges, Cargo purls; the matching local root can inherit its sibling manifest’s declared license |
 | npm | `package-lock.json` | Package graph, dev/optional scope, npm purls |
 | Yarn | `yarn.lock` classic or Berry | Locked packages with dependency edges, npm purls |
 | pnpm | `pnpm-lock.yaml` | Locked packages with dev/optional scope, npm purls |
@@ -780,47 +782,33 @@ CI measures line coverage on every run and enforces a 90% floor. Commit messages
 are linted as Conventional Commits, and dependency advisories, bans, licenses,
 and sources are checked on every pull request and push to `main`.
 
-Dependency-comparison claims against JFrog Xray are backed by a measured
-record-replay harness; see [JFrog Xray parity testing](#jfrog-xray-parity-testing).
+Once operators supply Xray recordings, the comparison harness can measure
+agreement on those inputs; see [JFrog Xray parity testing](#jfrog-xray-parity-testing).
 
 ## JFrog Xray parity testing
 
-Hooray claims capability parity with JFrog Xray at the commit level since
-version 0.5.0. The optional `parity` harness turns that claim into a measured,
-repeatable differential test instead of an assertion: an identical
-deterministic corpus is scanned by Hooray and by a real JFrog Xray
-installation through the JFrog CLI, both outputs are normalized into one
-canonical model, and explicit overlap metrics compare the two sides.
+Hooray aims to replace JFrog Xray. This repository does not establish product
+parity. The optional `parity` harness compares a particular fixture with a
+captured Xray result. See the [engineering assessment](docs/engineering-assessment.md)
+for evidence, open gaps, and the proposed acceptance sequence.
 
 ### Architecture
 
-The harness is record-replay. A deterministic corpus of about 21 cases under
-`tests/fixtures/parity/corpus/<case_id>/`, described by
-`corpus/manifest.json`, covers every supported input format kind: project
-directories, CycloneDX SBOMs, SPDX SBOMs, and ZIP archives. Each case is
-scanned twice - once with Hooray and once with real JFrog Xray invoked via
-`jf audit` - and both outputs are normalized into canonical model version 1:
-components sorted by package URL with scope, directness, and licenses;
-vulnerabilities sorted with aliases, fixed versions, and severity labels;
-license findings; and parse errors. A recording under
-`tests/fixtures/parity/recordings/<case_id>.recording.json` commits both
-sides together with provenance, so every later comparison replays offline
-without network access.
+The manifest in `tests/fixtures/parity/corpus/` defines the corpus. At the
+2026-11-20 review it contained 23 cases: 20 project directories, one CycloneDX
+SBOM, one SPDX SBOM, and one ZIP. There were no committed Xray recordings.
+The current corpus does not exercise repository enforcement or OCI image parity.
 
-Comparison runs on two tiers:
-
-- Tier 1 (CI, offline) replays committed recordings. It verifies corpus
-  detect/parse coverage against the manifest, applies a drift guard that
-  re-scans each case offline and compares components, licenses, license
-  findings, and parse errors exactly against the recorded Hooray side, and
-  computes the scorecard from recordings, applying enforcement thresholds
-  where a recording declares them.
-- Tier 2 (operator refresh) runs in a licensed environment where a real Xray
-  installation exists: capture fresh `jf audit` output per case, run `record`
-  to commit refreshed recordings, and land those recordings with the change.
+- The offline suite scans the local fixtures and checks inventory expectations.
+  When recordings exist, it also compares fresh local output against their
+  Hooray inventory and computes scores against their captured Xray side.
+  The offline re-scan does not regenerate vulnerability findings.
+- In a licensed environment, an operator scans the same input with Xray and
+  uses `record` to save both normalized results and their provenance.
+  Recordings go in `tests/fixtures/parity/recordings/`.
 
 Determinism is pinned for replayability: scans use run ID
-`run:00000000-0000-4000-8000-000000000000` and advisory date
+`run:00000000-0000-4000-8000-000000000000` and policy evaluation time
 `2026-01-01T00:00:00Z`.
 
 ### Building and running
@@ -862,31 +850,37 @@ jf audit --format json --licenses > xray-audit.json
 jf audit --format cyclonedx > xray-sbom.json
 ```
 
-The CI gate checks the whole corpus against the recordings directory:
+To require evidence for the entire corpus, run:
 
 ```bash
 hooray-parity check --corpus tests/fixtures/parity/corpus \
   --recordings tests/fixtures/parity/recordings \
-  --format table \
+  --require-recordings --format table \
   --min-purl-recall 0.95 --min-purl-precision 0.95 --min-cve-jaccard 0.8
 ```
 
 `check` also accepts `--format json`; per-recording enforcement thresholds
 apply automatically when present, and the optional `--min-*` flags supply
-global floors. Exit codes follow the house convention: `0` when comparisons
-pass or a case is skipped, `1` for a parity violation, and `2` for
-operational errors such as missing files or unparseable input. The
-integration suite runs through Cargo:
+global floors. Without `--require-recordings`, cases without a recording only
+check local expectations. With it, every declared case must have exactly one
+readable recording; missing and duplicate captures exit `1`. For reproducible project
+scans, run on a clean checkout with regular ancestor ignore files. If a developer
+checkout inherits local ignore rules, use `git archive` to stage the committed
+corpus under a clean temporary directory and pass that path to `--corpus`. A missing or
+empty corpus manifest in this mode is a setup error (exit `2`). A complete
+set of recordings establishes manifest coverage. The gate does not authenticate
+the supplied Xray data or require an online advisory lookup. For a qualification
+run, review capture provenance and include known positive and negative controls. Run the offline integration suite with:
 
 ```bash
-cargo test --test parity_harness
+cargo test --locked --features parity --test parity_harness
 ```
 
 ### Recording provenance
 
 A vulnerability comparison is only meaningful against a pinned database
-state, because Xray's vulnerability database moves daily. Every recording
-therefore records provenance:
+state. For acceptance evidence, capture the following provenance. The recording
+format also accepts partial metadata for exploratory use:
 
 - `hooray_version` - required;
 - the Xray server version and JFrog CLI version - required;
@@ -897,15 +891,15 @@ therefore records provenance:
 
 ### Metrics
 
-All metrics compare the Hooray side with the Xray side using the shared match
+Package and license comparisons match components by the normalized PURL
 key `pkg:<type>/<namespace>/name@version`: type and namespace/name are
 lowercased except golang, qualifiers and fragments are stripped, and the
 version is kept verbatim.
 
 - PURL recall divides matched purls by all Xray purls; precision divides
   matched purls by all Hooray purls.
-- CVE Jaccard similarity over the two advisory sets; two empty sets score
-  1.0.
+- CVE Jaccard similarity compares CVE sets for the entire case. Two empty
+  sets score 1.0; the same CVE attributed to different packages can also match.
 - Severity agreement over matched CVEs at the label level only (`unknown`,
   `low`, `medium`, `high`, `critical`).
 - License agreement as Jaccard similarity over licenses of shared components.
@@ -918,18 +912,12 @@ overlap rather than identity:
 - `composer.json` yields constraint-style versions when no sibling lockfile exists.
   `composer.lock` supplies pinned versions, declared licenses, and edges to
   locked sibling packages; platform and unresolved requirements are not edges.
-- Formats without dependency edges (`requirements.txt`, `go.mod`,
-  `Pipfile.lock`, `Package.resolved`, `pubspec.lock`, `composer.json`,
-  `environment.yml`, `Chart.yaml`, `pom.xml`, `*.lockfile`) classify
-  all components as disconnected; `Gemfile.lock`, `Podfile.lock`, and `composer.lock` emit
-  edges but no declared roots, so direct/transitive parity is comparable
-  only for npm, Yarn, pnpm, Poetry, Cargo, and NuGet cases.
-- Hooray derives severity as bucketed labels from OSV while Xray exposes
-  numeric CVSS scores; severity agreement compares label buckets only.
-- Vulnerability sets can never be identical because OSV and Xray curate
-  different databases. Metrics are overlap measures, not exact-match
-  assertions, and recordings pin `xray_db_date` to keep overlaps
-  interpretable across refreshes.
+- The scorecard does not compare dependency edges or direct versus transitive
+  classification. A package set may match even when its graph differs.
+- Severity agreement compares label buckets for shared CVEs. It does not
+  compare CVSS scores, fix versions or the policy decision.
+- OSV and Xray curate different databases. Record both feed states for a
+  meaningful comparison; the harness accepts recordings without `xray_db_date`.
 - License parity is meaningful mainly for SBOM-input and license-file cases:
   lockfile parsers rarely carry license data while Xray's database does.
 - SBOM ingestion takes purls verbatim while Xray canonicalizes qualifier and

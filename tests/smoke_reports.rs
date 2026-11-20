@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::DateTime;
 use hooray::{
     analysis::{
         ApplicabilityAnalyzer, ApplicabilityInput, OsvAffectedRange, OsvEvent, OsvRangeType,
@@ -13,6 +12,7 @@ use hooray::{
     sbom::parse_cyclonedx,
 };
 use serde_json::{Value, json};
+use time::macros::datetime;
 
 fn fixture() -> ScanReport {
     let inventory = parse_cyclonedx(
@@ -96,7 +96,7 @@ fn all_formats_smoke_escape_redact_and_preserve_policy_state() {
         .evaluate(
             &report.findings,
             &report.inventory,
-            DateTime::parse_from_rfc3339("2026-10-13T12:00:00Z").unwrap(),
+            datetime!(2026-10-13 12:00 UTC),
         )
         .unwrap();
     report.policy_decisions = evaluated.decisions;
@@ -277,7 +277,7 @@ exceptions:
         .evaluate(
             &report.findings,
             &report.inventory,
-            DateTime::parse_from_rfc3339("2026-10-13T12:00:00Z").unwrap(),
+            datetime!(2026-10-13 12:00 UTC),
         )
         .unwrap();
     assert_eq!(evaluated.summary.denied, 1);
@@ -318,7 +318,7 @@ fn exact_purl_exception_accepts_qualifiers_and_still_rejects_globs() {
                 .evaluate(
                     &report.findings,
                     &report.inventory,
-                    DateTime::parse_from_rfc3339("2026-10-13T12:00:00Z").unwrap(),
+                    datetime!(2026-10-13 12:00 UTC),
                 )
                 .unwrap()
         };

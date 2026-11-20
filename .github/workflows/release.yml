@@ -194,6 +194,7 @@ jobs:
           mkdir -p "dist/$package"
           install -m 0755 target/release/hooray "dist/$package/hooray"
           install -m 0644 LICENSE "dist/$package/LICENSE"
+          cp -R licenses "dist/$package/licenses"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
 
       - name: Generate SPDX SBOM

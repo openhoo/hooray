@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, NaiveDate};
 use hooray::{
     analysis::{
         ApplicabilityAnalyzer, ApplicabilityInput, OsvAffectedRange, OsvEvent, OsvRangeType,
@@ -13,6 +12,7 @@ use hooray::{
     sbom::{SbomError, parse_cyclonedx},
 };
 use serde_json::json;
+use time::macros::datetime;
 
 fn fixture() -> ScanReport {
     let inventory = parse_cyclonedx(br#"{"bomFormat":"CycloneDX","components":[{"bom-ref":"dep","name":"dep","version":"1.0.0","purl":"pkg:cargo/dep@1.0.0"}]}"#).unwrap();
@@ -267,7 +267,7 @@ fn blank_remediation_cannot_flip_fix_available_selectors_or_reduce_risk() {
             .evaluate(
                 &report.findings,
                 &report.inventory,
-                DateTime::parse_from_rfc3339("2026-10-13T12:00:00Z").unwrap(),
+                datetime!(2026-10-13 12:00 UTC),
             )
             .unwrap()
             .summary
@@ -290,7 +290,7 @@ fn blank_remediation_cannot_flip_fix_available_selectors_or_reduce_risk() {
             direct: Some(true),
             remediation: Some(&remediation),
             evidence: &BTreeSet::new(),
-            as_of: NaiveDate::from_ymd_opt(2026, 10, 13).unwrap(),
+            as_of: time::macros::date!(2026 - 10 - 13),
         });
         assert!(risk.factors["fix-availability"] >= 0);
     }

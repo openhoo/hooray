@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use time::{Date, UtcDateTime};
 
 use crate::analysis::EvidenceProperties;
 use crate::graph::DependencyGraph;
@@ -23,7 +23,7 @@ pub struct RiskInput<'a> {
     pub direct: Option<bool>,
     pub remediation: Option<&'a Remediation>,
     pub evidence: &'a BTreeSet<Evidence>,
-    pub as_of: NaiveDate,
+    pub as_of: Date,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -128,13 +128,13 @@ fn fix_points(remediation: Option<&Remediation>, metadata: &EvidenceProperties<'
     }
 }
 
-fn age_points(metadata: &EvidenceProperties<'_>, as_of: NaiveDate) -> i32 {
+fn age_points(metadata: &EvidenceProperties<'_>, as_of: Date) -> i32 {
     let days = metadata
         .integer("component.age_days")
         .or_else(|| {
             metadata
                 .date("component.first_published")
-                .map(|date| (as_of - date).num_days())
+                .map(|date| (as_of - date).whole_days())
         })
         .filter(|days| *days >= 0);
     match days {
@@ -198,7 +198,7 @@ pub struct OperationalRiskInput<'a> {
     /// unknown rather than assumed direct.
     pub graph: &'a DependencyGraph,
     pub evidence_by_component: &'a BTreeMap<ComponentId, BTreeSet<Evidence>>,
-    pub as_of: DateTime<Utc>,
+    pub as_of: UtcDateTime,
     pub config: OperationalRiskConfig,
 }
 
@@ -259,7 +259,7 @@ struct OperationalCondition {
 fn detect_conditions(
     metadata: &EvidenceProperties<'_>,
     config: &OperationalRiskConfig,
-    as_of: DateTime<Utc>,
+    as_of: UtcDateTime,
 ) -> Vec<OperationalCondition> {
     let mut conditions = Vec::new();
 
@@ -300,7 +300,7 @@ fn detect_conditions(
         });
     }
     if let Some(last_release) = metadata.date_time("release.last_published") {
-        let age_days = as_of.signed_duration_since(last_release).num_days();
+        let age_days = last_release.age_days_at(as_of);
         if age_days >= config.stale_after_days {
             conditions.push(OperationalCondition {
                 rule: "stale",
@@ -327,7 +327,7 @@ fn operational_finding(
     condition: &OperationalCondition,
     evidence: &BTreeSet<Evidence>,
     direct: Option<bool>,
-    as_of: DateTime<Utc>,
+    as_of: UtcDateTime,
 ) -> Finding {
     let rule_id = RuleId::new(format!("operational-risk:{}", condition.rule))
         .expect("static operational risk rule identifier is non-empty");
@@ -345,7 +345,7 @@ fn operational_finding(
         direct,
         remediation: None,
         evidence,
-        as_of: as_of.date_naive(),
+        as_of: as_of.date(),
     });
     Finding {
         id,
@@ -440,7 +440,7 @@ mod tests {
             direct: Some(true),
             remediation: None,
             evidence: &evidence,
-            as_of: NaiveDate::from_ymd_opt(2026, 7, 21).unwrap(),
+            as_of: time::macros::date!(2026 - 07 - 21),
         })
     }
 
@@ -648,9 +648,7 @@ mod tests {
             inventory: &inventory,
             graph: &graph,
             evidence_by_component: &evidence_by_component,
-            as_of: DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            as_of: crate::timestamp::parse_utc("2026-07-21T00:00:00Z").unwrap(),
             config,
         })
     }
@@ -781,9 +779,7 @@ mod tests {
             inventory: &inventory,
             graph: &graph,
             evidence_by_component: &evidence_by_component,
-            as_of: DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            as_of: crate::timestamp::parse_utc("2026-07-21T00:00:00Z").unwrap(),
             config: OperationalRiskConfig::default(),
         });
         let directness = |component_id: &ComponentId| {

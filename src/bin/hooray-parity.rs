@@ -13,6 +13,7 @@
 //! Hooray input failures are fail-closed: they abort the scan and surface as
 //! operational errors (exit code 2), never as silent parse errors.
 
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -136,6 +137,9 @@ enum Command {
         /// Directory containing `*.recording.json` files.
         #[arg(long)]
         recordings: PathBuf,
+        /// Require exactly one readable Xray recording for each manifest case.
+        #[arg(long)]
+        require_recordings: bool,
         /// Output format: `table` or `json`.
         #[arg(long, default_value = "table")]
         format: String,
@@ -176,9 +180,8 @@ fn pinned_request(input: ScanInput, policy_path: PathBuf) -> anyhow::Result<Scan
     let mut request = ScanRequest::new(input, policy_path);
     request.run_id = Some(RunId::new(PINNED_RUN_ID).context("pinned run id must be valid")?);
     request.as_of = Some(
-        chrono::DateTime::parse_from_rfc3339(PINNED_AS_OF)
-            .context("pinned as-of timestamp must be valid")?
-            .with_timezone(&chrono::Utc),
+        hooray::timestamp::parse_utc(PINNED_AS_OF)
+            .context("pinned as-of timestamp must be valid")?,
     );
     Ok(request)
 }
@@ -376,7 +379,7 @@ async fn command_record(command: &Command) -> anyhow::Result<i32> {
     let recording = Recording {
         schema_version: hooray::parity::recording::RECORDING_SCHEMA_VERSION,
         case_id,
-        recorded_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        recorded_at: hooray::timestamp::utc_seconds(time::UtcDateTime::now()),
         provenance: Provenance {
             hooray_version: env!("CARGO_PKG_VERSION").to_owned(),
             xray_cli_version: xray_cli_version.clone(),
@@ -411,6 +414,7 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
     let Command::Check {
         corpus,
         recordings,
+        require_recordings,
         format,
         min_purl_recall,
         min_purl_precision,
@@ -459,6 +463,10 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         );
         None
     };
+
+    if *require_recordings && manifest.as_ref().is_none_or(|m| m.cases.is_empty()) {
+        bail!("--require-recordings needs a non-empty corpus manifest");
+    }
 
     // Tier 1: corpus expectations against fresh normalization.
     if let Some(manifest) = &manifest {
@@ -509,6 +517,7 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         }
     }
 
+    let corpus_rows = results.len();
     // Tier 2: recordings — drift guard always, thresholds when configured.
     let mut recording_paths = Vec::new();
     for entry in std::fs::read_dir(recordings)
@@ -532,6 +541,7 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         );
     }
 
+    let mut recorded_cases = BTreeSet::new();
     for path in recording_paths {
         let recording = match Recording::load(&path) {
             Ok(recording) => recording,
@@ -553,6 +563,9 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
             }
         };
         let mut drift_notes = Vec::new();
+        if *require_recordings && !recorded_cases.insert(recording.case_id.clone()) {
+            drift_notes.push("duplicate Xray recording for this case".to_owned());
+        }
 
         // Drift guard: ALWAYS runs when a recording exists. Offline scans
         // produce no vulnerabilities, so those are exempt by construction.
@@ -635,13 +648,21 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         }
         compare::apply_recording_check(
             &mut results,
-            &recording.case_id.clone(),
+            &recording.case_id,
             drift_notes,
             threshold_notes,
             card,
         );
     }
 
+    if *require_recordings {
+        for row in &mut results[..corpus_rows] {
+            if !recorded_cases.contains(&row.case_id) {
+                row.status = "violation".to_owned();
+                row.notes.push("missing Xray recording".to_owned());
+            }
+        }
+    }
     let any_violation = results.iter().any(|r| r.status == "violation");
     if format == "json" {
         print_json(&results)?;

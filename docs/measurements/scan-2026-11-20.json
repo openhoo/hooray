@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "cpu": "Apple M4 Max",
+  "python": "3.15.2",
+  "builds": {
+    "candidate": {
+      "profile": "cargo build --locked --release --bin hooray",
+      "checkout_head": "0361fda09da6d49d477b127a64624e52aef3969e",
+      "checkout_dirty": true,
+      "source_sha256": "3c6b208534cd17870bcfab3014bb0abcecc6738398dfb7dae527508492749c23",
+      "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14)",
+      "cargo": "cargo 1.90.0 (840b83a10 2025-07-30)",
+      "binary_sha256": "42e8369492a78f605ae683858c7255f5b9c3bc2afe13022536dd90444e24c9a0",
+      "version": "hooray 0.9.0"
+    },
+    "baseline": {
+      "profile": "caller-supplied",
+      "revision": "0361fda09da6d49d477b127a64624e52aef3969e",
+      "binary_sha256": "3d696c94c2706734aef7d1d025af8d41cdca7bb6f2331a9d34571c54e6c6461a",
+      "version": "hooray 0.9.0"
+    }
+  },
+  "measured_runs": 5,
+  "warmup_runs": 1,
+  "cases": {
+    "sbom": {
+      "fixture": "fixture.cdx.json",
+      "bytes": 108077,
+      "sha256": "82cf1e5c52931f75d82c42f5208bfd3d094320677e231b8630dbdbc26570be4b",
+      "components": 512,
+      "edges": 448,
+      "source_files": 0,
+      "normalized_reports_equal_within_run": true,
+      "results": {
+        "candidate": {
+          "samples": [
+            {
+              "wall_ms": 68.487,
+              "peak_rss_mib": 35.453,
+              "findings": 512,
+              "report_bytes": 1480635
+            },
+            {
+              "wall_ms": 52.12,
+              "peak_rss_mib": 35.578,
+              "findings": 512,
+              "report_bytes": 1480635
+            },
+            {
+              "wall_ms": 69.453,
+              "peak_rss_mib": 35.281,
+              "findings": 512,
+              "report_bytes": 1480635
+            },
+            {
+              "wall_ms": 65.046,
+              "peak_rss_mib": 35.422,
+              "findings": 512,
+              "report_bytes": 1480635
+            },
+            {
+              "wall_ms": 64.391,
+              "peak_rss_mib": 35.5,
+              "findings": 512,
+              "report_bytes": 1480635
+            }
+          ],
+          "median_wall_ms": 65.046,
+          "median_peak_rss_mib": 35.453
+        },
+        "baseline": {
+          "samples": [
+            {
+              "wall_ms": 63.912,
+              "peak_rss_mib": 39.797,
+              "findings": 512,
+              "report_bytes": 1480635
+            },
+            {
+              "wall_ms": 53.15,
+              "peak_rss_mib": 40.047,
+              "findings": 512,
+              "report_bytes": 1480635
+            },
+            {
+              "wall_ms": 63.56,
+              "peak_rss_mib": 40.219,
+              "findings": 512,
+              "report_bytes": 1480635
+            },
+            {
+              "wall_ms": 66.941,
+              "peak_rss_mib": 39.828,
+              "findings": 512,
+              "report_bytes": 1480635
+            },
+            {
+              "wall_ms": 74.011,
+              "peak_rss_mib": 40.109,
+              "findings": 512,
+              "report_bytes": 1480635
+            }
+          ],
+          "median_wall_ms": 63.912,
+          "median_peak_rss_mib": 40.047
+        }
+      }
+    },
+    "artifact": {
+      "fixture": "fixture.zip",
+      "bytes": 91354,
+      "sha256": "6fd25f29d22915f0ea810dca6ae964c3cd4ca2154c8dbcd4fc872b0da62f5edb",
+      "components": 512,
+      "edges": 448,
+      "source_files": 32,
+      "normalized_reports_equal_within_run": true,
+      "results": {
+        "candidate": {
+          "samples": [
+            {
+              "wall_ms": 70.771,
+              "peak_rss_mib": 33.859,
+              "findings": 512,
+              "report_bytes": 1251306
+            },
+            {
+              "wall_ms": 67.026,
+              "peak_rss_mib": 33.797,
+              "findings": 512,
+              "report_bytes": 1251306
+            },
+            {
+              "wall_ms": 60.186,
+              "peak_rss_mib": 34.0,
+              "findings": 512,
+              "report_bytes": 1251306
+            },
+            {
+              "wall_ms": 75.362,
+              "peak_rss_mib": 33.969,
+              "findings": 512,
+              "report_bytes": 1251306
+            },
+            {
+              "wall_ms": 57.83,
+              "peak_rss_mib": 33.828,
+              "findings": 512,
+              "report_bytes": 1251306
+            }
+          ],
+          "median_wall_ms": 67.026,
+          "median_peak_rss_mib": 33.859
+        },
+        "baseline": {
+          "samples": [
+            {
+              "wall_ms": 67.326,
+              "peak_rss_mib": 36.641,
+              "findings": 512,
+              "report_bytes": 1251306
+            },
+            {
+              "wall_ms": 66.748,
+              "peak_rss_mib": 37.516,
+              "findings": 512,
+              "report_bytes": 1251306
+            },
+            {
+              "wall_ms": 63.322,
+              "peak_rss_mib": 36.422,
+              "findings": 512,
+              "report_bytes": 1251306
+            },
+            {
+              "wall_ms": 55.759,
+              "peak_rss_mib": 36.547,
+              "findings": 512,
+              "report_bytes": 1251306
+            },
+            {
+              "wall_ms": 56.183,
+              "peak_rss_mib": 36.797,
+              "findings": 512,
+              "report_bytes": 1251306
+            }
+          ],
+          "median_wall_ms": 63.322,
+          "median_peak_rss_mib": 36.641
+        }
+      }
+    }
+  }
+}

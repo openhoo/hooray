@@ -519,9 +519,9 @@ fn publish_directory_no_replace(staging: &Path, destination: &Path) -> Result<()
     unsafe extern "C" {
         fn renameat2(
             olddirfd: i32,
-            oldpath: *const i8,
+            oldpath: *const std::ffi::c_char,
             newdirfd: i32,
-            newpath: *const i8,
+            newpath: *const std::ffi::c_char,
             flags: u32,
         ) -> i32;
     }

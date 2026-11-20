@@ -21,34 +21,43 @@ pub(crate) fn parse_cargo_lock(
         .and_then(|b| utf8(b, path, "Cargo.toml").ok())
         .and_then(|text| toml::from_str::<toml::Value>(text).ok())
         .and_then(|v| v.get("package").cloned());
-    let declared_license = manifest_package
-        .as_ref()
-        .and_then(|package| package.get("license")?.as_str().map(str::to_owned));
+    let manifest_field = |field: &str| manifest_package.as_ref()?.get(field)?.as_str();
+    let manifest_name = manifest_field("name");
+    let manifest_version = manifest_field("version");
     // Root-anchored identity: the crate name/version claims the asset like
     // the manifest-name claims of the npm/maven/bun parsers.
-    if let Some(package) = &manifest_package {
+    if manifest_package.is_some() {
         out.claim_asset_identity(
             path,
-            package
-                .get("name")
-                .and_then(toml::Value::as_str)
-                .map(str::to_owned),
-            package
-                .get("version")
-                .and_then(toml::Value::as_str)
-                .map(str::to_owned),
+            manifest_name.map(str::to_owned),
+            manifest_version.map(str::to_owned),
         );
     }
+    // Component identity currently merges Cargo sources at the same name/version.
+    // Only credit the manifest's declaration when that coordinate identifies a
+    // single local lock entry. A stale sidecar cannot license a registry crate.
+    let licensed_root = manifest_name
+        .zip(manifest_version)
+        .zip(manifest_field("license"))
+        .filter(|((name, version), _)| {
+            let mut candidates = packages.iter().filter(|entry| {
+                entry.get("name").and_then(toml::Value::as_str) == Some(*name)
+                    && entry.get("version").and_then(toml::Value::as_str) == Some(*version)
+            });
+            candidates
+                .next()
+                .is_some_and(|entry| entry.get("source").is_none())
+                && candidates.next().is_none()
+        });
     let mut ids = LockComponents::new();
     for package in packages {
         let name = required_toml(package, "name", path)?;
         let version = required_toml(package, "version", path)?;
-        let licenses = declared_license
-            .as_ref()
-            .filter(|_| packages.len() == 1)
-            .map(|v| {
+        let licenses = licensed_root
+            .filter(|(coordinate, _)| *coordinate == (name, version))
+            .map(|(_, expression)| {
                 BTreeSet::from([License {
-                    expression: Some(v.clone()),
+                    expression: Some(expression.to_owned()),
                     name: None,
                     url: None,
                 }])
@@ -113,6 +122,42 @@ mod tests {
         let inventory = scan_path(dir.path(), &config()).unwrap();
         assert_eq!(inventory.components.len(), 2);
         assert_eq!(inventory.dependencies.len(), 1);
+        let licensed: Vec<_> = inventory
+            .components
+            .values()
+            .flat_map(|component| {
+                component
+                    .licenses
+                    .iter()
+                    .map(move |license| (component.purl.as_str(), license.expression.as_deref()))
+            })
+            .collect();
+        assert_eq!(licensed, [("pkg:cargo/app@1.0.0", Some("MIT"))]);
+    }
+
+    #[test]
+    fn cargo_manifest_cannot_license_an_unrelated_or_ambiguous_package() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='app'\nversion='1.0.0'\nlicense='MIT'\n",
+        )
+        .unwrap();
+        let local = "[[package]]\nname='app'\nversion='1.0.0'\n";
+        let registry = format!("{local}source='registry+https://example.invalid/index'\n");
+        for lock in [
+            "[[package]]\nname='other'\nversion='1.0.0'\n".to_owned(),
+            "[[package]]\nname='app'\nversion='2.0.0'\n".to_owned(),
+            registry.clone(),
+            format!("{local}{registry}"),
+        ] {
+            fs::write(dir.path().join("Cargo.lock"), &lock).unwrap();
+            let inventory = scan_path(dir.path(), &config()).unwrap();
+            assert!(
+                inventory.components.values().all(|c| c.licenses.is_empty()),
+                "{lock}"
+            );
+        }
     }
 
     #[test]

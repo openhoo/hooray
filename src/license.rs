@@ -62,17 +62,29 @@ pub fn analyze_with_files(
     inventory: &Inventory,
     files: Vec<(String, Vec<u8>)>,
 ) -> Result<LicenseAnalysis, LicenseError> {
+    analyze_file_slices(
+        inventory,
+        files
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+    )
+}
+
+pub(crate) fn analyze_file_slices<'a>(
+    inventory: &Inventory,
+    files: impl Iterator<Item = (&'a str, &'a [u8])>,
+) -> Result<LicenseAnalysis, LicenseError> {
     let mut detected = Vec::new();
     let mut notices = Vec::new();
     for (path, bytes) in files {
-        if is_notice_name(&path) {
+        if is_notice_name(path) {
             notices.push(Notice {
-                path,
-                sha256: crate::util::sha256_hex(&bytes),
-                text: String::from_utf8_lossy(&bytes).into_owned(),
+                path: path.to_owned(),
+                sha256: crate::util::sha256_hex(bytes),
+                text: String::from_utf8_lossy(bytes).into_owned(),
             });
-        } else if is_license_name(&path) {
-            detected.push(detect_license_text(&path, &bytes));
+        } else if is_license_name(path) {
+            detected.push(detect_license_text(path, bytes));
         }
     }
     notices.sort_by(|a, b| a.path.cmp(&b.path));

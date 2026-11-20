@@ -1,9 +1,10 @@
-use chrono::{DateTime, NaiveDate, Utc};
+use crate::timestamp::{WireTimestamp, calendar_date};
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::ControlFlow;
 use std::rc::Rc;
+use time::Date;
 
 use crate::model::{
     Applicability, ApplicabilityStatus, Component, ComponentId, Evidence, Inventory,
@@ -294,28 +295,20 @@ impl<'a> EvidenceProperties<'a> {
         self.value(key)?.parse().ok()
     }
 
-    pub(crate) fn date(&self, key: &str) -> Option<NaiveDate> {
+    pub(crate) fn date(&self, key: &str) -> Option<Date> {
         let value = self.value(key)?;
-        NaiveDate::parse_from_str(value, "%Y-%m-%d")
-            .ok()
-            .or_else(|| {
-                DateTime::parse_from_rfc3339(value)
-                    .ok()
-                    .map(|date| date.date_naive())
-            })
+        calendar_date(value).or_else(|| {
+            WireTimestamp::parse(value)
+                .ok()
+                .map(WireTimestamp::civil_date)
+        })
     }
 
-    pub(crate) fn date_time(&self, key: &str) -> Option<DateTime<Utc>> {
+    pub(crate) fn date_time(&self, key: &str) -> Option<WireTimestamp> {
         let value = self.value(key)?;
-        DateTime::parse_from_rfc3339(value)
+        WireTimestamp::parse(value)
             .ok()
-            .map(|date| date.with_timezone(&Utc))
-            .or_else(|| {
-                NaiveDate::parse_from_str(value, "%Y-%m-%d")
-                    .ok()?
-                    .and_hms_opt(0, 0, 0)
-                    .map(|date| date.and_utc())
-            })
+            .or_else(|| Some(calendar_date(value)?.midnight().assume_utc().into()))
     }
 }
 

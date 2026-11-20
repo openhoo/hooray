@@ -21,6 +21,7 @@ RUN apt-get update \
     && groupadd --gid 1000 gitlab \
     && useradd --uid 1000 --gid gitlab --create-home --shell /usr/sbin/nologin gitlab
 
+COPY licenses/ /usr/share/doc/hooray/licenses/
 COPY --from=builder /usr/src/hooray/target/release/hooray /usr/local/bin/hooray
 
 USER 1000:1000

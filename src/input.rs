@@ -38,7 +38,7 @@ use self::parsers::{
     gradle_catalog::parse_gradle_catalog,
     haskell::{parse_cabal, parse_cabal_freeze},
     helm::{parse_chart_lock, parse_chart_yaml},
-    image::{oci_layout_filesystem, oci_tar_filesystem, scan_oci_layout, scan_oci_tar},
+    image::{read_oci_layout, read_oci_tar},
     maven::parse_pom_xml,
     npm::{npm_workspace_paths, parse_package_json, parse_package_lock},
     nuget::{
@@ -127,6 +127,30 @@ pub enum InputError {
 
 pub fn scan_path(path: impl AsRef<Path>, config: &Config) -> Result<Inventory, InputError> {
     ScanInput::detect(path, config)?.inventory(config)
+}
+
+pub(crate) type VirtualFiles = BTreeMap<String, Vec<u8>>;
+
+/// Files after archive validation / layer application, plus image identity metadata.
+#[derive(Default)]
+struct PreparedFiles {
+    files: VirtualFiles,
+    metadata: BTreeMap<String, Value>,
+}
+
+enum InputSource<'a> {
+    Directory(&'a Path),
+    Sbom(&'a Path),
+    Virtual {
+        locator: &'a Path,
+        kind: AssetKind,
+        snapshot: PreparedFiles,
+    },
+}
+
+pub(crate) struct PreparedInput {
+    pub inventory: Inventory,
+    pub files: Option<VirtualFiles>,
 }
 
 impl ScanInput {
@@ -220,52 +244,78 @@ impl ScanInput {
     }
 
     pub fn inventory(&self, config: &Config) -> Result<Inventory, InputError> {
-        match self {
-            Self::ProjectDirectory(root) => scan_directory(root, config),
-            Self::Archive {
-                path,
-                format: ArchiveFormat::Zip,
-            } => {
-                let files = read_zip_file(path, config)?;
-                scan_virtual_files(path, AssetKind::Filesystem, files)
-            }
-            Self::Archive {
-                path,
-                format: ArchiveFormat::Tar,
-            } => {
-                let files = read_tar_file(path, config)?;
-                scan_virtual_files(path, AssetKind::Filesystem, files)
-            }
-            Self::OciImageLayout(root) => scan_oci_layout(root, config),
-            Self::OciImageTar(path) => scan_oci_tar(path, config),
-            Self::CycloneDx(path) => {
-                let bytes = read_limited(path, config.max_input_bytes)?;
-                Ok(sbom::parse_cyclonedx(&bytes)?)
-            }
-        }
+        Ok(self.prepare(config)?.inventory)
     }
 
-    /// Extracted member contents for archive and image inputs, so filesystem
-    /// scanners and license detection can evaluate what `scan_virtual_files`
-    /// saw beyond lockfiles. `None` for real-directory and SBOM inputs
-    /// (scanners walk those paths directly).
+    pub(crate) fn prepare(&self, config: &Config) -> Result<PreparedInput, InputError> {
+        let inventory = match self.source(config)? {
+            InputSource::Directory(root) => scan_directory(root, config)?,
+            InputSource::Sbom(path) => {
+                sbom::parse_cyclonedx(&read_limited(path, config.max_input_bytes)?)?
+            }
+            InputSource::Virtual {
+                locator,
+                kind,
+                snapshot,
+            } => {
+                let mut inventory = scan_virtual_files(locator, kind, &snapshot.files)?;
+                inventory.asset.metadata.extend(snapshot.metadata);
+                return Ok(PreparedInput {
+                    inventory,
+                    files: Some(snapshot.files),
+                });
+            }
+        };
+        Ok(PreparedInput {
+            inventory,
+            files: None,
+        })
+    }
+
+    /// Extract the validated member contents without requiring a successful package parse.
+    /// Directory and SBOM inputs do not have a virtual member set.
     pub fn virtual_files(
         &self,
         config: &Config,
     ) -> Result<Option<BTreeMap<String, Vec<u8>>>, InputError> {
-        match self {
-            Self::Archive {
-                path,
-                format: ArchiveFormat::Zip,
-            } => Ok(Some(read_zip_file(path, config)?)),
-            Self::Archive {
-                path,
-                format: ArchiveFormat::Tar,
-            } => Ok(Some(read_tar_file(path, config)?)),
-            Self::OciImageLayout(root) => Ok(Some(oci_layout_filesystem(root, config)?)),
-            Self::OciImageTar(path) => Ok(Some(oci_tar_filesystem(path, config)?)),
-            _ => Ok(None),
+        match self.source(config)? {
+            InputSource::Virtual { snapshot, .. } => Ok(Some(snapshot.files)),
+            InputSource::Directory(_) | InputSource::Sbom(_) => Ok(None),
         }
+    }
+
+    fn source(&self, config: &Config) -> Result<InputSource<'_>, InputError> {
+        let (locator, kind, snapshot) = match self {
+            Self::ProjectDirectory(root) => return Ok(InputSource::Directory(root)),
+            Self::CycloneDx(path) => return Ok(InputSource::Sbom(path)),
+            Self::Archive { path, format } => {
+                let files = match format {
+                    ArchiveFormat::Zip => read_zip_file(path, config)?,
+                    ArchiveFormat::Tar => read_tar_file(path, config)?,
+                };
+                (
+                    path,
+                    AssetKind::Filesystem,
+                    PreparedFiles {
+                        files,
+                        ..Default::default()
+                    },
+                )
+            }
+            Self::OciImageLayout(root) => (
+                root,
+                AssetKind::ContainerImage,
+                read_oci_layout(root, config)?,
+            ),
+            Self::OciImageTar(path) => {
+                (path, AssetKind::ContainerImage, read_oci_tar(path, config)?)
+            }
+        };
+        Ok(InputSource::Virtual {
+            locator,
+            kind,
+            snapshot,
+        })
     }
 }
 
@@ -306,7 +356,7 @@ fn scan_directory(root: &Path, config: &Config) -> Result<Inventory, InputError>
         }
         files.insert(normalize_relative(relative)?, bytes);
     }
-    scan_virtual_files(root, AssetKind::Repository, files)
+    scan_virtual_files(root, AssetKind::Repository, &files)
 }
 
 type LockfileParser = fn(&str, &[u8], &mut InventoryBuilder) -> Result<(), InputError>;
@@ -454,17 +504,17 @@ static CABAL_ROUTE: LockfileRoute = LockfileRoute::LockTree(parse_cabal);
 fn scan_virtual_files(
     locator: &Path,
     kind: AssetKind,
-    files: BTreeMap<String, Vec<u8>>,
+    files: &VirtualFiles,
 ) -> Result<Inventory, InputError> {
     let mut builder = InventoryBuilder::new(locator, kind);
-    let workspace_members = workspace_lock_members(&files)?;
-    for (path, bytes) in &files {
+    let workspace_members = workspace_lock_members(files)?;
+    for (path, bytes) in files {
         let Some(route) = lockfile_route(base_name(path)) else {
             continue;
         };
         match route {
             LockfileRoute::Lock(parse) => parse(path, bytes, &mut builder)?,
-            LockfileRoute::LockTree(parse) => parse(path, bytes, &files, &mut builder)?,
+            LockfileRoute::LockTree(parse) => parse(path, bytes, files, &mut builder)?,
             LockfileRoute::CargoLock => parse_cargo_lock(
                 path,
                 bytes,
@@ -482,20 +532,15 @@ fn scan_virtual_files(
                 // lives at the workspace root (pnpm workspaces, npm/yarn
                 // workspaces). The parser still receives the first present
                 // lockfile so it can skip redundant work.
-                let lock = covering_lockfile(
-                    path,
-                    lock_names,
-                    *ancestor_locks,
-                    &files,
-                    &workspace_members,
-                );
+                let lock =
+                    covering_lockfile(path, lock_names, *ancestor_locks, files, &workspace_members);
                 parse(path, bytes, lock, &mut builder)?;
             }
         }
     }
     // A recognized container/archive kind that carries no lockfiles yields an
     // empty inventory, matching the directory contract.
-    builder.finish(locator, &files)
+    builder.finish(locator, files)
 }
 
 struct InventoryBuilder {

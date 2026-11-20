@@ -292,7 +292,7 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> i64 {
-        chrono::Utc::now().timestamp()
+        time::UtcDateTime::now().unix_timestamp()
     }
 
     fn sleep(&self, duration: Duration) -> MonitorFuture<'_, ()> {
@@ -617,9 +617,9 @@ impl MonitorRepository for crate::store::Store {
     fn prune_reports_before(&mut self, cutoff: i64) -> Result<usize, MonitorError> {
         // scan_runs.started_at is RFC 3339 text, not the biased-sortable
         // monitor encoding, so the cutoff is rendered as RFC 3339 here.
-        let cutoff = chrono::DateTime::from_timestamp(cutoff, 0)
-            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-            .ok_or_else(|| MonitorError::Persistence("retention cutoff out of range".into()))?;
+        let cutoff = time::UtcDateTime::from_unix_timestamp(cutoff)
+            .map(crate::timestamp::utc_millis)
+            .map_err(|_| MonitorError::Persistence("retention cutoff out of range".into()))?;
         self.delete_before(&cutoff).map_err(store_error)
     }
 }
@@ -745,11 +745,9 @@ fn decode_time(field: &'static str, value: &str) -> Result<i64, MonitorError> {
 /// leaking the internal sortable form.
 pub fn display_time(field: &'static str, value: &str) -> Result<String, MonitorError> {
     let timestamp = decode_time(field, value)?;
-    chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-        .ok_or_else(|| {
-            MonitorError::Persistence(format!("stored {field} timestamp is out of range"))
-        })
+    time::UtcDateTime::from_unix_timestamp(timestamp)
+        .map(crate::timestamp::utc_seconds)
+        .map_err(|_| MonitorError::Persistence(format!("stored {field} timestamp is out of range")))
 }
 
 fn store_error(error: crate::store::StoreError) -> MonitorError {

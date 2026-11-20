@@ -234,18 +234,14 @@ impl DependencyGraph {
             truncated: false,
             expansions: 0,
         };
-        let mut roots = self.connected_roots().iter().cloned();
+        let mut roots = self.roots_reaching(target).into_iter();
         while let Some(root) = roots.next() {
-            if !self.can_reach(&root, target, &[]) {
-                continue;
-            }
-            let mut current = vec![root];
+            let mut current = vec![root.clone()];
             if self.collect_paths(&mut collection, &mut current) {
                 break;
             }
             if collection.paths.len() == max_paths {
-                collection.truncated =
-                    roots.any(|remaining| self.can_reach(&remaining, target, &[]));
+                collection.truncated = roots.next().is_some();
                 break;
             }
         }
@@ -254,6 +250,35 @@ impl DependencyGraph {
             paths: collection.paths,
             truncated: collection.truncated,
         })
+    }
+
+    /// Find the connected roots with a path to this target. In a forest of
+    /// manifests, searching forward from every root revisits every unrelated
+    /// manifest for each target. Walking incoming edges visits only ancestors.
+    fn roots_reaching<'a>(&'a self, target: &'a ComponentId) -> Vec<&'a ComponentId> {
+        if !self.depth_from_root.contains_key(target) {
+            return Vec::new();
+        }
+        if self.connected_roots.len() == 1 {
+            return self.connected_roots.iter().collect();
+        }
+        let mut roots = Vec::new();
+        let mut pending = vec![target];
+        let mut seen = BTreeSet::from([target]);
+        while let Some(node) = pending.pop() {
+            if self.connected_roots.contains(node) {
+                roots.push(node);
+            } else {
+                for parent in &self.incoming[node] {
+                    if seen.insert(parent) {
+                        pending.push(parent);
+                    }
+                }
+            }
+        }
+        // Root order determines which concrete paths survive the count cap.
+        roots.sort_unstable();
+        roots
     }
 
     fn collect_paths(
@@ -543,6 +568,37 @@ mod tests {
             ]
         );
         assert!(result.truncated);
+    }
+
+    #[test]
+    fn all_paths_caps_only_roots_that_reach_the_target_even_with_cycles() {
+        let graph = graph(
+            &["a", "b", "c", "d", "e", "other", "target", "x", "y"],
+            &[
+                edge("a", "c"),
+                edge("b", "d"),
+                edge("c", "d"),
+                edge("d", "c"),
+                edge("c", "target"),
+                edge("e", "other"),
+                edge("x", "y"),
+                edge("y", "x"),
+            ],
+        )
+        .unwrap();
+        let capped = graph.all_paths(&id("target"), 8, 1).unwrap();
+        assert_eq!(capped.paths[0].components, [id("a"), id("c"), id("target")]);
+        assert!(capped.truncated);
+        let full = graph.all_paths(&id("target"), 8, 2).unwrap();
+        assert_eq!(full.paths.len(), 2);
+        assert_eq!(
+            full.paths[1].components,
+            [id("b"), id("d"), id("c"), id("target")]
+        );
+        assert!(!full.truncated);
+        let disconnected = graph.all_paths(&id("x"), 8, 1).unwrap();
+        assert!(disconnected.paths.is_empty());
+        assert!(!disconnected.truncated);
     }
 
     #[test]
