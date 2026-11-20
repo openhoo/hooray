@@ -1,79 +1,11 @@
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::path::{Component as PathComponent, Path, PathBuf};
 
 use crate::config::Config;
-use crate::input::{InputError, malformed_msg, normalize_relative, read_limited};
-
-/// Opens an archive file for reading without following a final-component
-/// symlink and rejecting non-regular files, mirroring the input layer's
-/// `open_regular_nofollow` (kept local so the parsers surface stays
-/// self-contained).
-fn open_regular_nofollow(path: &Path) -> Result<File, InputError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        const O_NOFOLLOW: i32 = 0x20_000;
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        ))]
-        const O_NOFOLLOW: i32 = 0x100;
-        options.custom_flags(O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(path).map_err(|source| {
-        if is_symlink_open_error(&source) {
-            InputError::Symlink(path.to_owned())
-        } else {
-            InputError::Io {
-                path: path.to_owned(),
-                source,
-            }
-        }
-    })?;
-    let metadata = file.metadata().map_err(|source| InputError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    if !metadata.is_file() {
-        return Err(InputError::UnsupportedPath(path.to_owned()));
-    }
-    Ok(file)
-}
-
-/// `ELOOP` per target: Linux/Android use 40, Darwin and the BSDs use 62.
-/// Raw errno matching is required because `io::ErrorKind::FilesystemLoop`
-/// is not available on the pinned toolchain; a single hardcoded 40 would
-/// misclassify symlink rejections on every non-Linux unix target.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const ELOOP: i32 = 40;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly"
-))]
-const ELOOP: i32 = 62;
-
-#[cfg(unix)]
-fn is_symlink_open_error(source: &io::Error) -> bool {
-    source.raw_os_error() == Some(ELOOP)
-}
-
-#[cfg(not(unix))]
-fn is_symlink_open_error(_: &io::Error) -> bool {
-    false
-}
+use crate::input::{
+    InputError, malformed_msg, normalize_relative, open_regular_nofollow, read_limited,
+};
 
 /// Marker error `BoundedReader` raises so archive readers can report an
 /// over-budget stream as `ArchiveTooLarge` rather than a bare I/O error.
@@ -155,9 +87,9 @@ fn read_zip<R: Read + io::Seek>(
     let mut expanded = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let path = entry
-            .enclosed_name()
-            .ok_or_else(|| InputError::PathTraversal(entry.name().to_owned()))?;
+        let Some(path) = entry.enclosed_name() else {
+            return Err(InputError::PathTraversal(entry.name()?.into_owned()));
+        };
         let path = normalize_relative(&path)?;
         if entry
             .unix_mode()

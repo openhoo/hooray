@@ -3,6 +3,9 @@
 Open an issue before a large scanner, policy, persistence, or public-API change.
 Small fixes may go directly to a pull request.
 
+For the current scan architecture, measured bottlenecks and Xray qualification
+criteria, see the [engineering assessment](docs/engineering-assessment.md).
+
 ## Development
 
 Use the repository Rust toolchain.

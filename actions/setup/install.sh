@@ -17,6 +17,7 @@ base_url="https://github.com/openhoo/hooray/releases/download/v${version}"
 signature_identity="https://github.com/openhoo/hooray/.github/workflows/release.yml@refs/heads/main"
 signature_issuer="https://token.actions.githubusercontent.com"
 download_dir="$(mktemp -d "${RUNNER_TEMP}/hooray-download.XXXXXXXX")"
+trap 'rm -rf "$download_dir"' EXIT
 archive="${download_dir}/${archive_name}"
 checksums="${download_dir}/SHA256SUMS"
 archive_bundle="${archive}.sigstore.json"
@@ -46,17 +47,34 @@ if [[ "$actual" != "$expected" ]]; then
   exit 1
 fi
 
-extract_dir="$(mktemp -d "${RUNNER_TEMP}/hooray-extract.XXXXXXXX")"
+extract_dir="$download_dir/extracted"
+mkdir "$extract_dir"
 tar -xzf "$archive" -C "$extract_dir"
-source_binary="${extract_dir}/${stem}/hooray"
-if [[ ! -f "$source_binary" ]]; then
-  echo "::error::Archive ${archive_name} contains no hooray binary at the expected path."
-  exit 1
-fi
-
+package="${extract_dir}/${stem}"
 bin_dir="$(mktemp -d "${RUNNER_TEMP}/hooray-bin.XXXXXXXX")"
-cp "$source_binary" "${bin_dir}/hooray"
-chmod +x "${bin_dir}/hooray"
-"${bin_dir}/hooray" --version | grep -F "hooray ${version}"
+programs=(hooray)
+# Releases before 0.10 supplied just the scanner.
+if [[ ! "$version" =~ ^0\.[0-9]\. || -e "$package/hooray-parity" ]]; then
+  programs+=(hooray-parity)
+fi
+for program in "${programs[@]}"; do
+  if [[ ! -f "$package/$program" || -L "$package/$program" ]]; then
+    echo "::error::Archive ${archive_name} contains no regular $program binary at the expected path."
+    exit 1
+  fi
+  install -m 0755 "$package/$program" "$bin_dir/$program"
+  reported_version="$("$bin_dir/$program" --version)"
+  if [[ "$reported_version" != "$program $version" ]]; then
+    echo "::error::Installed $program does not report the requested version $version."
+    exit 1
+  fi
+  "$bin_dir/$program" --help > /dev/null
+done
+if [[ -f "$package/LICENSE" ]]; then
+  install -m 0644 "$package/LICENSE" "$bin_dir/LICENSE"
+fi
+if [[ -d "$package/licenses" ]]; then
+  cp -R "$package/licenses" "$bin_dir/licenses"
+fi
 echo "$bin_dir" >> "$GITHUB_PATH"
 echo "version=$version" >> "$GITHUB_OUTPUT"

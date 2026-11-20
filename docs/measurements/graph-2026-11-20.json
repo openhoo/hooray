@@ -1,0 +1,66 @@
+{
+  "date": "2026-11-20",
+  "host": "Apple M4 Max, arm64, macOS 26.6.2",
+  "toolchain": "Rust 1.90.0, cargo bench (optimized)",
+  "base_revision": "0361fda09da6d49d477b127a64624e52aef3969e",
+  "method": "Same graph-only benchmark fixture with alternating base/candidate binaries, three warmup iterations per workload per run; samples are ns per batch. The changed path search does not affect graph_classify_108.",
+  "workloads": {
+    "graph_classify_108": {
+      "before": [
+        5607,
+        8694,
+        5634,
+        5560,
+        5550
+      ],
+      "updated": [
+        5538,
+        5648,
+        5707,
+        5719,
+        5720
+      ],
+      "median_speedup": 0.982,
+      "median_before_ns": 5607,
+      "median_updated_ns": 5707
+    },
+    "graph_all_paths_dense": {
+      "before": [
+        23415,
+        35290,
+        24153,
+        23684,
+        23264
+      ],
+      "updated": [
+        20164,
+        20469,
+        21057,
+        20494,
+        19973
+      ],
+      "median_speedup": 1.157,
+      "median_before_ns": 23684,
+      "median_updated_ns": 20469
+    },
+    "graph_all_paths_256_manifest_leaves": {
+      "before": [
+        56441301,
+        60774119,
+        59296583,
+        57111881,
+        55573768
+      ],
+      "updated": [
+        449511,
+        542516,
+        455576,
+        454711,
+        453953
+      ],
+      "median_speedup": 125.6,
+      "median_before_ns": 57111881,
+      "median_updated_ns": 454711
+    }
+  }
+}

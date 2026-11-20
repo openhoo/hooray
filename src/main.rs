@@ -8,7 +8,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hooray::{
     config::Config,
@@ -27,6 +26,7 @@ use hooray::{
     util::{sanitize_cell_text, sha256_hex},
 };
 use serde::Serialize;
+use time::UtcDateTime;
 
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_POLICY_DENIED: u8 = 1;
@@ -556,7 +556,7 @@ fn run_policy(config: &Config, args: PolicyArgs) -> Result<CommandOutcome> {
             let evaluation = policy.evaluate(
                 &report.findings,
                 &report.inventory,
-                Utc::now().fixed_offset(),
+                UtcDateTime::now().into(),
             )?;
             write_output(&evaluation.summary, &args.output)?;
             Ok(if evaluation.summary.denied == 0 {
@@ -705,7 +705,7 @@ fn run_monitor_targets(config: &Config, args: MonitorTargetsArgs) -> Result<Comm
                     .context("monitor source path is not UTF-8")?
                     .to_owned(),
                 args.interval_seconds,
-                Utc::now().timestamp(),
+                UtcDateTime::now().unix_timestamp(),
             )?;
             store.add_monitor_target(&target)?;
             println!("added monitor target '{}'", target.target_id);
@@ -2573,8 +2573,8 @@ mod tests {
         // Timestamps must reach the CLI decoded to RFC 3339, not the internal
         // biased-sortable encode_time form.
         let next_due_at = rows[0]["next_due_at"].as_str().unwrap();
-        chrono::DateTime::parse_from_rfc3339(next_due_at).unwrap();
-        chrono::DateTime::parse_from_rfc3339(rows[0]["updated_at"].as_str().unwrap()).unwrap();
+        hooray::timestamp::parse_utc(next_due_at).unwrap();
+        hooray::timestamp::parse_utc(rows[0]["updated_at"].as_str().unwrap()).unwrap();
 
         let duplicate = run_monitor_targets(&config, add("zeta")).unwrap_err();
         assert!(duplicate.to_string().contains("already exists"));

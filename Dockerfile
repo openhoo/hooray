@@ -2,7 +2,7 @@ FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f
 
 WORKDIR /usr/src/hooray
 COPY . .
-RUN cargo build --locked --release --bin hooray
+RUN cargo build --locked --release --features parity --bin hooray --bin hooray-parity
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 
@@ -21,7 +21,10 @@ RUN apt-get update \
     && groupadd --gid 1000 gitlab \
     && useradd --uid 1000 --gid gitlab --create-home --shell /usr/sbin/nologin gitlab
 
+COPY licenses/ /usr/share/doc/hooray/licenses/
+COPY LICENSE /usr/share/doc/hooray/LICENSE
 COPY --from=builder /usr/src/hooray/target/release/hooray /usr/local/bin/hooray
+COPY --from=builder /usr/src/hooray/target/release/hooray-parity /usr/local/bin/hooray-parity
 
 USER 1000:1000
 ENTRYPOINT ["hooray"]

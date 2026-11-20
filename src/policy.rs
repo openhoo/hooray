@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, FixedOffset};
+use crate::timestamp::WireTimestamp;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use time::OffsetDateTime;
 
 use crate::model::{
     ApplicabilityStatus, Component, Confidence, Finding, FindingKind, Inventory, PolicyDecision,
@@ -294,7 +295,16 @@ impl Policy {
         &self,
         findings: &BTreeMap<crate::model::FindingId, Finding>,
         inventory: &Inventory,
-        now: DateTime<FixedOffset>,
+        now: OffsetDateTime,
+    ) -> Result<PolicyEvaluation, PolicyError> {
+        self.evaluate_at(findings, inventory, now.into())
+    }
+
+    pub(crate) fn evaluate_at(
+        &self,
+        findings: &BTreeMap<crate::model::FindingId, Finding>,
+        inventory: &Inventory,
+        now: WireTimestamp,
     ) -> Result<PolicyEvaluation, PolicyError> {
         let compiled = self.compiled()?;
         let decisions = findings
@@ -330,7 +340,7 @@ struct CompiledRule<'a> {
 struct CompiledPolicy<'a> {
     policy: &'a Policy,
     rules: Vec<CompiledRule<'a>>,
-    expiries: BTreeMap<&'a str, DateTime<FixedOffset>>,
+    expiries: BTreeMap<&'a str, WireTimestamp>,
     exceptions: Vec<&'a PolicyException>,
 }
 
@@ -378,7 +388,7 @@ impl<'a> CompiledPolicy<'a> {
         &self,
         finding: &Finding,
         inventory: &Inventory,
-        now: DateTime<FixedOffset>,
+        now: WireTimestamp,
     ) -> PolicyDecision {
         let component = finding
             .component_id
@@ -458,7 +468,7 @@ impl<'a> CompiledPolicy<'a> {
         mut decision: PolicyDecision,
         finding: &Finding,
         component: Option<&Component>,
-        now: DateTime<FixedOffset>,
+        now: WireTimestamp,
     ) -> PolicyDecision {
         // Fail-closed denials are only overridable by exceptions whose
         // selectors explicitly name the failing fail-closed policy id;
@@ -468,7 +478,7 @@ impl<'a> CompiledPolicy<'a> {
             _ => None,
         };
         if let Some(exception) = self.exceptions.iter().copied().find(|exception| {
-            self.expiries[exception.id.as_str()] > now
+            self.expiries[exception.id.as_str()].order_key() > now.order_key()
                 && exception_matches(&exception.selectors, &decision, finding, component)
                 && fail_closed_id
                     .is_none_or(|id| exception.selectors.policy_id.as_deref() == Some(id))
@@ -664,8 +674,8 @@ fn require_text(field: String, value: &str) -> Result<(), PolicyError> {
     }
 }
 
-fn parse_expiry(exception: &PolicyException) -> Result<DateTime<FixedOffset>, PolicyError> {
-    DateTime::parse_from_rfc3339(&exception.expires_at).map_err(|_| PolicyError::InvalidExpiry {
+fn parse_expiry(exception: &PolicyException) -> Result<WireTimestamp, PolicyError> {
+    WireTimestamp::parse(&exception.expires_at).map_err(|_| PolicyError::InvalidExpiry {
         exception_id: exception.id.clone(),
         value: exception.expires_at.clone(),
     })
@@ -750,8 +760,10 @@ mod tests {
         Asset, AssetId, AssetKind, ComponentId, Evidence, FindingId, FindingStatus, License,
         Remediation, Risk, RuleId,
     };
-    fn now() -> DateTime<FixedOffset> {
-        DateTime::parse_from_rfc3339("2026-07-21T12:00:00Z").unwrap()
+    fn now() -> OffsetDateTime {
+        crate::timestamp::parse_utc("2026-07-21T12:00:00Z")
+            .unwrap()
+            .into()
     }
 
     fn inventory(license: Option<&str>, scope: Scope, purl: &str) -> Inventory {
@@ -892,6 +904,45 @@ mod tests {
         let selected = evaluate_one(&policy, finding("finding"), &inventory);
         assert_eq!(selected.outcome, PolicyOutcome::Deny);
         assert_eq!(selected.exception_id, None);
+    }
+
+    #[test]
+    fn expiry_keeps_leap_second_and_offset_at_nanosecond_boundary() {
+        let inventory = inventory(Some("MIT"), Scope::Runtime, "pkg:cargo/example@1");
+        let mut policy = policy(vec![rule("deny", 0, PolicyOutcome::Deny)]);
+        let finding = finding("finding");
+        policy.exceptions.push(PolicyException {
+            id: "waiver".into(),
+            owner: "security".into(),
+            reason: "temporary acceptance".into(),
+            ticket: "SEC-1".into(),
+            expires_at: "2017-01-01T00:59:60.25+01:00".into(),
+            compensating_controls: BTreeSet::new(),
+            selectors: ExceptionSelectors {
+                finding_id: Some(finding.id.to_string()),
+                ..ExceptionSelectors::default()
+            },
+        });
+        let findings = BTreeMap::from([(finding.id.clone(), finding)]);
+        for (timestamp, applies) in [
+            ("2016-12-31T23:59:59.999999999Z", true),
+            ("2016-12-31T23:59:60.249999999Z", true),
+            ("2016-12-31T23:59:60.250000000Z", false),
+            ("2017-01-01T00:00:00Z", false),
+        ] {
+            let result = policy
+                .evaluate_at(
+                    &findings,
+                    &inventory,
+                    WireTimestamp::parse(timestamp).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                result.decisions.first().unwrap().exception_id.is_some(),
+                applies,
+                "{timestamp}"
+            );
+        }
     }
 
     #[test]

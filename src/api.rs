@@ -1,12 +1,8 @@
 use std::{
-    borrow::Cow,
-    collections::BTreeMap,
-    future::Future,
-    str::FromStr,
-    sync::{Arc, Mutex},
-    time::Duration,
+    borrow::Cow, collections::BTreeMap, future::Future, str::FromStr, sync::Arc, time::Duration,
 };
 
+use crate::timestamp::{WireTimestamp, utc_millis};
 use axum::{
     Json, Router,
     extract::{
@@ -21,10 +17,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use time::UtcDateTime;
 use tokio::{net::TcpListener, sync::Semaphore};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
@@ -44,6 +40,9 @@ use crate::{
     report::{sanitize_report, sanitize_value},
     store::{FindingFilter, InventoryFilter, MAX_PAGE_SIZE, Store, StoreError},
 };
+
+mod database;
+use database::Database;
 
 const API_VERSION: &str = "v1";
 const DEFAULT_PAGE_SIZE: u32 = 100;
@@ -65,7 +64,7 @@ pub enum ApiStateError {
 
 #[derive(Clone)]
 pub struct ApiState {
-    store: Arc<Mutex<Store>>,
+    store: Arc<Database>,
     config: Arc<Config>,
     osv: Arc<OsvClient>,
     scan_slots: Arc<Semaphore>,
@@ -83,7 +82,7 @@ impl ApiState {
             Duration::from_secs(config.osv_request_timeout_secs),
         )?);
         Ok(Self {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(Database::new(store)),
             scan_slots: Arc::new(Semaphore::new(config.max_concurrency)),
             osv,
             config: Arc::new(config),
@@ -170,7 +169,7 @@ async fn health() -> Json<Value> {
 }
 
 async fn ready(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
-    store_call(&state, |store| store.latest_run().map(|_| ())).await?;
+    state.store.call(|store| store.check_readiness()).await?;
     Ok(Json(json!({"status":"ready","version":API_VERSION})))
 }
 
@@ -237,7 +236,7 @@ async fn scan_with_deadline(
         )
     })?;
     let started_at = timestamp();
-    let as_of = Utc::now();
+    let as_of = UtcDateTime::now();
     let mut findings = if state.config.offline {
         BTreeMap::new()
     } else {
@@ -295,11 +294,13 @@ async fn scan_with_deadline(
         }
     })?;
     let run_id = report.run.id.clone();
-    store_call(&state, move |store| {
-        let _permit = permit;
-        store.save_report(&report)
-    })
-    .await?;
+    state
+        .store
+        .call(move |store| {
+            let _permit = permit;
+            store.save_report(&report)
+        })
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -383,7 +384,10 @@ async fn list_runs(
     let offset = page.offset;
     // Run summaries only: deserializing up to 1000 full reports per
     // request would let a single GET force multi-hundred-MB allocations.
-    let runs = store_call(&state, move |store| store.list_run_summaries(limit, offset)).await?;
+    let runs = state
+        .store
+        .call(move |store| store.list_run_summaries(limit, offset))
+        .await?;
     Ok(Json(json!({
         "version": API_VERSION,
         "limit": limit,
@@ -408,10 +412,10 @@ async fn diff_runs(
     let baseline = parse_run_id(baseline_run_id)?;
     let current_id = current.clone();
     let baseline_id = baseline.clone();
-    let diff = store_call(&state, move |store| {
-        store.diff_runs(&baseline_id, &current_id)
-    })
-    .await?;
+    let diff = state
+        .store
+        .call(move |store| store.diff_runs(&baseline_id, &current_id))
+        .await?;
     Ok(Json(DiffResponse::new(baseline, current, diff)))
 }
 
@@ -483,10 +487,10 @@ async fn query_findings(
     };
     let limit = query.limit;
     let offset = query.offset;
-    let findings = store_call(&state, move |store| {
-        store.query_findings(&filter, limit, offset)
-    })
-    .await?;
+    let findings = state
+        .store
+        .call(move |store| store.query_findings(&filter, limit, offset))
+        .await?;
     let mut response = json!({"version":API_VERSION,"limit":limit,"offset":offset,"count":findings.len(),"findings":findings});
     sanitize_value(&mut response);
     Ok(Json(response))
@@ -546,10 +550,10 @@ async fn query_inventory(
     };
     let limit = query.limit;
     let offset = query.offset;
-    let components = store_call(&state, move |store| {
-        store.query_inventory(&filter, limit, offset)
-    })
-    .await?;
+    let components = state
+        .store
+        .call(move |store| store.query_inventory(&filter, limit, offset))
+        .await?;
     let mut response = json!({"version":API_VERSION,"limit":limit,"offset":offset,"count":components.len(),"components":components});
     sanitize_value(&mut response);
     Ok(Json(response))
@@ -638,11 +642,11 @@ async fn evaluate_policy(
         .report
         .validate()
         .map_err(|error| ApiError::unprocessable("invalid_scan_report", error.to_string()))?;
-    let evaluated_at = DateTime::parse_from_rfc3339(&request.evaluated_at)
+    let evaluated_at = WireTimestamp::parse(&request.evaluated_at)
         .map_err(|_| ApiError::bad_request("invalid_timestamp", "evaluated_at must be RFC 3339"))?;
     let evaluation = request
         .policy
-        .evaluate(
+        .evaluate_at(
             &request.report.findings,
             &request.report.inventory,
             evaluated_at,
@@ -679,13 +683,15 @@ async fn validate_exception(
 }
 
 fn timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    utc_millis(UtcDateTime::now())
 }
 
 async fn load_report(state: &ApiState, raw_id: String) -> Result<ScanReport, ApiError> {
     let run_id = parse_run_id(raw_id)?;
     let lookup_id = run_id.clone();
-    let report = store_call(state, move |store| store.get_run(&lookup_id))
+    let report = state
+        .store
+        .call(move |store| store.get_run(&lookup_id))
         .await?
         .ok_or_else(|| {
             ApiError::not_found("run_not_found", format!("run '{run_id}' was not found"))
@@ -846,22 +852,6 @@ fn representation_quality(ranges: &[(String, u16)], aliases: &[&str]) -> u16 {
         })
         .max_by_key(|(specificity, quality)| (*specificity, *quality))
         .map_or(0, |(_, quality)| quality)
-}
-
-async fn store_call<T, F>(state: &ApiState, operation: F) -> Result<T, ApiError>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
-{
-    let store = Arc::clone(&state.store);
-    tokio::task::spawn_blocking(move || {
-        let mut store = store
-            .lock()
-            .map_err(|_| ApiError::internal("store_unavailable", "store lock is poisoned"))?;
-        operation(&mut store).map_err(ApiError::from)
-    })
-    .await
-    .map_err(|_| ApiError::internal("store_unavailable", "store operation was cancelled"))?
 }
 
 async fn auth_middleware(State(state): State<ApiState>, request: Request, next: Next) -> Response {
@@ -1262,15 +1252,12 @@ mod tests {
         assert_eq!(body, json!({"status":"ready","version":"v1"}));
 
         let state = ApiState::new(Store::open_memory().unwrap(), Config::default()).unwrap();
-        let store = Arc::clone(&state.store);
-        assert!(
-            std::thread::spawn(move || {
-                let _guard = store.lock().unwrap();
-                panic!("poison test store");
-            })
-            .join()
-            .is_err()
-        );
+        let error = state
+            .store
+            .call::<(), _>(|_| panic!("poison test store"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "store_unavailable");
         let (status, body) = response(
             router(state),
             Request::get("/ready").body(Body::empty()).unwrap(),
@@ -1278,6 +1265,37 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"]["code"], "store_unavailable");
+    }
+
+    #[tokio::test]
+    async fn cancelled_store_waiter_drops_its_operation_while_the_database_is_busy() {
+        let state = ApiState::new(Store::open_memory().unwrap(), Config::default()).unwrap();
+        let (started, busy) = oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let active_state = state.clone();
+        let active = tokio::spawn(async move {
+            active_state
+                .store
+                .call(move |_| {
+                    started.send(()).unwrap();
+                    let _ = resume.recv();
+                    Ok(())
+                })
+                .await
+        });
+        busy.await.unwrap();
+
+        let (submitted, mut receipt) = oneshot::channel();
+        let mut waiting = Box::pin(state.store.call(move |_| {
+            let _ = submitted.send(());
+            Ok(())
+        }));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(waiting);
+        let cancelled = receipt.try_recv();
+        release.send(()).unwrap();
+        active.await.unwrap().unwrap();
+        assert_eq!(cancelled, Err(oneshot::error::TryRecvError::Closed));
     }
 
     #[tokio::test]

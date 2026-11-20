@@ -818,7 +818,7 @@ impl ScanReport {
         // and typed output fields (CycloneDX metadata.timestamp, SPDX
         // creationInfo.created, JUnit timestamp), so it must be a real
         // RFC 3339 timestamp rather than any non-empty string.
-        if chrono::DateTime::parse_from_rfc3339(&self.run.started_at).is_err() {
+        if crate::timestamp::WireTimestamp::parse(&self.run.started_at).is_err() {
             return Err(ModelInvariantError::InvalidRunTimestamp);
         }
         self.inventory.validate()?;

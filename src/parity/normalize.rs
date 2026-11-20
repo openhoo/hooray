@@ -246,10 +246,27 @@ pub fn normalize_hooray(
     components.sort();
 
     let mut accumulators: BTreeMap<String, VulnAccumulator> = BTreeMap::new();
+    let mut package_cve_evidence = matches!(scan_mode, "osv-live" | "provider-replay")
+        .then(super::package_cve::PackageCveEvidence::default);
     let mut license_triples: BTreeSet<(String, String, Option<String>)> = BTreeSet::new();
     for finding in report.findings.values() {
         match finding.kind {
             FindingKind::Vulnerability => {
+                let purl = finding
+                    .component_id
+                    .as_ref()
+                    .and_then(|id| report.inventory.components.get(id))
+                    .map(|component| component.purl.as_str());
+                if let Some(obs) = &mut package_cve_evidence {
+                    obs.observe(
+                        finding
+                            .advisory_id
+                            .as_deref()
+                            .unwrap_or(finding.id.as_str()),
+                        finding.aliases.iter().map(String::as_str),
+                        purl,
+                    );
+                }
                 // Advisory-id-less vulnerabilities are intentionally
                 // skipped: Xray keys every advisory by its issue id, so a
                 // hooray finding without one has no comparison counterpart
@@ -257,15 +274,10 @@ pub fn normalize_hooray(
                 let Some(primary_id) = finding.advisory_id.clone() else {
                     continue;
                 };
-                let purl = finding
-                    .component_id
-                    .as_ref()
-                    .and_then(|id| report.inventory.components.get(id))
-                    .map(|component| component.purl.clone());
                 accumulators
                     .entry(primary_id)
                     .or_default()
-                    .push(finding, purl);
+                    .push(finding, purl.map(str::to_owned));
             }
             FindingKind::License => {
                 for (path, expression, detector) in license_finding_triples(finding, &locations) {
@@ -304,6 +316,7 @@ pub fn normalize_hooray(
         scan_mode: scan_mode.to_owned(),
         components,
         vulnerabilities,
+        package_cve_evidence,
         license_findings,
         parse_errors: Vec::new(),
     })
@@ -671,5 +684,34 @@ mod tests {
         .unwrap();
         assert_eq!(canonical.vulnerabilities[0].cves, vec!["CVE-2026-9999"]);
         assert!(canonical.vulnerabilities[0].aliases.is_empty());
+    }
+
+    #[test]
+    fn package_evidence_is_collected_before_hooray_merges_findings_by_advisory() {
+        let mut a = vuln_finding(stable_component_id("pkg:npm/lodash@4.17.15").unwrap());
+        a.aliases = BTreeSet::from(["CVE-2026-1111".into()]);
+        let mut b = vuln_finding(stable_component_id("pkg:cargo/hooray-app@1.0.0").unwrap());
+        b.aliases = BTreeSet::from(["cve-2026-2222".into()]);
+        let src = report_with(base_inventory(), vec![a, b]);
+        let captured = normalize_hooray(&src, "case", "provider-replay").unwrap();
+        assert_eq!(captured.vulnerabilities.len(), 1);
+        let obs = captured.package_cve_evidence.unwrap();
+        assert!(obs.unresolved_advisories.is_empty());
+        assert_eq!(
+            obs.pairs
+                .into_iter()
+                .map(|p| (p.purl, p.cve))
+                .collect::<Vec<_>>(),
+            [
+                ("pkg:cargo/hooray-app@1.0.0".into(), "CVE-2026-2222".into()),
+                ("pkg:npm/lodash@4.17.15".into(), "CVE-2026-1111".into())
+            ]
+        );
+        assert!(
+            normalize_hooray(&src, "case", "offline")
+                .unwrap()
+                .package_cve_evidence
+                .is_none()
+        );
     }
 }

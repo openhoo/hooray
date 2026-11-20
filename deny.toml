@@ -27,6 +27,11 @@ allow = [
     "bzip2-1.0.6",
 ]
 
+# The bundled legacy Zstandard decoders carry this additional notice.
+[[licenses.exceptions]]
+crate = "zstd-sys"
+allow = ["BSD-2-Clause"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

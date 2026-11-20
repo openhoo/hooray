@@ -100,11 +100,7 @@ async fn run_pinned_offline(input: ScanInput) -> ScanReport {
     let mut engine = Engine::new(&config, &mut store, None);
     let mut request = ScanRequest::new(input, policy_path());
     request.run_id = Some(RunId::new(PINNED_RUN_ID).expect("pinned run id"));
-    request.as_of = Some(
-        chrono::DateTime::parse_from_rfc3339(PINNED_AS_OF)
-            .expect("pinned as-of")
-            .with_timezone(&chrono::Utc),
-    );
+    request.as_of = Some(hooray::timestamp::parse_utc(PINNED_AS_OF).expect("pinned as-of"));
     engine.scan(request).await.expect("pinned scan")
 }
 

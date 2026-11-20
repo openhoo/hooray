@@ -13,6 +13,7 @@
 //! Hooray input failures are fail-closed: they abort the scan and surface as
 //! operational errors (exit code 2), never as silent parse errors.
 
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -136,6 +137,13 @@ enum Command {
         /// Directory containing `*.recording.json` files.
         #[arg(long)]
         recordings: PathBuf,
+        /// Require exactly one readable Xray recording for each manifest case.
+        #[arg(long)]
+        require_recordings: bool,
+        /// Require complete recordings and identical observed (versioned PURL, CVE)
+        /// pairs. Missing package evidence, offline scans and SBOM-only captures fail.
+        #[arg(long)]
+        require_package_cve_parity: bool,
         /// Output format: `table` or `json`.
         #[arg(long, default_value = "table")]
         format: String,
@@ -176,9 +184,8 @@ fn pinned_request(input: ScanInput, policy_path: PathBuf) -> anyhow::Result<Scan
     let mut request = ScanRequest::new(input, policy_path);
     request.run_id = Some(RunId::new(PINNED_RUN_ID).context("pinned run id must be valid")?);
     request.as_of = Some(
-        chrono::DateTime::parse_from_rfc3339(PINNED_AS_OF)
-            .context("pinned as-of timestamp must be valid")?
-            .with_timezone(&chrono::Utc),
+        hooray::timestamp::parse_utc(PINNED_AS_OF)
+            .context("pinned as-of timestamp must be valid")?,
     );
     Ok(request)
 }
@@ -376,7 +383,7 @@ async fn command_record(command: &Command) -> anyhow::Result<i32> {
     let recording = Recording {
         schema_version: hooray::parity::recording::RECORDING_SCHEMA_VERSION,
         case_id,
-        recorded_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        recorded_at: hooray::timestamp::utc_seconds(time::UtcDateTime::now()),
         provenance: Provenance {
             hooray_version: env!("CARGO_PKG_VERSION").to_owned(),
             xray_cli_version: xray_cli_version.clone(),
@@ -411,6 +418,8 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
     let Command::Check {
         corpus,
         recordings,
+        require_recordings,
+        require_package_cve_parity,
         format,
         min_purl_recall,
         min_purl_precision,
@@ -459,6 +468,11 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         );
         None
     };
+
+    let coverage_required = *require_recordings || *require_package_cve_parity;
+    if coverage_required && manifest.as_ref().is_none_or(|m| m.cases.is_empty()) {
+        bail!("strict recording checks need a non-empty corpus manifest");
+    }
 
     // Tier 1: corpus expectations against fresh normalization.
     if let Some(manifest) = &manifest {
@@ -509,6 +523,7 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         }
     }
 
+    let corpus_rows = results.len();
     // Tier 2: recordings — drift guard always, thresholds when configured.
     let mut recording_paths = Vec::new();
     for entry in std::fs::read_dir(recordings)
@@ -532,6 +547,7 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         );
     }
 
+    let mut recorded_cases = BTreeSet::new();
     for path in recording_paths {
         let recording = match Recording::load(&path) {
             Ok(recording) => recording,
@@ -553,6 +569,9 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
             }
         };
         let mut drift_notes = Vec::new();
+        if coverage_required && !recorded_cases.insert(recording.case_id.clone()) {
+            drift_notes.push("duplicate Xray recording for this case".to_owned());
+        }
 
         // Drift guard: ALWAYS runs when a recording exists. Offline scans
         // produce no vulnerabilities, so those are exempt by construction.
@@ -597,6 +616,21 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         // means "no recording-side gate", not "skip the CLI gates".
         let card = compare::scorecard(&recording.hooray, &recording.xray);
         let mut threshold_notes = Vec::new();
+        if *require_package_cve_parity {
+            use hooray::parity::package_cve::PackageCveStatus;
+            let packages = &card.package_cves;
+            match packages.status {
+                PackageCveStatus::Match => {}
+                PackageCveStatus::Indeterminate => {
+                    threshold_notes.extend(packages.reasons.iter().cloned())
+                }
+                PackageCveStatus::Mismatch => threshold_notes.push(format!(
+                    "package/CVE mismatch: {} missing and {} extra in Hooray (see JSON for pairs)",
+                    packages.missing_in_hooray.len(),
+                    packages.extra_in_hooray.len(),
+                )),
+            }
+        }
         let enforcement = recording.enforcement.as_ref();
         let checks = [
             (
@@ -635,13 +669,21 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         }
         compare::apply_recording_check(
             &mut results,
-            &recording.case_id.clone(),
+            &recording.case_id,
             drift_notes,
             threshold_notes,
             card,
         );
     }
 
+    if coverage_required {
+        for row in &mut results[..corpus_rows] {
+            if !recorded_cases.contains(&row.case_id) {
+                row.status = "violation".to_owned();
+                row.notes.push("missing Xray recording".to_owned());
+            }
+        }
+    }
     let any_violation = results.iter().any(|r| r.status == "violation");
     if format == "json" {
         print_json(&results)?;
@@ -652,13 +694,21 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
 }
 
 fn render_table(results: &[CaseCheck]) {
-    let headers = ["case", "status", "recall", "precision", "jaccard", "notes"];
+    let headers = [
+        "case",
+        "status",
+        "recall",
+        "precision",
+        "jaccard",
+        "package/CVE",
+        "notes",
+    ];
     let rows: Vec<Vec<String>> = results
         .iter()
         .map(|result| {
             let score = result.scorecard.as_ref();
             vec![
-                result.case_id.clone(),
+                hooray::util::sanitize_cell_text(&result.case_id),
                 result.status.clone(),
                 score
                     .map(|s| format!("{:.3}", s.purl_recall))
@@ -669,7 +719,17 @@ fn render_table(results: &[CaseCheck]) {
                 score
                     .map(|s| format!("{:.3}", s.cve_jaccard))
                     .unwrap_or_else(|| "-".into()),
-                result.notes.join("; "),
+                score
+                    .map(|s| match s.package_cves.status {
+                        hooray::parity::package_cve::PackageCveStatus::Match => "match",
+                        hooray::parity::package_cve::PackageCveStatus::Mismatch => "mismatch",
+                        hooray::parity::package_cve::PackageCveStatus::Indeterminate => {
+                            "indeterminate"
+                        }
+                    })
+                    .unwrap_or("-")
+                    .to_owned(),
+                hooray::util::sanitize_cell_text(&result.notes.join("; ")),
             ]
         })
         .collect();

@@ -14,3 +14,14 @@ fn manual_publication_is_limited_to_main_except_dry_run() {
         "github.event_name != 'workflow_dispatch' || inputs.dry_run || github.ref_name == 'main'"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn setup_installs_verified_legacy_and_dual_binary_archives() {
+    let status = std::process::Command::new("bash")
+        .arg("tests/setup_release.sh")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("run setup action fixture");
+    assert!(status.success(), "setup action fixture: {status}");
+}

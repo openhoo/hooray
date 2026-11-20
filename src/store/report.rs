@@ -27,7 +27,22 @@ pub struct RunSummary {
 }
 
 impl Store {
+    /// Probe the history table and its newest schema without decoding the
+    /// report. The same index used for the history listing locates that row.
+    pub(crate) fn check_readiness(&self) -> Result<(), StoreError> {
+        let latest = self.connection.query_row(
+            "SELECT schema_version FROM scan_runs ORDER BY started_at DESC, run_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        ).optional()?;
+        if let Some(version) = latest {
+            ensure_supported_schema_version(&version)?;
+        }
+        Ok(())
+    }
+
     pub fn save_report(&mut self, report: &ScanReport) -> Result<(), StoreError> {
+        ensure_supported_report_schema(report)?;
         reject_unredacted_secrets(&report.findings)?;
         report.validate()?;
         let sanitized = crate::report::sanitize_report(report)
@@ -308,7 +323,7 @@ impl Store {
         // occurred_at records when the prune actually ran (not the cutoff),
         // and the audit event_id carries a unique nonce so repeat prunes
         // with identical results are not dedupe-swallowed.
-        let occurred_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let occurred_at = crate::timestamp::utc_millis(time::UtcDateTime::now());
         let event_id = format!(
             "retention:{}:{}:{}",
             occurred_at,
@@ -374,11 +389,8 @@ pub(super) fn insert_report(
 /// and range comparisons stay consistent regardless of input precision or
 /// offset. Unparseable values pass through unchanged.
 fn normalize_started_at(value: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|time| {
-            time.with_timezone(&chrono::Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        })
+    crate::timestamp::WireTimestamp::parse(value)
+        .map(crate::timestamp::WireTimestamp::utc_millis)
         .unwrap_or_else(|_| value.to_owned())
 }
 
@@ -504,12 +516,14 @@ pub(super) fn reject_unredacted_secrets(
 }
 
 pub(super) fn ensure_supported_report_schema(report: &ScanReport) -> Result<(), StoreError> {
-    if report.schema_version == REPORT_SCHEMA_VERSION {
+    ensure_supported_schema_version(&report.schema_version)
+}
+
+fn ensure_supported_schema_version(version: &str) -> Result<(), StoreError> {
+    if version == REPORT_SCHEMA_VERSION {
         Ok(())
     } else {
-        Err(StoreError::UnsupportedReportSchema(
-            report.schema_version.clone(),
-        ))
+        Err(StoreError::UnsupportedReportSchema(version.to_owned()))
     }
 }
 
@@ -607,6 +621,36 @@ mod tests {
         assert_eq!(normalized, (1, 1, 1));
         assert!(s.connection.execute("INSERT INTO scan_findings(run_id,finding_id,kind,severity,confidence,status,rule_id,finding_json) VALUES ('run:1',' ','sast','high','high','open','r','{}')",[]).is_err());
     }
+    #[test]
+    fn history_keeps_leap_seconds_and_normalizes_only_the_sort_key() {
+        let mut store = Store::open_memory().unwrap();
+        // Legacy data may use U+2212 as the negative offset sign.
+        let leap = report("leap", "2016-12-31T18:29:60.123999999−05:30", &[]);
+        for run in [
+            report("before", "2016-12-31T23:59:59.999999Z", &[]),
+            leap.clone(),
+            report("after", "2017-01-01T00:00:00Z", &[]),
+        ] {
+            store.save_report(&run).unwrap();
+        }
+        assert_eq!(store.get_run(&leap.run.id).unwrap().unwrap(), leap);
+        let summaries = store.list_run_summaries(10, 0).unwrap();
+        let starts: Vec<_> = summaries
+            .iter()
+            .map(|row| row.started_at.as_str())
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                "2017-01-01T00:00:00.000Z",
+                "2016-12-31T23:59:60.123Z",
+                "2016-12-31T23:59:59.999Z",
+            ]
+        );
+        assert_eq!(store.delete_before("2016-12-31T23:59:60.123Z").unwrap(), 1);
+        assert_eq!(store.list_runs(10, 0).unwrap().len(), 2);
+    }
+
     #[test]
     fn pagination_history_and_audit_are_deterministic() {
         let mut s = Store::open_memory().unwrap();
@@ -1024,6 +1068,40 @@ mod tests {
         ));
     }
     #[test]
+    fn readiness_checks_the_database_without_hydrating_the_report() {
+        let mut store = Store::open_memory().unwrap();
+        let current = report("run:latest", "2026-01-01T00:00:00Z", &[]);
+        store.save_report(&current).unwrap();
+        // Historical payloads are decoded by the report route. A probe only
+        // needs a readable history table and a supported storage projection.
+        store
+            .connection
+            .execute("UPDATE scan_runs SET report_json='{}'", [])
+            .unwrap();
+        assert!(store.get_run(&current.run.id).is_err());
+        store.check_readiness().unwrap();
+        store
+            .connection
+            .execute("DROP TABLE scan_runs", [])
+            .unwrap();
+        assert!(matches!(
+            store.check_readiness(),
+            Err(StoreError::Sqlite(_))
+        ));
+    }
+
+    #[test]
+    fn save_rejects_a_report_the_store_cannot_read() {
+        let mut store = Store::open_memory().unwrap();
+        let mut current = report("future", "2026-01-01T00:00:00Z", &[]);
+        current.schema_version = "2".to_owned();
+        assert!(
+            matches!(store.save_report(&current), Err(StoreError::UnsupportedReportSchema(version)) if version == "2")
+        );
+        assert!(store.latest_run().unwrap().is_none());
+    }
+
+    #[test]
     fn unsupported_report_schema_version_is_rejected_on_read() {
         let mut s = Store::open_memory().unwrap();
         // Earlier started_at than the rejected row keeps DESC-order assertions
@@ -1044,6 +1122,10 @@ mod tests {
                 ],
             )
             .unwrap();
+        assert!(matches!(
+            s.check_readiness(),
+            Err(StoreError::UnsupportedReportSchema(_))
+        ));
         assert!(matches!(
             s.get_run(&r.run.id),
             Err(StoreError::UnsupportedReportSchema(version)) if version == "2"

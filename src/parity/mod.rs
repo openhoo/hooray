@@ -21,5 +21,6 @@ pub mod compare;
 pub mod corpus;
 pub mod model;
 pub mod normalize;
+pub mod package_cve;
 pub mod recording;
 pub mod xray;

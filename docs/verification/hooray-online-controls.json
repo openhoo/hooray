@@ -1,0 +1,540 @@
+{
+  "control": "CVE-2026-115905",
+  "provider": "live OSV; no pinned snapshot",
+  "binary_version": "hooray 0.9.0",
+  "executable_sha256": "d125c2ef25602b9dc13f98ec0e605f7b712bc09c7814cef50bd2b727e29d47b3",
+  "cases": [
+    {
+      "commit": "0361fda09da6d49d477b127a64624e52aef3969e",
+      "input_sha256": {
+        "Cargo.lock": "86858a28cec66553a6f38dff33b5c31685e8d85c35ecb2cc21ba5a9db502de47",
+        "Cargo.toml": "1081eacbe359325b5ee76dfa2979cbe517978b994a37febd45b3d6595b0b875d",
+        "LICENSE": "50e6751797c50dedd75ef1b8a0d9e42f5f8472e9fbce91f34718e9f97b0c780a",
+        "hooray-policy.yaml": "0e3904806071dbaacf90c6268562ffb01d5f10eaaa0f721060b18ca6096f5659"
+      },
+      "started_at": "2026-11-20T19:46:42.216Z",
+      "exit_code": 1,
+      "expected_exit_code": 1,
+      "passed": true,
+      "zip_coordinates": [
+        "pkg:cargo/zip@8.6.0"
+      ],
+      "components": 298,
+      "edges": 751,
+      "lockfile_inventory_equal": true,
+      "decisions": {
+        "deny": 9,
+        "warn": 346
+      },
+      "vulnerability_rows": [
+        {
+          "purl": "pkg:cargo/chrono@0.4.45",
+          "advisory": "RUSTSEC-2026-0543",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/libsqlite3-sys@0.38.2",
+          "advisory": "RUSTSEC-2026-0459",
+          "aliases": [
+            "BIT-sqlite-2026-119375",
+            "CVE-2026-119375",
+            "GHSA-72w2-rjgg-q729",
+            "RUSTSEC-2026-0502"
+          ],
+          "severity": "medium",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/quinn-proto@0.11.18",
+          "advisory": "RUSTSEC-2026-0523",
+          "aliases": [
+            "GHSA-53rm-773f-4q8c"
+          ],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/quinn-proto@0.11.18",
+          "advisory": "RUSTSEC-2026-0524",
+          "aliases": [
+            "GHSA-wppq-2f6r-wfvm"
+          ],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/quinn-udp@0.5.15",
+          "advisory": "RUSTSEC-2026-0538",
+          "aliases": [
+            "GHSA-6pp4-4cxf-xf88"
+          ],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustix@1.1.5",
+          "advisory": "RUSTSEC-2026-0486",
+          "aliases": [
+            "GHSA-jh2m-fhpj-3vr7"
+          ],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustls-webpki@0.103.15",
+          "advisory": "RUSTSEC-2026-0382",
+          "aliases": [
+            "BIT-golang-2026-111943",
+            "CVE-2026-111943",
+            "GO-2026-6809",
+            "RUSTSEC-2026-0381",
+            "RUSTSEC-2026-0383"
+          ],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustls@0.23.45",
+          "advisory": "GHSA-c8m5-c952-6cm4",
+          "aliases": [
+            "CVE-2026-123609",
+            "RUSTSEC-2026-0346"
+          ],
+          "severity": "medium",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustls@0.23.45",
+          "advisory": "GHSA-h2v8-394m-p7vv",
+          "aliases": [
+            "CVE-2026-123610",
+            "RUSTSEC-2026-0348"
+          ],
+          "severity": "low",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustls@0.23.45",
+          "advisory": "GHSA-vp88-798v-h67f",
+          "aliases": [
+            "CVE-2026-123612",
+            "RUSTSEC-2026-0347"
+          ],
+          "severity": "low",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustls@0.23.45",
+          "advisory": "GHSA-w44r-93j7-qv28",
+          "aliases": [
+            "CVE-2026-123611",
+            "RUSTSEC-2026-0349"
+          ],
+          "severity": "low",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustls@0.23.45",
+          "advisory": "RUSTSEC-2026-0346",
+          "aliases": [
+            "CVE-2026-123609",
+            "GHSA-c8m5-c952-6cm4"
+          ],
+          "severity": "medium",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustls@0.23.45",
+          "advisory": "RUSTSEC-2026-0347",
+          "aliases": [
+            "CVE-2026-123612",
+            "GHSA-vp88-798v-h67f"
+          ],
+          "severity": "low",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustls@0.23.45",
+          "advisory": "RUSTSEC-2026-0348",
+          "aliases": [
+            "CVE-2026-123610",
+            "GHSA-h2v8-394m-p7vv"
+          ],
+          "severity": "low",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/rustls@0.23.45",
+          "advisory": "RUSTSEC-2026-0349",
+          "aliases": [
+            "CVE-2026-123611",
+            "GHSA-w44r-93j7-qv28"
+          ],
+          "severity": "low",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/tokio@1.53.1",
+          "advisory": "RUSTSEC-2026-0386",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/webpki-roots@1.0.9",
+          "advisory": "RUSTSEC-2026-0381",
+          "aliases": [
+            "BIT-golang-2026-111943",
+            "CVE-2026-111943",
+            "GO-2026-6809",
+            "RUSTSEC-2026-0382",
+            "RUSTSEC-2026-0383"
+          ],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "GHSA-8hxf-qr8p-62x4",
+          "aliases": [
+            "CVE-2026-115906",
+            "RUSTSEC-2026-0545"
+          ],
+          "severity": "medium",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "GHSA-9hj8-73fh-9963",
+          "aliases": [
+            "CVE-2026-115907",
+            "RUSTSEC-2026-0547"
+          ],
+          "severity": "high",
+          "decision": "deny"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "GHSA-hjqx-j4rw-g7xv",
+          "aliases": [
+            "CVE-2026-115908",
+            "RUSTSEC-2026-0546"
+          ],
+          "severity": "high",
+          "decision": "deny"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "GHSA-m665-v7pm-7grj",
+          "aliases": [
+            "CVE-2026-115905",
+            "RUSTSEC-2026-0548"
+          ],
+          "severity": "critical",
+          "decision": "deny"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "GHSA-q7v9-x93c-xqv3",
+          "aliases": [
+            "CVE-2026-115909",
+            "RUSTSEC-2026-0429"
+          ],
+          "severity": "high",
+          "decision": "deny"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "RUSTSEC-2026-0367",
+          "aliases": [
+            "GHSA-vv5m-jxxh-4627"
+          ],
+          "severity": "high",
+          "decision": "deny"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "RUSTSEC-2026-0368",
+          "aliases": [
+            "GHSA-4v9h-p7m9-rh26"
+          ],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "RUSTSEC-2026-0369",
+          "aliases": [
+            "GHSA-4684-h2q9-2vcp"
+          ],
+          "severity": "critical",
+          "decision": "deny"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "RUSTSEC-2026-0429",
+          "aliases": [
+            "CVE-2026-115909",
+            "GHSA-q7v9-x93c-xqv3"
+          ],
+          "severity": "high",
+          "decision": "deny"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "RUSTSEC-2026-0545",
+          "aliases": [
+            "CVE-2026-115906",
+            "GHSA-8hxf-qr8p-62x4"
+          ],
+          "severity": "medium",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "RUSTSEC-2026-0546",
+          "aliases": [
+            "CVE-2026-115908",
+            "GHSA-hjqx-j4rw-g7xv"
+          ],
+          "severity": "high",
+          "decision": "deny"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "RUSTSEC-2026-0547",
+          "aliases": [
+            "CVE-2026-115907",
+            "GHSA-9hj8-73fh-9963"
+          ],
+          "severity": "high",
+          "decision": "deny"
+        },
+        {
+          "purl": "pkg:cargo/zip@8.6.0",
+          "advisory": "RUSTSEC-2026-0548",
+          "aliases": [
+            "CVE-2026-115905",
+            "GHSA-m665-v7pm-7grj"
+          ],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0395",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0396",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0397",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0398",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0399",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0400",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0401",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0402",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0403",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0404",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0405",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@7.3.0",
+          "advisory": "RUSTSEC-2026-0406",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0395",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0396",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0397",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0398",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0399",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0400",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0401",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0402",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0403",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0404",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0405",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-safe@8.0.0",
+          "advisory": "RUSTSEC-2026-0406",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd-sys@2.1.0+zstd.1.5.7",
+          "advisory": "RUSTSEC-2026-0410",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd@0.13.3",
+          "advisory": "RUSTSEC-2026-0391",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        },
+        {
+          "purl": "pkg:cargo/zstd@0.14.0",
+          "advisory": "RUSTSEC-2026-0391",
+          "aliases": [],
+          "severity": "unknown",
+          "decision": "warn"
+        }
+      ]
+    },
+    {
+      "commit": "87b42fc167afb72557ff715747f4cc65828b8083",
+      "input_sha256": {
+        "Cargo.lock": "f8b6d18acdde9d4d84e286e415d24b85f9dc7dae33a1df7884c74515eafb4dd0",
+        "Cargo.toml": "c1164002d92616e88ae6db06da65edc4ae25de08d87841158c5b5e6018bb0f52",
+        "LICENSE": "50e6751797c50dedd75ef1b8a0d9e42f5f8472e9fbce91f34718e9f97b0c780a",
+        "hooray-policy.yaml": "0e3904806071dbaacf90c6268562ffb01d5f10eaaa0f721060b18ca6096f5659"
+      },
+      "started_at": "2026-11-20T19:46:43.940Z",
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "passed": true,
+      "zip_coordinates": [
+        "pkg:cargo/zip@9.8.1"
+      ],
+      "components": 295,
+      "edges": 744,
+      "lockfile_inventory_equal": true,
+      "decisions": {
+        "warn": 295
+      },
+      "vulnerability_rows": []
+    }
+  ]
+}
