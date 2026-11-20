@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.0 (2026-11-20)
+
+### Features
+
+- gate Cargo artifact promotion on pinned publisher evidence (#367) (c85d985)
+
+### Other Changes
+
+- **release:** verify registry manifests before completing publication (8845c63)
+
 ## 0.10.0 (2026-11-20)
 
 ### Features
