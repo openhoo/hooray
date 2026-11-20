@@ -24,3 +24,15 @@ coverage.
 Commits use Conventional Commits. Pull requests must explain compatibility and
 security impact. Maintainers squash-merge using the Conventional Commit pull
 request title. Lockfile changes must accompany manifest changes.
+
+## Recovering a container release
+
+After an interrupted container publication, dispatch the Release workflow on
+`main` with the existing tag and version (for example, `image_tag=v0.10.0`
+and `image_version=0.10.0`). It reuses the original image. The digest identifies
+the full manifest or image index, including its platform and attestation entries.
+
+When the workflow runs from a newer commit, recovery requires the original
+signature and build provenance for the release commit. If either is missing,
+recovery stops before changing the release notes or public tags. Only the
+current GitHub release may update the container's `latest` tag.
