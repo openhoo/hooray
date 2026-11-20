@@ -1,12 +1,11 @@
 """Run the actual YAML Bash step with isolated, stateful stand-ins for external APIs."""
 
 import json
-import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 IMAGE = "ghcr.io/openhoo/hooray"
 DIGEST = "sha256:" + "a" * 64
@@ -37,8 +36,8 @@ def fake(tool, args):
     ]:
         # Stand in for registry reads. An unpushed promotion is not readable.
         print(
-            "from pathlib import Path\nimport sys\nr=sys.argv[1]\nassert r in Path('registry').read_text().splitlines()\nprint(%r)"
-            % DIGEST
+            "from pathlib import Path\nimport sys\nr=sys.argv[1]\nassert r in Path('registry').read_text().splitlines()\n"
+            f"print({DIGEST!r})"
         )
     elif tool == "gh" and args == ["api", f"repos/{REPO}/releases/tags/v{version}"]:
         print(json.dumps({"draft": False, "id": 100, "body": cfg["body"]}))
@@ -192,6 +191,7 @@ def scenario(script, root, tools, name, historical, reject="", marker=False):
     result = subprocess.run(
         [shutil.which("bash"), str(script)],
         cwd=wd,
+        check=False,
         env=env,
         capture_output=True,
         text=True,
