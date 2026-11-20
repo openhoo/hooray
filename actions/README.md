@@ -8,7 +8,7 @@ requires Bash and Python 3 on Linux or macOS. The release installer supports Lin
 - uses: openhoo/hooray/actions/scan@<full-commit-sha>
   id: hooray
   with:
-    version: 0.9.0
+    version: 0.10.0
     policy: hooray-policy.yaml
     additional-formats: json,junit,html
 ```
