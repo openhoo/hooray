@@ -210,6 +210,7 @@ fn parse_audit_vulnerabilities(
     accumulators: &mut BTreeMap<String, VulnAccumulator>,
     resolve: impl Fn(&str, &str) -> Option<String>,
     synthesize_components: &mut BTreeMap<String, CanonicalComponent>,
+    observations: &mut super::package_cve::PackageCveEvidence,
 ) {
     let entries: Vec<&Value> = match document {
         Value::Array(items) => items.iter().collect(),
@@ -254,15 +255,40 @@ fn parse_audit_vulnerabilities(
                 accumulator.severity_rank = rank;
                 accumulator.severity_label = label;
             }
-            for cve in collect_strings(vuln.get("cves"), "cve") {
+            let cves = collect_strings(vuln.get("cves"), "cve");
+            let aliases = collect_strings(vuln.get("aliases"), "alias");
+            for (key, values) in [("cves", &cves), ("aliases", &aliases)] {
+                if vuln.get(key).is_some_and(|v| {
+                    !v.is_null() && v.as_array().is_none_or(|a| a.len() != values.len())
+                }) {
+                    summary.skip(format!("{issue_id}: malformed '{key}' list"));
+                }
+            }
+            if cves
+                .iter()
+                .any(|id| super::package_cve::cve_id(id).is_none())
+            {
+                summary.skip(format!("{issue_id}: invalid identifier in 'cves'"));
+            }
+            let observed_ids = || cves.iter().chain(&aliases).map(String::as_str);
+            let refs = extract_component_refs(vuln.get("components"));
+            let expected_refs = match vuln.get("components") {
+                Some(Value::Array(entries)) => entries.len(),
+                Some(Value::Object(entries)) => entries.len(),
+                _ => 0,
+            };
+            if refs.is_empty() || refs.len() != expected_refs {
+                observations.observe(issue_id, observed_ids(), None);
+            }
+            for cve in &cves {
                 accumulator.cves.insert(cve.clone());
-                accumulator.aliases.insert(cve);
+                accumulator.aliases.insert(cve.clone());
             }
-            for alias in collect_strings(vuln.get("aliases"), "alias") {
-                accumulator.aliases.insert(alias);
-            }
-            for (name, version, fixed) in extract_component_refs(vuln.get("components")) {
-                if let Some(purl) = resolve(&name, &version) {
+            accumulator.aliases.extend(aliases.iter().cloned());
+            for (name, version, fixed) in refs {
+                let resolved = resolve(&name, &version);
+                observations.observe(issue_id, observed_ids(), resolved.as_deref());
+                if let Some(purl) = resolved {
                     accumulator.affected_purls.insert(purl);
                 } else {
                     let purl = generic_purl(&name, &version);
@@ -306,7 +332,7 @@ pub fn build_xray_canonical(
 
     // Inventory from the SBOM side, deconflicted by purl match key.
     let mut components: BTreeMap<String, CanonicalComponent> = BTreeMap::new();
-    let mut by_name_version: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut by_name_version: BTreeMap<(String, String), Option<String>> = BTreeMap::new();
     if let Some(sbom) = artifacts.sbom_json {
         let document: CdxDocument = serde_json::from_str(sbom)?;
         let mut pending: Vec<CdxComponent> = document.components;
@@ -333,6 +359,19 @@ pub fn build_xray_canonical(
                 scope: "runtime".to_owned(),
                 directness: "disconnected".to_owned(),
             };
+            // Index the raw source rows: deconflicting the inventory by match
+            // key first would hide ambiguous references (e.g. two distro
+            // variants). Identical duplicate rows still resolve to one PURL.
+            let candidate =
+                super::package_cve::version_agrees(&purl, &component.version).then(|| purl.clone());
+            by_name_version
+                .entry((component.name.clone(), component.version.clone()))
+                .and_modify(|existing| {
+                    if *existing != candidate {
+                        *existing = None;
+                    }
+                })
+                .or_insert(candidate);
             components
                 .entry(purl_match_key(&purl))
                 .and_modify(|existing| {
@@ -347,39 +386,48 @@ pub fn build_xray_canonical(
                 })
                 .or_insert(component);
         }
-        for component in components.values() {
-            by_name_version.insert(
-                (
-                    component.name.to_ascii_lowercase(),
-                    component.version.clone(),
-                ),
-                component.purl.clone(),
-            );
-        }
     }
 
-    let sbom_present = !components.is_empty() || artifacts.sbom_json.is_some();
     let resolve = |name: &str, version: &str| -> Option<String> {
-        if sbom_present {
-            by_name_version
-                .get(&(name.to_ascii_lowercase(), version.to_owned()))
-                .cloned()
-        } else {
-            None
-        }
+        by_name_version
+            .get(&(name.to_owned(), version.to_owned()))
+            .and_then(Clone::clone)
     };
 
     let mut accumulators: BTreeMap<String, VulnAccumulator> = BTreeMap::new();
     let mut synthesized: BTreeMap<String, CanonicalComponent> = BTreeMap::new();
+    let mut observations = None;
     if let Some(audit) = artifacts.audit_json {
         let document: Value = serde_json::from_str(audit)?;
+        // A JSON object containing only an invocation error, or SBOM JSON
+        // supplied to --xray-json, does not establish an empty CVE set.
+        let has_audit_results = |entry: &Value| {
+            let clear = |field: &Value| match field {
+                Value::Null | Value::Bool(false) => true,
+                Value::Array(a) => a.is_empty(),
+                Value::Object(o) => o.is_empty(),
+                Value::String(s) => s.trim().is_empty(),
+                _ => false,
+            };
+            entry.get("vulnerabilities").is_some_and(Value::is_array)
+                && ["error", "errors"]
+                    .iter()
+                    .all(|key| entry.get(*key).is_none_or(clear))
+        };
+        let observed = match &document {
+            Value::Array(rows) => !rows.is_empty() && rows.iter().all(has_audit_results),
+            row => has_audit_results(row),
+        };
+        let mut evidence = super::package_cve::PackageCveEvidence::default();
         parse_audit_vulnerabilities(
             &document,
             &mut summary,
             &mut accumulators,
             resolve,
             &mut synthesized,
+            &mut evidence,
         );
+        observations = observed.then_some(evidence);
     }
     let synthesized_count = synthesized.len();
     for (key, component) in synthesized {
@@ -430,6 +478,7 @@ pub fn build_xray_canonical(
         .collect();
     report.components = components;
     report.vulnerabilities = vulnerabilities;
+    report.package_cve_evidence = observations;
     Ok((report, summary))
 }
 

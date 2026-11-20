@@ -140,6 +140,10 @@ enum Command {
         /// Require exactly one readable Xray recording for each manifest case.
         #[arg(long)]
         require_recordings: bool,
+        /// Require complete recordings and identical observed (versioned PURL, CVE)
+        /// pairs. Missing package evidence, offline scans and SBOM-only captures fail.
+        #[arg(long)]
+        require_package_cve_parity: bool,
         /// Output format: `table` or `json`.
         #[arg(long, default_value = "table")]
         format: String,
@@ -415,6 +419,7 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         corpus,
         recordings,
         require_recordings,
+        require_package_cve_parity,
         format,
         min_purl_recall,
         min_purl_precision,
@@ -464,8 +469,9 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         None
     };
 
-    if *require_recordings && manifest.as_ref().is_none_or(|m| m.cases.is_empty()) {
-        bail!("--require-recordings needs a non-empty corpus manifest");
+    let coverage_required = *require_recordings || *require_package_cve_parity;
+    if coverage_required && manifest.as_ref().is_none_or(|m| m.cases.is_empty()) {
+        bail!("strict recording checks need a non-empty corpus manifest");
     }
 
     // Tier 1: corpus expectations against fresh normalization.
@@ -563,7 +569,7 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
             }
         };
         let mut drift_notes = Vec::new();
-        if *require_recordings && !recorded_cases.insert(recording.case_id.clone()) {
+        if coverage_required && !recorded_cases.insert(recording.case_id.clone()) {
             drift_notes.push("duplicate Xray recording for this case".to_owned());
         }
 
@@ -610,6 +616,21 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         // means "no recording-side gate", not "skip the CLI gates".
         let card = compare::scorecard(&recording.hooray, &recording.xray);
         let mut threshold_notes = Vec::new();
+        if *require_package_cve_parity {
+            use hooray::parity::package_cve::PackageCveStatus;
+            let packages = &card.package_cves;
+            match packages.status {
+                PackageCveStatus::Match => {}
+                PackageCveStatus::Indeterminate => {
+                    threshold_notes.extend(packages.reasons.iter().cloned())
+                }
+                PackageCveStatus::Mismatch => threshold_notes.push(format!(
+                    "package/CVE mismatch: {} missing and {} extra in Hooray (see JSON for pairs)",
+                    packages.missing_in_hooray.len(),
+                    packages.extra_in_hooray.len(),
+                )),
+            }
+        }
         let enforcement = recording.enforcement.as_ref();
         let checks = [
             (
@@ -655,7 +676,7 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
         );
     }
 
-    if *require_recordings {
+    if coverage_required {
         for row in &mut results[..corpus_rows] {
             if !recorded_cases.contains(&row.case_id) {
                 row.status = "violation".to_owned();
@@ -673,13 +694,21 @@ async fn command_check(command: &Command) -> anyhow::Result<i32> {
 }
 
 fn render_table(results: &[CaseCheck]) {
-    let headers = ["case", "status", "recall", "precision", "jaccard", "notes"];
+    let headers = [
+        "case",
+        "status",
+        "recall",
+        "precision",
+        "jaccard",
+        "package/CVE",
+        "notes",
+    ];
     let rows: Vec<Vec<String>> = results
         .iter()
         .map(|result| {
             let score = result.scorecard.as_ref();
             vec![
-                result.case_id.clone(),
+                hooray::util::sanitize_cell_text(&result.case_id),
                 result.status.clone(),
                 score
                     .map(|s| format!("{:.3}", s.purl_recall))
@@ -690,7 +719,17 @@ fn render_table(results: &[CaseCheck]) {
                 score
                     .map(|s| format!("{:.3}", s.cve_jaccard))
                     .unwrap_or_else(|| "-".into()),
-                result.notes.join("; "),
+                score
+                    .map(|s| match s.package_cves.status {
+                        hooray::parity::package_cve::PackageCveStatus::Match => "match",
+                        hooray::parity::package_cve::PackageCveStatus::Mismatch => "mismatch",
+                        hooray::parity::package_cve::PackageCveStatus::Indeterminate => {
+                            "indeterminate"
+                        }
+                    })
+                    .unwrap_or("-")
+                    .to_owned(),
+                hooray::util::sanitize_cell_text(&result.notes.join("; ")),
             ]
         })
         .collect();

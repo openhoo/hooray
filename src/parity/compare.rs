@@ -136,6 +136,9 @@ pub struct SeverityMismatch {
 /// report.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Scorecard {
+    /// Comparison of versioned package/CVE associations and gaps in evidence.
+    #[serde(default)]
+    pub package_cves: super::package_cve::PackageCveComparison,
     /// |hooray ∩ xray| / |xray| over purl match keys (1.0 when xray empty).
     pub purl_recall: f64,
     /// |hooray ∩ xray| / |hooray| over purl match keys (1.0 when hooray empty).
@@ -240,6 +243,7 @@ pub fn scorecard(hooray: &CanonicalReport, xray: &CanonicalReport) -> Scorecard 
     let license_agreement = jaccard(&license_pairs(&hooray_keys), &license_pairs(&xray_keys));
 
     Scorecard {
+        package_cves: super::package_cve::compare(hooray, xray),
         purl_recall: ratio(
             hooray_keys
                 .keys()

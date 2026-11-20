@@ -41,6 +41,10 @@ pub struct CanonicalReport {
     /// Vulnerability findings sorted deterministically.
     #[serde(default)]
     pub vulnerabilities: Vec<CanonicalVuln>,
+    /// Observed CVE/package associations before advisory aggregation. Absent
+    /// from older recordings, offline Hooray scans, and SBOM-only Xray inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_cve_evidence: Option<super::package_cve::PackageCveEvidence>,
     /// License findings sorted by `(path, expression)` and deduplicated.
     #[serde(default)]
     pub license_findings: Vec<CanonicalLicenseFinding>,
@@ -66,6 +70,7 @@ impl CanonicalReport {
             scan_mode: scan_mode.into(),
             components: Vec::new(),
             vulnerabilities: Vec::new(),
+            package_cve_evidence: None,
             license_findings: Vec::new(),
             parse_errors: Vec::new(),
         }
